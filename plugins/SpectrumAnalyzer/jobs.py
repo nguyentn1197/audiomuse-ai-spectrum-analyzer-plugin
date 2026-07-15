@@ -227,7 +227,7 @@ def _rq_job_lost(job):
 
 # ------------------------------------------------------------- album task --
 
-def _analyze_download(track, info, meta_fp, settings, existing, mode):
+def _analyze_download(track, info, meta_fp, settings, existing, mode, deep=False):
     """Download one track, decide skip/recompute, store. Returns a status tag."""
     item_id = info['item_id']
     tmp = tempfile.mkdtemp(prefix='spectrum_')
@@ -244,7 +244,7 @@ def _analyze_download(track, info, meta_fp, settings, existing, mode):
         result = dsp.analyze_file(
             path, suffix=info.get('suffix'), bitrate_kbps=info.get('bitrate'),
             segment_seconds=settings['segment_seconds'], drop_db=settings['drop_db'],
-            img_w=settings['img_w'], img_h=settings['img_h'],
+            img_w=settings['img_w'], img_h=settings['img_h'], deep=deep,
         )
         _upsert(item_id, info, result, meta_fp, md5)
         return 'analyzed'
@@ -477,8 +477,9 @@ def scan_library_job(mode='changed', task_id=None):
         raise
 
 
-def analyze_track_job(item_id):
-    """Manual re-run of one song. Always recomputes."""
+def analyze_track_job(item_id, deep=False):
+    """Manual re-run of one song. Always recomputes. deep=True analyzes the
+    entire file instead of a segment (dark-master check)."""
     settings = _settings()
     db = get_db()
     cur = db.cursor()
@@ -512,8 +513,10 @@ def analyze_track_job(item_id):
     info['title'] = info['title'] or title
     info['artist'] = info['artist'] or artist
     info['album'] = info['album'] or album
-    _analyze_download(track, info, meta_fingerprint(track), settings, {}, 'force')
-    logger.info('spectrum_analyzer: re-analyzed %s', info.get('title'))
+    _analyze_download(track, info, meta_fingerprint(track), settings, {}, 'force',
+                      deep=deep)
+    logger.info('spectrum_analyzer: re-analyzed %s%s', info.get('title'),
+                ' (deep)' if deep else '')
 
 
 def scan_changed_task():

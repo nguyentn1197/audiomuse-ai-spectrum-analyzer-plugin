@@ -18,6 +18,11 @@ LOSSY_SUFFIXES = {'mp3', 'ogg', 'opus', 'aac', 'm4a', 'mp4', 'wma', 'mpc'}
 
 N_FFT = 4096
 
+# Deep scan: analyze the whole file in chunks (bounded so a mislabelled
+# 10-hour stream can't eat the worker).
+DEEP_MAX_SECONDS = 1800
+_DEEP_CHUNK_SECONDS = 120
+
 
 def _load_segment(path, segment_seconds):
     """Load a mono segment at native sample rate. Prefer the middle of the
@@ -48,6 +53,64 @@ def _spectrum(y, sr):
     profile = np.percentile(S_db, 95, axis=1)
     freqs = np.linspace(0, sr / 2.0, S_db.shape[0])
     return S_db, profile, freqs
+
+
+def _deep_spectrum(path, drop_db):
+    """Whole-file analysis in chunks (bounded memory): a global max-hold
+    profile, a ~1 column/second display matrix for the spectrogram, and the
+    per-second spectral-edge series used to tell a machine low-pass (constant
+    wall) from a genuine dark master (edge follows the music)."""
+    import librosa
+
+    hop = N_FFT // 4
+    profile = None
+    display = []
+    edge_cutoffs = []
+    sr = None
+    total = 0.0
+    t = 0.0
+
+    while total < DEEP_MAX_SECONDS:
+        try:
+            y, y_sr = librosa.load(path, sr=None, mono=True, offset=t,
+                                   duration=_DEEP_CHUNK_SECONDS)
+        except Exception:
+            break
+        if y is None or not y_sr or y.size < y_sr:  # under 1 s left
+            break
+        sr = int(y_sr)
+        S_db = 20.0 * np.log10(
+            np.abs(librosa.stft(y, n_fft=N_FFT, hop_length=hop, window='hann')) + 1e-10)
+        freqs = np.linspace(0, sr / 2.0, S_db.shape[0])
+
+        chunk_profile = np.percentile(S_db, 95, axis=1)
+        profile = chunk_profile if profile is None else np.maximum(profile, chunk_profile)
+        band = chunk_profile[(freqs >= 1000) & (freqs <= 8000)]
+        chunk_ref = float(np.median(band)) if band.size else float(np.max(chunk_profile))
+
+        n_frames = S_db.shape[1]
+        group = max(1, int(round(sr / hop)))  # STFT frames per second
+        starts = np.arange(0, n_frames, group)
+        for s0 in starts:
+            win = np.percentile(S_db[:, s0:s0 + group], 95, axis=1)
+            wband = win[(freqs >= 1000) & (freqs <= 8000)]
+            if not wband.size or float(np.median(wband)) < chunk_ref - 25.0:
+                continue  # quiet second: the edge position is meaningless
+            c, _ = _find_cutoff(freqs, win, drop_db)
+            edge_cutoffs.append(c)
+        # ~1 column per second, max-pooled so peaks survive
+        display.append(np.maximum.reduceat(S_db, starts, axis=1))
+
+        got = y.size / float(sr)
+        total += got
+        t += got
+        if got < _DEEP_CHUNK_SECONDS - 1.0:
+            break  # ran off the end of the file
+
+    if profile is None or sr is None or total < 5.0:
+        raise ValueError('could not decode audio for deep analysis')
+    freqs = np.linspace(0, sr / 2.0, profile.shape[0])
+    return np.concatenate(display, axis=1), profile, freqs, sr, total, edge_cutoffs
 
 
 def _find_cutoff(freqs, profile, drop_db):
@@ -307,19 +370,59 @@ def _render_spectrogram(S_db, sr, seg_offset, seg_len_s, cutoff_hz,
 
 
 def analyze_file(path, suffix=None, bitrate_kbps=None, segment_seconds=90,
-                 drop_db=40, img_w=800, img_h=280):
-    """Full pipeline. Returns a dict ready to be stored."""
+                 drop_db=40, img_w=800, img_h=280, deep=False):
+    """Full pipeline. Returns a dict ready to be stored.
+
+    deep=True analyzes the entire file (chunked) instead of one segment and
+    tracks the spectral edge over time: a resampler/encoder wall sits at a
+    constant frequency for the whole file, while a genuine dark master's edge
+    moves with the music.
+    """
     if suffix is None:
         suffix = os.path.splitext(path)[1].lstrip('.')
 
-    y, sr, offset = _load_segment(path, segment_seconds)
-    seg_len = y.size / float(sr)
-    S_db, profile, freqs = _spectrum(y, sr)
+    edge_var = edge_med = None
+    if deep:
+        S_db, profile, freqs, sr, seg_len, edge_series = _deep_spectrum(path, drop_db)
+        offset = 0.0
+        if len(edge_series) >= 10:
+            arr = np.asarray(edge_series)
+            edge_var = float(np.std(arr))
+            edge_med = float(np.median(arr))
+    else:
+        y, sr, offset = _load_segment(path, segment_seconds)
+        seg_len = y.size / float(sr)
+        S_db, profile, freqs = _spectrum(y, sr)
+
     cutoff_hz, ref = _find_cutoff(freqs, profile, drop_db)
     edge = _edge_sharpness(freqs, profile, cutoff_hz)
     shelf = _shelf_level(freqs, profile, cutoff_hz, ref)
     verdict, est, conf, notes = _verdict(sr, suffix, bitrate_kbps, cutoff_hz, edge, shelf,
                                          freqs=freqs, profile=profile)
+
+    if deep:
+        if edge_var is None:
+            notes.append('deep scan: not enough loud content to track the spectral edge')
+        elif verdict in ('UPSAMPLED', 'FAKE_SUSPECT', 'LOWPASSED'):
+            if edge_var >= 500.0:
+                notes.append(
+                    f'deep scan: the spectral edge follows the music '
+                    f'(varies ±{edge_var:.0f} Hz over the whole file) — a resampler '
+                    f'or encoder wall would be constant; consistent with a genuine '
+                    f'dark master')
+                if verdict in ('UPSAMPLED', 'FAKE_SUSPECT'):
+                    verdict = 'LOWPASSED'
+                    est = 'likely genuine dark master'
+                    conf = 0.4
+                else:
+                    conf = min(0.9, conf + 0.2)
+            elif edge_var <= 150.0:
+                notes.append(
+                    f'deep scan: constant spectral edge across the whole file '
+                    f'(±{edge_var:.0f} Hz): a machine low-pass, not natural content')
+                conf = min(0.97, conf + 0.15)
+            else:
+                notes.append(f'deep scan: edge variability ±{edge_var:.0f} Hz: inconclusive')
 
     container_bits, effective_bits = _bit_depth_probe(path)
     if (container_bits or 0) > 16 and effective_bits and effective_bits <= 16:
@@ -355,6 +458,9 @@ def analyze_file(path, suffix=None, bitrate_kbps=None, segment_seconds=90,
             'effective_bits': effective_bits,
             'declared_bitrate_kbps': bitrate_kbps,
             'suffix': suffix,
+            'deep': deep,
+            'edge_var_hz': round(edge_var, 1) if edge_var is not None else None,
+            'edge_median_hz': round(edge_med, 1) if edge_med is not None else None,
             'notes': notes,
         }),
         'spectrogram_b64': png_b64,

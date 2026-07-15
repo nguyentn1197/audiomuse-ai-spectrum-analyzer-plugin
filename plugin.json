@@ -6,6 +6,12 @@
   "requirements": ["matplotlib"],
   "versions": [
     {
+      "version": "0.5.0",
+      "min_core_version": "2.5.0",
+      "changelog": "Deep analyze button per track: scans the ENTIRE file (chunked) and tracks the spectral edge over time — an edge that follows the music downgrades UPSAMPLED/FAKE_SUSPECT to a likely genuine dark master, a constant wall raises confidence. Manual 'verified' checkbox per track: verified tracks are excluded from all suspect counts, shown as an overview column, and filterable ('only albums with verified tracks').",
+      "sourceUrl": "http://10.10.1.203:8120/spectrum_analyzer.zip"
+    },
+    {
       "version": "0.4.1",
       "min_core_version": "2.5.0",
       "changelog": "Fix: album names containing &, ?, # or other URL-special characters broke the album page link (query string was built without percent-encoding). All album links and pagination URLs are now properly URL-encoded.",
