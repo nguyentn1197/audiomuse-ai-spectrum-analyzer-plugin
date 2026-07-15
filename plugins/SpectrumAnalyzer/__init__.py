@@ -332,7 +332,14 @@ def album():
         f'<input type="hidden" name="album_id" value="{_esc(album_id or "")}">'
         f'<button type="submit" class="btn btn-primary" '
         f'title="Force re-download and re-analyze every track in this album">'
-        'Re-analyze album</button></form>') if rows else ''
+        'Re-analyze album</button></form>'
+        f'<form method="post" action="{url_for("spectrum_analyzer.deep_rescan_album")}" '
+        f'style="display:inline;margin-left:.4rem;">'
+        f'<input type="hidden" name="name" value="{_esc(name)}">'
+        f'<button type="submit" class="btn" '
+        f'title="Queue a deep (whole-file) scan for every track whose verdict is not '
+        f'CLEAN. Verified and already-queued tracks are skipped.">'
+        'Deep scan all non-CLEAN</button></form>') if rows else ''
 
     body = (
         f'<p><a href="{url_for("spectrum_analyzer.home")}">&laquo; all albums</a></p>'
@@ -383,6 +390,26 @@ def deep_rescan(item_id):
     cur.close()
     enqueue(jobs.analyze_track_job, item_id, deep=True, queue='high')
     return redirect(request.referrer or url_for('spectrum_analyzer.home'))
+
+
+@bp.route('/album/deep_all', methods=['POST'])
+def deep_rescan_album():
+    name = request.form.get('name') or ''
+    # tag-and-collect atomically; skip CLEAN, already-queued, and verified tracks
+    db = get_db()
+    cur = db.cursor()
+    cur.execute(
+        'UPDATE ' + table('results') + ' SET deep_pending=TRUE'
+        " WHERE album = %s AND verdict IS DISTINCT FROM 'CLEAN'"
+        ' AND NOT verified AND NOT deep_pending RETURNING item_id', (name,))
+    item_ids = [r[0] for r in cur.fetchall()]
+    db.commit()
+    cur.close()
+    # default queue: bulk deep scans are slow, let all workers share them
+    # instead of hogging the high queue
+    for item_id in item_ids:
+        enqueue(jobs.analyze_track_job, item_id, deep=True)
+    return redirect(request.referrer or url_for('spectrum_analyzer.album', name=name))
 
 
 @bp.route('/verify/<item_id>', methods=['POST'])

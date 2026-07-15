@@ -6,6 +6,12 @@
   "requirements": ["matplotlib"],
   "versions": [
     {
+      "version": "0.6.1",
+      "min_core_version": "2.5.0",
+      "changelog": "Album page: 'Deep scan all non-CLEAN' button queues a whole-file deep scan for every track whose verdict is not CLEAN (verified and already-queued tracks are skipped; jobs run on the default queue so all workers share them).",
+      "sourceUrl": "http://10.10.1.203:8120/spectrum_analyzer.zip"
+    },
+    {
       "version": "0.6.0",
       "min_core_version": "2.5.0",
       "changelog": "Overview filter rework: filter albums by the statuses their songs contain via per-verdict chips (CLEAN / CONSISTENT_LOSSY / LOWPASSED / UPSAMPLED / UPSCALED / TRANSCODED_LOSSY / FAKE_SUSPECT, any combination), optionally matching unverified tracks only. Combines with the min-suspect-count and has-verified filters; pagination preserves all filters.",
