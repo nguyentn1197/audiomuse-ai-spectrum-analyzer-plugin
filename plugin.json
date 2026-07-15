@@ -6,6 +6,24 @@
   "requirements": ["matplotlib"],
   "versions": [
     {
+      "version": "0.4.1",
+      "min_core_version": "2.5.0",
+      "changelog": "Fix: album names containing &, ?, # or other URL-special characters broke the album page link (query string was built without percent-encoding). All album links and pagination URLs are now properly URL-encoded.",
+      "sourceUrl": "http://10.10.1.203:8120/spectrum_analyzer.zip"
+    },
+    {
+      "version": "0.4.0",
+      "min_core_version": "2.5.0",
+      "changelog": "Fake 24-bit detection: PCM samples are probed for zero-padded low bits (new UPSCALED verdict, effective/container bits stored and shown per track). UPSAMPLED confidence is now corroborated by aliasing-image analysis: content above the cutoff that mirrors the band below it is a resampler artifact, not a dark master.",
+      "sourceUrl": "http://10.10.1.203:8120/spectrum_analyzer.zip"
+    },
+    {
+      "version": "0.3.1",
+      "min_core_version": "2.5.0",
+      "changelog": "UPSAMPLED detection now matches the cutoff against every standard rate's Nyquist (22.05/24/44.1/48 kHz), so 48 kHz->96 kHz upsamples (content stopping at 24 kHz) are caught, not just 44.1 kHz sources. Confidence is graded by edge sharpness and shelf silence.",
+      "sourceUrl": "http://10.10.1.203:8120/spectrum_analyzer.zip"
+    },
+    {
       "version": "0.3.0",
       "min_core_version": "2.5.0",
       "changelog": "New UPSAMPLED verdict for fake hi-res: a >48 kHz container whose content stops at CD bandwidth (with digital silence above) is flagged as a resampled 44.1/48 kHz source instead of CLEAN. UPSAMPLED counts as suspect in the overview filters.",

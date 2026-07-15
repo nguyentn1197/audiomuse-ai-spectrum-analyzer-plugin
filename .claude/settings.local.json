@@ -4,7 +4,9 @@
       "Bash(git *)",
       "Bash(find *)",
       "Bash(python*)",
-      "Bash(pip*)"
+      "Bash(pip*)",
+      "WebSearch",
+      "WebFetch(domain:github.com)"
     ]
   }
 }

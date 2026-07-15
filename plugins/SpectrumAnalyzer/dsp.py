@@ -130,8 +130,79 @@ def _expected_cutoff_for_bitrate(bitrate_kbps):
 # keeps dither / analog noise, typically within ~120 dB of the reference.
 SILENT_SHELF_DB = -120.0
 
+# Nyquist frequencies of the standard rates a hi-res file may be upsampled from.
+_STD_NYQUISTS = (22050.0, 24000.0, 44100.0, 48000.0)
 
-def _verdict(sr, suffix, bitrate_kbps, cutoff_hz, edge_db_khz, shelf_db):
+
+def _bit_depth_probe(path, max_seconds=30.0):
+    """(container_bits, effective_bits) from the PCM samples themselves.
+
+    A 16-bit master padded into a 24-bit container leaves the low 8 bits of
+    every sample zero; libsndfile left-justifies samples into int32, so the
+    effective depth is 32 minus the fewest trailing zero bits seen. Returns
+    (None, None) when the container has no fixed bit depth or can't be read
+    (lossy formats, ALAC-in-m4a, float WAV...).
+    """
+    try:
+        import soundfile as sf
+        info = sf.info(path)
+    except Exception:
+        return None, None
+    digits = ''.join(ch for ch in (info.subtype or '') if ch.isdigit())
+    bits = int(digits) if digits else None
+    if not bits or bits <= 16:
+        return bits, bits  # nothing to fake in a 16-bit container
+    try:
+        with sf.SoundFile(path) as f:
+            frames = int(max_seconds * f.samplerate)
+            if f.seekable() and f.frames > frames * 2:
+                f.seek((f.frames - frames) // 2)
+            data = f.read(frames, dtype='int32', always_2d=True)
+    except Exception:
+        return bits, None
+    x = np.asarray(data).ravel().astype(np.int64)  # int64: -x of INT32_MIN overflows
+    x = x[x != 0]
+    if x.size < 1000:
+        return bits, None  # too quiet to judge
+    lowest_set_bit = (x & -x).astype(np.float64)
+    effective = int(32 - np.min(np.log2(lowest_set_bit)))
+    return bits, min(bits, effective)
+
+
+def _alias_image_corr(freqs, profile, mirror_hz, width_hz=4000.0):
+    """Correlation between the band above `mirror_hz` and the band below it,
+    mirrored. A cheap resampler folds images of the source content around the
+    old Nyquist, so a high correlation means the energy above the cutoff is a
+    resampler artifact rather than genuine noise or a dark master."""
+    nyquist = float(freqs[-1])
+    width = min(width_hz, nyquist - mirror_hz - 200.0, mirror_hz - 200.0)
+    if width < 1500.0:
+        return None
+    lo = profile[(freqs >= mirror_hz - width) & (freqs < mirror_hz)]
+    hi = profile[(freqs > mirror_hz) & (freqs <= mirror_hz + width)]
+    n = min(lo.size, hi.size)
+    if n < 32:
+        return None
+    lo = lo[-n:]
+    hi = hi[:n][::-1]  # hi[k] at mirror+k*df pairs with lo at mirror-k*df
+    if np.ptp(lo) < 1e-6 or np.ptp(hi) < 1e-6:
+        return None  # flat band (e.g. digital silence): correlation undefined
+    c = np.corrcoef(lo, hi)[0, 1]
+    return float(c) if np.isfinite(c) else None
+
+
+def _resample_match(nyquist, cutoff_hz):
+    """Source sample rate whose Nyquist the cutoff aligns with (within 5%),
+    when that Nyquist sits well below the container's own — the signature a
+    resampler's anti-alias filter leaves in an upsampled file."""
+    for q in _STD_NYQUISTS:
+        if q <= 0.75 * nyquist and abs(cutoff_hz - q) <= 0.05 * q:
+            return int(q * 2)
+    return None
+
+
+def _verdict(sr, suffix, bitrate_kbps, cutoff_hz, edge_db_khz, shelf_db,
+             freqs=None, profile=None):
     nyquist = sr / 2.0
     suffix = (suffix or '').lower().lstrip('.')
     # Genuine 44.1 kHz masters legitimately roll off at 20-21 kHz (ADC
@@ -145,16 +216,32 @@ def _verdict(sr, suffix, bitrate_kbps, cutoff_hz, edge_db_khz, shelf_db):
     notes = []
 
     if cutoff_hz >= full_threshold:
-        # a hi-res container whose content stops at CD bandwidth is a
-        # resampled 44.1/48 kHz source sold as hi-res; a genuine hi-res
-        # master keeps content (or at least noise) above 23 kHz
-        if nyquist > 24000.0 and cutoff_hz < 23000.0:
-            est = ('likely 44.1/48 kHz source'
-                   if cutoff_hz >= 21600.0 else 'CD-bandwidth source')
-            if silent_shelf:
-                return 'UPSAMPLED', est, 0.85, notes
-            notes.append('noise above the cutoff: could be a very dark genuine master')
-            return 'UPSAMPLED', est, 0.6, notes
+        # hi-res container: content stopping at a lower standard rate's
+        # Nyquist (22.05 k / 24 k / 44.1 k / 48 k), or below 23 kHz at all,
+        # is a resampled source sold as hi-res; a genuine hi-res master
+        # keeps content or noise well above that
+        if nyquist > 24000.0:
+            src_rate = _resample_match(nyquist, cutoff_hz)
+            if src_rate or cutoff_hz < 23000.0:
+                if src_rate:
+                    est = f'likely {src_rate / 1000.0:g} kHz source'
+                else:
+                    est = ('likely 44.1/48 kHz source'
+                           if cutoff_hz >= 21600.0 else 'CD-bandwidth source')
+                conf = 0.5 + (0.25 if sharp else 0.0) + (0.15 if silent_shelf else 0.0)
+                if silent_shelf:
+                    return 'UPSAMPLED', est, conf, notes
+                corr = (None if freqs is None or profile is None
+                        else _alias_image_corr(freqs, profile, cutoff_hz))
+                if corr is not None and corr >= 0.6:
+                    # the "noise" above the cutoff mirrors the band below it:
+                    # resampler aliasing images, not a genuine noise floor
+                    notes.append(f'content above the cutoff mirrors the band below '
+                                 f'(correlation {corr:.2f}): resampler aliasing images')
+                    return 'UPSAMPLED', est, max(conf, 0.9), notes
+                notes.append('some content above the cutoff: '
+                             'could be a genuine but dark master')
+                return 'UPSAMPLED', est, conf, notes
         return 'CLEAN', 'full bandwidth', 0.9, notes
 
     if nyquist > 24000.0 and cutoff_hz < 23000.0:
@@ -231,7 +318,19 @@ def analyze_file(path, suffix=None, bitrate_kbps=None, segment_seconds=90,
     cutoff_hz, ref = _find_cutoff(freqs, profile, drop_db)
     edge = _edge_sharpness(freqs, profile, cutoff_hz)
     shelf = _shelf_level(freqs, profile, cutoff_hz, ref)
-    verdict, est, conf, notes = _verdict(sr, suffix, bitrate_kbps, cutoff_hz, edge, shelf)
+    verdict, est, conf, notes = _verdict(sr, suffix, bitrate_kbps, cutoff_hz, edge, shelf,
+                                         freqs=freqs, profile=profile)
+
+    container_bits, effective_bits = _bit_depth_probe(path)
+    if (container_bits or 0) > 16 and effective_bits and effective_bits <= 16:
+        if verdict == 'CLEAN':
+            verdict = 'UPSCALED'
+            est = f'{effective_bits}-bit source in a {container_bits}-bit container'
+            conf = 0.95  # zero-padded low bits are a deterministic signature
+        else:
+            notes.append(f'bit depth: only {effective_bits} effective bits in a '
+                         f'{container_bits}-bit container (padded)')
+
     png_b64 = _render_spectrogram(S_db, sr, offset, seg_len, cutoff_hz, img_w, img_h)
 
     return {
@@ -244,12 +343,16 @@ def analyze_file(path, suffix=None, bitrate_kbps=None, segment_seconds=90,
         'verdict': verdict,
         'est_source': est,
         'confidence': round(conf, 2),
+        'container_bits': container_bits,
+        'effective_bits': effective_bits,
         'details': json.dumps({
             'ref_level_db': round(ref, 2),
             'drop_db': drop_db,
             'nyquist_hz': sr / 2.0,
             'full_bandwidth_threshold_hz': round(min(0.93 * sr / 2.0, 20500.0), 1),
             'shelf_db': round(shelf, 2) if shelf is not None else None,
+            'container_bits': container_bits,
+            'effective_bits': effective_bits,
             'declared_bitrate_kbps': bitrate_kbps,
             'suffix': suffix,
             'notes': notes,

@@ -8,6 +8,7 @@ Cleanup: results table cascades on DELETE FROM score (the core cleanup task).
 
 import html
 import uuid
+from urllib.parse import urlencode
 
 from flask import Blueprint, request, redirect, url_for
 
@@ -25,10 +26,11 @@ VERDICT_STYLE = {
     'CONSISTENT_LOSSY': ('#2563eb', 'Lossy, consistent with container'),
     'LOWPASSED':        ('#d97706', 'Low-passed (possibly genuine master)'),
     'UPSAMPLED':        ('#7c3aed', 'Fake hi-res: resampled from a lower-rate source'),
+    'UPSCALED':         ('#7c3aed', 'Fake 24-bit: zero-padded 16-bit source'),
     'TRANSCODED_LOSSY': ('#dc2626', 'Lossy re-encoded from lower bitrate'),
     'FAKE_SUSPECT':     ('#dc2626', 'Suspect fake lossless (transcode)'),
 }
-SUSPECT_VERDICTS = ('FAKE_SUSPECT', 'TRANSCODED_LOSSY', 'UPSAMPLED')
+SUSPECT_VERDICTS = ('FAKE_SUSPECT', 'TRANSCODED_LOSSY', 'UPSAMPLED', 'UPSCALED')
 
 
 def migrate(db):
@@ -43,9 +45,13 @@ def migrate(db):
         ' sample_rate INTEGER, seg_offset REAL, seg_seconds REAL,'
         ' cutoff_hz REAL, edge_db_khz REAL, shelf_db REAL,'
         ' verdict TEXT, est_source TEXT, confidence REAL, details TEXT,'
+        ' container_bits INTEGER, effective_bits INTEGER,'
         ' spectrogram_b64 TEXT,'
         ' analyzed_at TIMESTAMP DEFAULT now())'
     )
+    # 0.4.0: bit-depth columns for installs upgrading from older schemas
+    cur.execute('ALTER TABLE ' + tbl + ' ADD COLUMN IF NOT EXISTS container_bits INTEGER')
+    cur.execute('ALTER TABLE ' + tbl + ' ADD COLUMN IF NOT EXISTS effective_bits INTEGER')
     cur.execute('CREATE INDEX IF NOT EXISTS ' + tbl + '_album_idx ON ' + tbl + ' (album)')
     # optional weekly incremental scan, shipped disabled (admin enables it)
     cur.execute(
@@ -134,7 +140,7 @@ def home():
     album_rows = ''.join(
         '<tr>'
         f'<td style="padding:.3rem .6rem;border-top:1px solid #ccc;">'
-        f'<a href="{url_for("spectrum_analyzer.album")}?name={_esc(album)}">{_esc(album) or "(no album)"}</a></td>'
+        f'<a href="{_esc(url_for("spectrum_analyzer.album", name=album or ""))}">{_esc(album) or "(no album)"}</a></td>'
         f'<td style="padding:.3rem .6rem;border-top:1px solid #ccc;text-align:right;">{count}</td>'
         f'<td style="padding:.3rem .6rem;border-top:1px solid #ccc;text-align:right;'
         f'color:{"#dc2626" if bad else "#16a34a"};font-weight:600;">{bad}</td>'
@@ -143,12 +149,17 @@ def home():
         '</tr>'
         for album, count, bad, min_cut, last in rows)
 
-    qs = f'q={_esc(q)}&min_bad={min_bad}' + ('&suspects=1' if suspects_only else '')
+    def page_url(p):
+        params = {'q': q, 'min_bad': min_bad, 'p': p}
+        if suspects_only:
+            params['suspects'] = 1
+        return '?' + _esc(urlencode(params))
+
     nav = ''
     if page > 0:
-        nav += f'<a href="?{qs}&p={page - 1}" style="margin-right:1rem;">&laquo; prev</a>'
+        nav += f'<a href="{page_url(page - 1)}" style="margin-right:1rem;">&laquo; prev</a>'
     if has_next:
-        nav += f'<a href="?{qs}&p={page + 1}">next &raquo;</a>'
+        nav += f'<a href="{page_url(page + 1)}">next &raquo;</a>'
 
     body = (
         f'<p><strong>{total}</strong> songs analyzed across <strong>{n_albums}</strong> albums; '
@@ -190,7 +201,8 @@ def album():
     cur.execute(
         'SELECT item_id, title, artist, suffix, bitrate, sample_rate, cutoff_hz,'
         ' edge_db_khz, verdict, est_source, confidence, details,'
-        ' to_char(analyzed_at, \'DD-MM-YYYY HH24:MI\'), spectrogram_b64, album_id'
+        ' to_char(analyzed_at, \'DD-MM-YYYY HH24:MI\'), spectrogram_b64, album_id,'
+        ' container_bits, effective_bits'
         ' FROM ' + tbl + ' WHERE album = %s ORDER BY title', (name,))
     rows = cur.fetchall()
     cur.close()
@@ -199,8 +211,15 @@ def album():
 
     cards = []
     for (item_id, title, artist, suffix, bitrate, sr, cutoff, edge, verdict,
-         est, conf, details, when, png, _aid) in rows:
-        fmt = f'{_esc(suffix)}{f" {bitrate}k" if bitrate else ""} / {sr or "?"} Hz'
+         est, conf, details, when, png, _aid, cbits, ebits) in rows:
+        if cbits and ebits and ebits < cbits:
+            bits = (f' / <span style="color:#dc2626;font-weight:600;" '
+                    f'title="effective bits / container bits">{ebits}&rarr;{cbits} bit</span>')
+        elif cbits:
+            bits = f' / {cbits} bit'
+        else:
+            bits = ''
+        fmt = f'{_esc(suffix)}{f" {bitrate}k" if bitrate else ""} / {sr or "?"} Hz{bits}'
         img = (f'<img src="data:image/png;base64,{png}" alt="spectrogram" loading="lazy" '
                f'style="max-width:100%;height:auto;border:1px solid #ddd;border-radius:4px;">'
                ) if png else '<em>no spectrogram stored</em>'
@@ -291,7 +310,7 @@ def rescan_album():
         for item_id in item_ids:
             enqueue(jobs.analyze_track_job, item_id)
     return redirect(request.referrer
-                    or url_for('spectrum_analyzer.album') + f'?name={name}')
+                    or url_for('spectrum_analyzer.album', name=name))
 
 
 # --------------------------------------------------------------- settings --
