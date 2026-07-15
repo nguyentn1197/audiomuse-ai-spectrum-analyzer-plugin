@@ -6,6 +6,12 @@
   "requirements": ["matplotlib"],
   "versions": [
     {
+      "version": "0.2.0",
+      "min_core_version": "2.5.0",
+      "changelog": "Parallel scans: one task per album fanned out across all workers, with a parent task tracking done/remaining. Fewer false FAKE_SUSPECT verdicts: content reaching ~20.5 kHz counts as full bandwidth, and a sharp edge with audible noise above the cutoff is now LOWPASSED, not FAKE. UI: filter albums by suspect count, re-analyze a whole album from its page.",
+      "sourceUrl": "http://10.10.1.203:8120/spectrum_analyzer.zip"
+    },
+    {
       "version": "0.1.0",
       "min_core_version": "2.5.0",
       "changelog": "Initial release: library scan grouped by album, change detection (metadata fingerprint + audio MD5), fake-lossless verdicts, base64 spectrograms, per-track re-analysis, on_song_analyzed hook, optional weekly incremental cron.",

@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git *)",
+      "Bash(find *)",
+      "Bash(python*)",
+      "Bash(pip*)"
+    ]
+  }
+}

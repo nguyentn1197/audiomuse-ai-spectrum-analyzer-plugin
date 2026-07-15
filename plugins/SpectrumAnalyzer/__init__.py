@@ -80,6 +80,13 @@ def home():
     tbl = table('results')
     q = (request.args.get('q') or '').strip()
     page = max(0, int(request.args.get('p', 0) or 0))
+    suspects_only = bool(request.args.get('suspects'))
+    try:
+        min_bad = max(0, int(request.args.get('min_bad', 0) or 0))
+    except ValueError:
+        min_bad = 0
+    if suspects_only:
+        min_bad = max(1, min_bad)
     per_page = 100
 
     db = get_db()
@@ -90,14 +97,20 @@ def home():
         ' COUNT(DISTINCT album) FROM ' + tbl, (SUSPECT_VERDICTS,))
     total, suspects, n_albums = cur.fetchone()
 
+    having = ' HAVING COUNT(*) FILTER (WHERE verdict IN %s) >= %s' if min_bad else ''
+    params = [SUSPECT_VERDICTS, f'%{q}%']
+    if min_bad:
+        params += [SUSPECT_VERDICTS, min_bad]
+    params += [SUSPECT_VERDICTS, per_page + 1, page * per_page]
     cur.execute(
         'SELECT album, COUNT(*),'
         ' COUNT(*) FILTER (WHERE verdict IN %s),'
         ' MIN(cutoff_hz), to_char(MAX(analyzed_at), \'DD-MM-YYYY HH24:MI\')'
         ' FROM ' + tbl + ' WHERE album ILIKE %s GROUP BY album'
+        + having +
         ' ORDER BY COUNT(*) FILTER (WHERE verdict IN %s) DESC, album'
         ' LIMIT %s OFFSET %s',
-        (SUSPECT_VERDICTS, f'%{q}%', SUSPECT_VERDICTS, per_page + 1, page * per_page))
+        tuple(params))
     rows = cur.fetchall()
     cur.close()
     has_next = len(rows) > per_page
@@ -129,11 +142,12 @@ def home():
         '</tr>'
         for album, count, bad, min_cut, last in rows)
 
+    qs = f'q={_esc(q)}&min_bad={min_bad}' + ('&suspects=1' if suspects_only else '')
     nav = ''
     if page > 0:
-        nav += f'<a href="?q={_esc(q)}&p={page - 1}" style="margin-right:1rem;">&laquo; prev</a>'
+        nav += f'<a href="?{qs}&p={page - 1}" style="margin-right:1rem;">&laquo; prev</a>'
     if has_next:
-        nav += f'<a href="?q={_esc(q)}&p={page + 1}">next &raquo;</a>'
+        nav += f'<a href="?{qs}&p={page + 1}">next &raquo;</a>'
 
     body = (
         f'<p><strong>{total}</strong> songs analyzed across <strong>{n_albums}</strong> albums; '
@@ -143,8 +157,14 @@ def home():
         '<p style="font-size:.85rem;color:#6b7280;">Scans run on the worker, album by album; '
         'progress appears under Active Tasks. Already-analyzed tracks are skipped unless '
         'their file changed.</p>'
-        f'<form method="get" style="margin:.8rem 0;">'
+        f'<form method="get" style="margin:.8rem 0;display:flex;gap:.8rem;'
+        f'align-items:center;flex-wrap:wrap;">'
         f'<input name="q" value="{_esc(q)}" placeholder="filter albums...">'
+        f'<label style="white-space:nowrap;"><input type="checkbox" name="suspects" '
+        f'value="1" {"checked" if suspects_only else ""}> only albums with suspects</label>'
+        f'<label style="white-space:nowrap;">min suspect tracks '
+        f'<input type="number" name="min_bad" min="0" value="{min_bad}" '
+        f'style="width:4rem;"></label>'
         f'<button type="submit" class="btn">Filter</button></form>'
         '<table style="border-collapse:collapse;width:100%;font-size:.95rem;">'
         '<tr><th style="text-align:left;padding:.3rem .6rem;">Album</th>'
@@ -169,14 +189,16 @@ def album():
     cur.execute(
         'SELECT item_id, title, artist, suffix, bitrate, sample_rate, cutoff_hz,'
         ' edge_db_khz, verdict, est_source, confidence, details,'
-        ' to_char(analyzed_at, \'DD-MM-YYYY HH24:MI\'), spectrogram_b64'
+        ' to_char(analyzed_at, \'DD-MM-YYYY HH24:MI\'), spectrogram_b64, album_id'
         ' FROM ' + tbl + ' WHERE album = %s ORDER BY title', (name,))
     rows = cur.fetchall()
     cur.close()
 
+    album_id = next((r[14] for r in rows if r[14]), None)
+
     cards = []
     for (item_id, title, artist, suffix, bitrate, sr, cutoff, edge, verdict,
-         est, conf, details, when, png) in rows:
+         est, conf, details, when, png, _aid) in rows:
         fmt = f'{_esc(suffix)}{f" {bitrate}k" if bitrate else ""} / {sr or "?"} Hz'
         img = (f'<img src="data:image/png;base64,{png}" alt="spectrogram" loading="lazy" '
                f'style="max-width:100%;height:auto;border:1px solid #ddd;border-radius:4px;">'
@@ -201,9 +223,20 @@ def album():
             '</details></div>'
         )
 
+    rescan_all = (
+        f'<form method="post" action="{url_for("spectrum_analyzer.rescan_album")}" '
+        f'style="display:inline;">'
+        f'<input type="hidden" name="name" value="{_esc(name)}">'
+        f'<input type="hidden" name="album_id" value="{_esc(album_id or "")}">'
+        f'<button type="submit" class="btn btn-primary" '
+        f'title="Force re-download and re-analyze every track in this album">'
+        'Re-analyze album</button></form>') if rows else ''
+
     body = (
         f'<p><a href="{url_for("spectrum_analyzer.home")}">&laquo; all albums</a></p>'
-        f'<h3>{_esc(name) or "(no album)"}</h3>'
+        f'<div style="display:flex;justify-content:space-between;align-items:center;'
+        f'flex-wrap:wrap;gap:.5rem;">'
+        f'<h3 style="margin:.2rem 0;">{_esc(name) or "(no album)"}</h3>{rescan_all}</div>'
         + (''.join(cards) or '<p>No analyzed tracks in this album.</p>')
     )
     return render_page(body, title='Spectrum Analyzer')
@@ -219,10 +252,13 @@ def scan():
     task_id = str(uuid.uuid4())
     save_task_status(task_id, jobs.TASK_TYPE, TASK_STATUS_PENDING,
                      details={'mode': mode, 'info': 'queued'})
-    enqueue(jobs.scan_library_job, mode=mode, task_id=task_id)
+    # the orchestrator lives on the high queue so its per-album children
+    # (default queue) can be picked up by every default worker in parallel
+    enqueue(jobs.scan_library_job, mode=mode, task_id=task_id, queue='high')
     return render_page(
         f'<p>Library scan started (mode: <strong>{_esc(mode)}</strong>). '
-        'Follow progress under Active Tasks.</p>'
+        'Albums are dispatched as parallel worker tasks; follow overall progress '
+        'and per-album sub-tasks under Active Tasks.</p>'
         f'<p><a href="{url_for("spectrum_analyzer.home")}">Back</a></p>',
         title='Spectrum Analyzer')
 
@@ -231,6 +267,30 @@ def scan():
 def rescan(item_id):
     enqueue(jobs.analyze_track_job, item_id, queue='high')
     return redirect(request.referrer or url_for('spectrum_analyzer.home'))
+
+
+@bp.route('/album/rescan', methods=['POST'])
+def rescan_album():
+    name = request.form.get('name') or ''
+    album_id = (request.form.get('album_id') or '').strip()
+    if album_id:
+        task_id = str(uuid.uuid4())
+        save_task_status(task_id, jobs.ALBUM_TASK_TYPE, TASK_STATUS_PENDING,
+                         sub_type_identifier=name,
+                         details={'mode': 'force', 'album': name, 'info': 'queued'})
+        enqueue(jobs.scan_album_job, album_id, name, mode='force', task_id=task_id)
+    else:
+        # no album id stored (e.g. hook-inserted rows): re-run track by track
+        db = get_db()
+        cur = db.cursor()
+        cur.execute('SELECT item_id FROM ' + table('results') + ' WHERE album = %s',
+                    (name,))
+        item_ids = [r[0] for r in cur.fetchall()]
+        cur.close()
+        for item_id in item_ids:
+            enqueue(jobs.analyze_track_job, item_id)
+    return redirect(request.referrer
+                    or url_for('spectrum_analyzer.album') + f'?name={name}')
 
 
 # --------------------------------------------------------------- settings --
@@ -277,5 +337,7 @@ def register(ctx):
     ctx.on_install(migrate)
     ctx.add_blueprint(bp)
     ctx.add_menu_item('Spectrum', 'spectrum_analyzer.home')
-    ctx.add_task('scan_changed', jobs.scan_changed_task)
+    # high queue: the orchestrator must not occupy the default workers its
+    # per-album child jobs run on
+    ctx.add_task('scan_changed', jobs.scan_changed_task, queue='high')
     ctx.on_song_analyzed(jobs.on_song_analyzed)

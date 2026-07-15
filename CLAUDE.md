@@ -16,7 +16,8 @@ An AudioMuse-AI plugin for audio spectrum analysis that detects fake lossless fi
   - `changed`: skip tracks whose metadata fingerprint (path, size, bitrate, etc.) hasn't changed
   - `verify`: download every file, re-analyze only if audio MD5 differs (catches in-place edits invisible to metadata)
   - `force`: re-download and re-analyze everything
-  - `scan_library_job()` iterates albums from the media server, implements change detection (fingerprint → MD5), and upserts results.
+  - `scan_library_job()` is a parent orchestrator (must run on the **high** queue): it fans out one `scan_album_job()` per album onto the default queue with `parent_task_id`, throttles in-flight children to `config.MAX_QUEUED_ANALYSIS_JOBS`, and tracks done/remaining by polling the children's `task_status` rows (statuses + counters aggregated from their details JSON). In `changed` mode it settles all-unchanged albums itself without spawning a child. Cancellation: it checks its own row for REVOKED each poll; children check the parent's status at start. This mirrors core's `run_analysis_task`/`analyze_album_task` pattern.
+  - `scan_album_job()` also runs standalone (no parent) for the album Re-analyze button.
   - `on_song_analyzed()` hook piggybacks on core analysis when the audio is already on disk (no extra download).
 
 - **`dsp.py`** — Audio DSP (librosa + numpy) and analysis pipeline:
@@ -24,7 +25,7 @@ An AudioMuse-AI plugin for audio spectrum analysis that detects fake lossless fi
   - `_spectrum()` computes STFT, reduces to per-frequency 95th-percentile profile (robust against silence/clicks).
   - `_find_cutoff()` locates the highest frequency within a drop threshold (default: 40 dB below 1–8 kHz reference).
   - `_edge_sharpness()` measures rolloff steepness in dB/kHz (encoder low-pass filters are near-vertical; natural rolloff is gradual).
-  - `_verdict()` decision logic: full bandwidth → CLEAN; lossless + sharp edge → FAKE_SUSPECT; gradual rolloff → LOWPASSED; lossy with low cutoff relative to declared bitrate → TRANSCODED_LOSSY; otherwise CONSISTENT_LOSSY.
+  - `_verdict()` decision logic: cutoff ≥ min(0.93 × Nyquist, 20.5 kHz) → CLEAN (genuine masters roll off at 20–21 kHz; near-Nyquist edges are meaningless — this deliberately lets ~320 kbps transcodes pass to avoid false accusations); lossless + sharp edge + digitally silent shelf (≤ −120 dB vs. reference) → FAKE_SUSPECT; sharp edge but audible noise above cutoff → LOWPASSED (encoder walls leave silence, masters leave dither); gradual rolloff → LOWPASSED; lossy with low cutoff relative to declared bitrate → TRANSCODED_LOSSY; otherwise CONSISTENT_LOSSY.
   - `_render_spectrogram()` matplotlib-based PNG (spek-style color map, red line at detected cutoff), base64 encoded, tunable in settings.
 
 ### Database

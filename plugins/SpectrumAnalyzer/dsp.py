@@ -67,12 +67,20 @@ def _find_cutoff(freqs, profile, drop_db):
 
 def _edge_sharpness(freqs, profile, cutoff_hz):
     """Level drop across the cutoff in dB per kHz. A lossy encoder's low-pass
-    is a near-vertical wall; a natural rolloff is gradual."""
+    is a near-vertical wall; a natural rolloff is gradual. Near Nyquist the
+    upper band is truncated and every rolloff looks like a wall, so the
+    measurement needs at least ~500 Hz of band above the cutoff to mean
+    anything."""
+    nyquist = float(freqs[-1])
+    hi_top = min(cutoff_hz + 1500, nyquist)
+    span_khz = (hi_top - cutoff_hz) / 1000.0
+    if span_khz < 0.5:
+        return 0.0
     lo = profile[(freqs >= cutoff_hz - 1000) & (freqs < cutoff_hz)]
-    hi = profile[(freqs > cutoff_hz) & (freqs <= cutoff_hz + 1500)]
+    hi = profile[(freqs > cutoff_hz) & (freqs <= hi_top)]
     if lo.size == 0 or hi.size == 0:
         return 0.0
-    return float((np.mean(lo) - np.mean(hi)) / 1.25)
+    return float((np.mean(lo) - np.mean(hi)) / (0.5 + span_khz / 2.0))
 
 
 def _shelf_level(freqs, profile, cutoff_hz, ref):
@@ -117,11 +125,22 @@ def _expected_cutoff_for_bitrate(bitrate_kbps):
     return None
 
 
+# Above the cutoff a real encoder wall leaves essentially digital silence
+# (the dB profile bottoms out ~200 dB below any signal); a genuine master
+# keeps dither / analog noise, typically within ~120 dB of the reference.
+SILENT_SHELF_DB = -120.0
+
+
 def _verdict(sr, suffix, bitrate_kbps, cutoff_hz, edge_db_khz, shelf_db):
     nyquist = sr / 2.0
     suffix = (suffix or '').lower().lstrip('.')
-    full_threshold = 21000.0 if nyquist >= 22050 else 0.955 * nyquist
+    # Genuine 44.1 kHz masters legitimately roll off at 20-21 kHz (ADC
+    # anti-alias filters, mastering chains), and any rolloff measured against
+    # the Nyquist wall looks sharp, so content reaching ~93% of Nyquist
+    # (capped at 20.5 kHz for high-rate files) counts as full bandwidth.
+    full_threshold = min(0.93 * nyquist, 20500.0)
     sharp = edge_db_khz >= 25.0
+    silent_shelf = shelf_db is None or shelf_db <= SILENT_SHELF_DB
     margin = max(0.0, min(1.0, (full_threshold - cutoff_hz) / full_threshold))
     notes = []
 
@@ -134,9 +153,13 @@ def _verdict(sr, suffix, bitrate_kbps, cutoff_hz, edge_db_khz, shelf_db):
     est = _estimate_source(cutoff_hz)
 
     if suffix in LOSSLESS_SUFFIXES:
-        if sharp:
+        if sharp and silent_shelf:
             conf = min(0.95, 0.6 + 0.5 * margin + min(0.15, (edge_db_khz - 25.0) / 200.0))
             return 'FAKE_SUSPECT', est, conf, notes
+        if sharp:
+            notes.append('sharp edge but audible noise floor above the cutoff: '
+                         'more likely a low-passed master than an encoder wall')
+            return 'LOWPASSED', est, 0.5 + 0.3 * margin, notes
         notes.append('gradual rolloff: could be a genuine low-passed master, not a transcode')
         return 'LOWPASSED', est, 0.45 + 0.3 * margin, notes
 
@@ -215,6 +238,8 @@ def analyze_file(path, suffix=None, bitrate_kbps=None, segment_seconds=90,
             'ref_level_db': round(ref, 2),
             'drop_db': drop_db,
             'nyquist_hz': sr / 2.0,
+            'full_bandwidth_threshold_hz': round(min(0.93 * sr / 2.0, 20500.0), 1),
+            'shelf_db': round(shelf, 2) if shelf is not None else None,
             'declared_bitrate_kbps': bitrate_kbps,
             'suffix': suffix,
             'notes': notes,
