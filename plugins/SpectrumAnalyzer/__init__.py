@@ -55,6 +55,9 @@ def migrate(db):
     # 0.5.0: manual verification flag (verified tracks don't count as suspect)
     cur.execute('ALTER TABLE ' + tbl +
                 ' ADD COLUMN IF NOT EXISTS verified BOOLEAN NOT NULL DEFAULT FALSE')
+    # 0.5.1: set while a deep scan is queued/running, cleared when it finishes
+    cur.execute('ALTER TABLE ' + tbl +
+                ' ADD COLUMN IF NOT EXISTS deep_pending BOOLEAN NOT NULL DEFAULT FALSE')
     cur.execute('CREATE INDEX IF NOT EXISTS ' + tbl + '_album_idx ON ' + tbl + ' (album)')
     # optional weekly incremental scan, shipped disabled (admin enables it)
     cur.execute(
@@ -90,8 +93,10 @@ def home():
     tbl = table('results')
     q = (request.args.get('q') or '').strip()
     page = max(0, int(request.args.get('p', 0) or 0))
-    suspects_only = bool(request.args.get('suspects'))
+    suspects_only = bool(request.args.get('suspects'))  # legacy links
     verified_only = bool(request.args.get('verified'))
+    unverified_only = bool(request.args.get('unv'))
+    sel_verdicts = [v for v in request.args.getlist('v') if v in VERDICT_STYLE]
     try:
         min_bad = max(0, int(request.args.get('min_bad', 0) or 0))
     except ValueError:
@@ -113,6 +118,11 @@ def home():
 
     having = []
     having_params = []
+    if sel_verdicts:
+        # albums containing at least one song with any selected status
+        cond = 'verdict = ANY(%s)' + (' AND NOT verified' if unverified_only else '')
+        having.append('COUNT(*) FILTER (WHERE ' + cond + ') > 0')
+        having_params.append(sel_verdicts)
     if min_bad:
         having.append(bad_expr + ' >= %s')
         having_params += [SUSPECT_VERDICTS, min_bad]
@@ -125,6 +135,7 @@ def home():
     cur.execute(
         'SELECT album, COUNT(*), ' + bad_expr + ','
         ' COUNT(*) FILTER (WHERE verified),'
+        ' COUNT(*) FILTER (WHERE deep_pending),'
         ' MIN(cutoff_hz), to_char(MAX(analyzed_at), \'DD-MM-YYYY HH24:MI\')'
         ' FROM ' + tbl + ' WHERE album ILIKE %s GROUP BY album'
         + having_sql +
@@ -150,10 +161,25 @@ def home():
              'Recomputes everything, including unchanged files'),
         ))
 
+    def _album_tags(ver, pending):
+        tags = ''
+        if pending:
+            tags += ('<span style="background:#f59e0b;color:#fff;border-radius:4px;'
+                     'padding:.05rem .4rem;font-size:.75rem;margin-left:.4rem;'
+                     'white-space:nowrap;" title="Tracks with a deep scan queued or '
+                     f'running">deep scan &times;{pending}</span>')
+        if ver:
+            tags += ('<span style="background:#16a34a;color:#fff;border-radius:4px;'
+                     'padding:.05rem .4rem;font-size:.75rem;margin-left:.4rem;'
+                     'white-space:nowrap;" title="Manually verified tracks">'
+                     f'verified &times;{ver}</span>')
+        return tags
+
     album_rows = ''.join(
         '<tr>'
         f'<td style="padding:.3rem .6rem;border-top:1px solid #ccc;">'
-        f'<a href="{_esc(url_for("spectrum_analyzer.album", name=album or ""))}">{_esc(album) or "(no album)"}</a></td>'
+        f'<a href="{_esc(url_for("spectrum_analyzer.album", name=album or ""))}">{_esc(album) or "(no album)"}</a>'
+        f'{_album_tags(ver, pending)}</td>'
         f'<td style="padding:.3rem .6rem;border-top:1px solid #ccc;text-align:right;">{count}</td>'
         f'<td style="padding:.3rem .6rem;border-top:1px solid #ccc;text-align:right;'
         f'color:{"#dc2626" if bad else "#16a34a"};font-weight:600;">{bad}</td>'
@@ -162,15 +188,15 @@ def home():
         f'<td style="padding:.3rem .6rem;border-top:1px solid #ccc;text-align:right;">{_khz(min_cut)} kHz</td>'
         f'<td style="padding:.3rem .6rem;border-top:1px solid #ccc;">{_esc(last)}</td>'
         '</tr>'
-        for album, count, bad, ver, min_cut, last in rows)
+        for album, count, bad, ver, pending, min_cut, last in rows)
 
     def page_url(p):
-        params = {'q': q, 'min_bad': min_bad, 'p': p}
-        if suspects_only:
-            params['suspects'] = 1
+        params = {'q': q, 'min_bad': min_bad, 'p': p, 'v': sel_verdicts}
         if verified_only:
             params['verified'] = 1
-        return '?' + _esc(urlencode(params))
+        if unverified_only:
+            params['unv'] = 1
+        return '?' + _esc(urlencode(params, doseq=True))
 
     nav = ''
     if page > 0:
@@ -188,17 +214,33 @@ def home():
         '<p style="font-size:.85rem;color:#6b7280;">Scans run on the worker, album by album; '
         'progress appears under Active Tasks. Already-analyzed tracks are skipped unless '
         'their file changed.</p>'
-        f'<form method="get" style="margin:.8rem 0;display:flex;gap:.8rem;'
-        f'align-items:center;flex-wrap:wrap;">'
+        f'<form method="get" style="margin:.8rem 0;">'
+        f'<div style="display:flex;gap:.8rem;align-items:center;flex-wrap:wrap;">'
         f'<input name="q" value="{_esc(q)}" placeholder="filter albums...">'
-        f'<label style="white-space:nowrap;"><input type="checkbox" name="suspects" '
-        f'value="1" {"checked" if suspects_only else ""}> only albums with suspects</label>'
         f'<label style="white-space:nowrap;">min suspect tracks '
         f'<input type="number" name="min_bad" min="0" value="{min_bad}" '
         f'style="width:4rem;"></label>'
         f'<label style="white-space:nowrap;"><input type="checkbox" name="verified" '
         f'value="1" {"checked" if verified_only else ""}> only albums with verified tracks</label>'
-        f'<button type="submit" class="btn">Filter</button></form>'
+        f'<button type="submit" class="btn">Filter</button></div>'
+        f'<div style="display:flex;gap:.2rem .6rem;align-items:center;flex-wrap:wrap;'
+        f'margin-top:.5rem;">'
+        f'<span style="font-size:.85rem;color:#6b7280;margin-right:.2rem;" '
+        f'title="Show only albums containing at least one song with any of the '
+        f'selected statuses">albums containing:</span>'
+        + ''.join(
+            f'<label style="display:inline-flex;align-items:center;gap:.25rem;'
+            f'font-size:.85rem;white-space:nowrap;cursor:pointer;" title="{_esc(vlabel)}">'
+            f'<input type="checkbox" name="v" value="{v}" '
+            f'{"checked" if v in sel_verdicts else ""}>'
+            f'<span style="background:{color};color:#fff;border-radius:4px;'
+            f'padding:.05rem .4rem;">{v}</span></label>'
+            for v, (color, vlabel) in VERDICT_STYLE.items())
+        + f'<label style="white-space:nowrap;font-size:.85rem;margin-left:.4rem;" '
+          f'title="When matching the selected statuses, ignore manually verified tracks">'
+          f'<input type="checkbox" name="unv" value="1" '
+          f'{"checked" if unverified_only else ""}> unverified tracks only</label>'
+        '</div></form>'
         '<table style="border-collapse:collapse;width:100%;font-size:.95rem;">'
         '<tr><th style="text-align:left;padding:.3rem .6rem;">Album</th>'
         '<th style="text-align:right;padding:.3rem .6rem;">Tracks</th>'
@@ -224,7 +266,7 @@ def album():
         'SELECT item_id, title, artist, suffix, bitrate, sample_rate, cutoff_hz,'
         ' edge_db_khz, verdict, est_source, confidence, details,'
         ' to_char(analyzed_at, \'DD-MM-YYYY HH24:MI\'), spectrogram_b64, album_id,'
-        ' container_bits, effective_bits, verified'
+        ' container_bits, effective_bits, verified, deep_pending'
         ' FROM ' + tbl + ' WHERE album = %s ORDER BY title', (name,))
     rows = cur.fetchall()
     cur.close()
@@ -233,7 +275,8 @@ def album():
 
     cards = []
     for (item_id, title, artist, suffix, bitrate, sr, cutoff, edge, verdict,
-         est, conf, details, when, png, _aid, cbits, ebits, verified) in rows:
+         est, conf, details, when, png, _aid, cbits, ebits, verified,
+         deep_pending) in rows:
         if cbits and ebits and ebits < cbits:
             bits = (f' / <span style="color:#dc2626;font-weight:600;" '
                     f'title="effective bits / container bits">{ebits}&rarr;{cbits} bit</span>')
@@ -252,7 +295,11 @@ def album():
             f'<div><strong>{_esc(title)}</strong> <span style="color:#6b7280;">'
             f'{_esc(artist)} &middot; {fmt}</span></div>'
             f'<div>{_badge(verdict, conf)}'
-            f'<form method="post" action="{url_for("spectrum_analyzer.verify", item_id=item_id)}" '
+            + ('<span style="background:#f59e0b;color:#fff;border-radius:4px;'
+               'padding:.1rem .45rem;font-size:.8rem;margin-left:.4rem;white-space:nowrap;" '
+               'title="A deep scan is queued or running for this track">'
+               'deep scan queued</span>' if deep_pending else '')
+            + f'<form method="post" action="{url_for("spectrum_analyzer.verify", item_id=item_id)}" '
             f'style="display:inline;margin-left:.6rem;">'
             f'<label style="white-space:nowrap;font-size:.85rem;" '
             f'title="Mark as manually checked: verified tracks are excluded from suspect counts">'
@@ -326,6 +373,14 @@ def rescan(item_id):
 
 @bp.route('/deep_rescan/<item_id>', methods=['POST'])
 def deep_rescan(item_id):
+    # tag first so the page shows "deep scan queued" immediately; the job
+    # clears the flag when it finishes
+    db = get_db()
+    cur = db.cursor()
+    cur.execute('UPDATE ' + table('results') + ' SET deep_pending=TRUE WHERE item_id=%s',
+                (item_id,))
+    db.commit()
+    cur.close()
     enqueue(jobs.analyze_track_job, item_id, deep=True, queue='high')
     return redirect(request.referrer or url_for('spectrum_analyzer.home'))
 

@@ -477,9 +477,33 @@ def scan_library_job(mode='changed', task_id=None):
         raise
 
 
+def _clear_deep_pending(item_id):
+    try:
+        db = get_db()
+        cur = db.cursor()
+        cur.execute('UPDATE ' + table('results') + ' SET deep_pending=FALSE'
+                    ' WHERE item_id=%s', (item_id,))
+        db.commit()
+        cur.close()
+    except Exception:
+        logger.exception('spectrum_analyzer: could not clear deep_pending for %s',
+                         item_id)
+
+
 def analyze_track_job(item_id, deep=False):
     """Manual re-run of one song. Always recomputes. deep=True analyzes the
     entire file instead of a segment (dark-master check)."""
+    if deep:
+        # the flag is set by the deep_rescan route at queue time; clear it
+        # however this job ends so it can never stick
+        try:
+            return _analyze_track(item_id, deep=True)
+        finally:
+            _clear_deep_pending(item_id)
+    return _analyze_track(item_id, deep=False)
+
+
+def _analyze_track(item_id, deep):
     settings = _settings()
     db = get_db()
     cur = db.cursor()

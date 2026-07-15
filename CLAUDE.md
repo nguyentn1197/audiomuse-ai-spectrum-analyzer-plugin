@@ -29,6 +29,7 @@ An AudioMuse-AI plugin for audio spectrum analysis that detects fake lossless fi
   - `_bit_depth_probe()` reads PCM via soundfile as int32 (left-justified) and computes effective bit depth from trailing zero bits: a >16-bit container with ≤16 effective bits is fake 24-bit → UPSCALED verdict (when spectrum is otherwise CLEAN) or a note. Stored as `container_bits`/`effective_bits` columns.
   - `_deep_spectrum()` (deep=True on `analyze_file`, from the per-track Deep analyze button): chunked whole-file scan (120 s chunks, 30 min cap) producing a global max-hold profile, a 1-column/second spectrogram, and a per-second spectral-edge series. Edge variance ≥ 500 Hz (edge follows the music) downgrades UPSAMPLED/FAKE_SUSPECT → LOWPASSED "likely genuine dark master"; ≤ 150 Hz (constant wall) raises confidence. Quiet seconds (window ref < chunk ref − 25 dB) are skipped.
   - `verified` column (0.5.0): manual per-track flag toggled from the album page; excluded from all suspect counts/filters in `__init__.py` (`bad_expr`), preserved across re-analysis (not in the upsert column list).
+  - `deep_pending` column (0.5.1): set by the `deep_rescan` route at queue time, cleared in `analyze_track_job`'s finally block (survives job failure). Shown as a "deep scan queued" badge on the song card and aggregated into per-album overview tags (deep scan ×N / verified ×N).
   - `_render_spectrogram()` matplotlib-based PNG (spek-style color map, red line at detected cutoff), base64 encoded, tunable in settings.
 
 ### Database
