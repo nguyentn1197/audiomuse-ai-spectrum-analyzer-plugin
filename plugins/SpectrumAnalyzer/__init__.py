@@ -24,10 +24,11 @@ VERDICT_STYLE = {
     'CLEAN':            ('#16a34a', 'Full bandwidth'),
     'CONSISTENT_LOSSY': ('#2563eb', 'Lossy, consistent with container'),
     'LOWPASSED':        ('#d97706', 'Low-passed (possibly genuine master)'),
+    'UPSAMPLED':        ('#7c3aed', 'Fake hi-res: resampled from a lower-rate source'),
     'TRANSCODED_LOSSY': ('#dc2626', 'Lossy re-encoded from lower bitrate'),
     'FAKE_SUSPECT':     ('#dc2626', 'Suspect fake lossless (transcode)'),
 }
-SUSPECT_VERDICTS = ('FAKE_SUSPECT', 'TRANSCODED_LOSSY')
+SUSPECT_VERDICTS = ('FAKE_SUSPECT', 'TRANSCODED_LOSSY', 'UPSAMPLED')
 
 
 def migrate(db):

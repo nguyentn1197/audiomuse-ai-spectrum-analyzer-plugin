@@ -6,6 +6,12 @@
   "requirements": ["matplotlib"],
   "versions": [
     {
+      "version": "0.3.0",
+      "min_core_version": "2.5.0",
+      "changelog": "New UPSAMPLED verdict for fake hi-res: a >48 kHz container whose content stops at CD bandwidth (with digital silence above) is flagged as a resampled 44.1/48 kHz source instead of CLEAN. UPSAMPLED counts as suspect in the overview filters.",
+      "sourceUrl": "http://10.10.1.203:8120/spectrum_analyzer.zip"
+    },
+    {
       "version": "0.2.0",
       "min_core_version": "2.5.0",
       "changelog": "Parallel scans: one task per album fanned out across all workers, with a parent task tracking done/remaining. Fewer false FAKE_SUSPECT verdicts: content reaching ~20.5 kHz counts as full bandwidth, and a sharp edge with audible noise above the cutoff is now LOWPASSED, not FAKE. UI: filter albums by suspect count, re-analyze a whole album from its page.",

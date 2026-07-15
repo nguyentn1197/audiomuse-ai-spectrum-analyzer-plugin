@@ -144,11 +144,21 @@ def _verdict(sr, suffix, bitrate_kbps, cutoff_hz, edge_db_khz, shelf_db):
     margin = max(0.0, min(1.0, (full_threshold - cutoff_hz) / full_threshold))
     notes = []
 
-    if nyquist > 24000 and cutoff_hz < 23000:
-        notes.append('content ends below 23 kHz despite high sample rate: possible upsample')
-
     if cutoff_hz >= full_threshold:
+        # a hi-res container whose content stops at CD bandwidth is a
+        # resampled 44.1/48 kHz source sold as hi-res; a genuine hi-res
+        # master keeps content (or at least noise) above 23 kHz
+        if nyquist > 24000.0 and cutoff_hz < 23000.0:
+            est = ('likely 44.1/48 kHz source'
+                   if cutoff_hz >= 21600.0 else 'CD-bandwidth source')
+            if silent_shelf:
+                return 'UPSAMPLED', est, 0.85, notes
+            notes.append('noise above the cutoff: could be a very dark genuine master')
+            return 'UPSAMPLED', est, 0.6, notes
         return 'CLEAN', 'full bandwidth', 0.9, notes
+
+    if nyquist > 24000.0 and cutoff_hz < 23000.0:
+        notes.append('content ends below 23 kHz despite high sample rate: possible upsample')
 
     est = _estimate_source(cutoff_hz)
 

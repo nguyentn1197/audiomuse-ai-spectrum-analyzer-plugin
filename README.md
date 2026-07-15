@@ -8,7 +8,7 @@ Spectrum analysis over the whole library with fake-lossless / transcode detectio
 - **Each song analyzed once, re-analyzed only when the file changes** — two layers:
   1. *Metadata fingerprint* (path, size, suffix, bitRate, created…) from the media-server track object → unchanged tracks are skipped without downloading.
   2. *Audio MD5* of the downloaded bytes → if metadata changed but bytes didn't, only the fingerprint is refreshed; if bytes changed, full re-analysis.
-- **Fake detection output per song** — frequency cutoff (Hz), edge sharpness (dB/kHz), noise-shelf level, verdict (`CLEAN`, `CONSISTENT_LOSSY`, `LOWPASSED`, `TRANSCODED_LOSSY`, `FAKE_SUSPECT`), estimated source-bitrate class, confidence, raw metrics JSON.
+- **Fake detection output per song** — frequency cutoff (Hz), edge sharpness (dB/kHz), noise-shelf level, verdict (`CLEAN`, `CONSISTENT_LOSSY`, `LOWPASSED`, `UPSAMPLED`, `TRANSCODED_LOSSY`, `FAKE_SUSPECT`), estimated source-bitrate class, confidence, raw metrics JSON. `FAKE_SUSPECT`, `TRANSCODED_LOSSY` and `UPSAMPLED` count as suspect in the overview.
 - **Spectrogram stored as base64 PNG** in the plugin's own Postgres table (`plugin_spectrum_analyzer__results`), rendered spek-style with a red line at the detected cutoff.
 - **Reacts to the core cleanup task** — `item_id` is a foreign key to `score(item_id)` with `ON DELETE CASCADE` (same pattern as core's `embedding` tables), so when `tasks/cleaning.py` removes an orphaned track, its spectrogram row disappears too.
 - **Manual re-run** — a Re-analyze button on every track (runs on the `high` queue) and a Re-analyze album button on each album page (one forced album task on the default queue), plus three scan modes: *changed* (default), *verify* (re-hash everything), *force* (redo everything).
@@ -21,6 +21,7 @@ Spectrum analysis over the whole library with fake-lossless / transcode detectio
 A 90 s segment from the middle of the track is loaded at native sample rate, STFT'd (n_fft 4096), and reduced to a robust per-frequency "max hold" profile (95th percentile over time). The cutoff is the highest frequency still within 40 dB of the 1–8 kHz reference level. A lossy encoder's low-pass leaves a near-vertical wall (high dB/kHz edge) with digital silence above it; a genuine master rolls off gradually and keeps dither/analog noise above the rolloff. Verdict logic:
 
 - cutoff ≥ ~93 % of Nyquist (capped at 20.5 kHz) → `CLEAN` — genuine 44.1 kHz masters legitimately roll off at 20–21 kHz (anti-alias filters, mastering chains), and edge sharpness measured against the Nyquist wall means nothing
+- **except** in a hi-res container (> 48 kHz): content stopping below 23 kHz there means a resampled 44.1/48 kHz source → `UPSAMPLED` (fake hi-res; 85 % confidence with digital silence above the cutoff, 60 % if there's noise — could be a very dark genuine master)
 - lossless container + low cutoff + sharp edge + **silent shelf** above the cutoff → `FAKE_SUSPECT` (estimated source class, e.g. "~128 kbps")
 - lossless container + sharp edge but audible noise above the cutoff → `LOWPASSED` (an encoder wall leaves digital silence; noise points at a genuine low-passed master)
 - lossless container + gradual rolloff → `LOWPASSED` (lower confidence)
