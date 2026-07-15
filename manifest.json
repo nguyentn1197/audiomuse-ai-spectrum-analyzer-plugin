@@ -1,0 +1,11 @@
+{
+  "plugins": [
+    {
+      "id": "spectrum_analyzer",
+      "name": "SpectrumAnalyzer",
+      "author": "Nguyen",
+      "description": "Spectrum analysis and fake-lossless detection with per-song spectrograms.",
+      "pluginUrl": "http://10.10.1.203:8120/plugin.json"
+    }
+  ]
+}
