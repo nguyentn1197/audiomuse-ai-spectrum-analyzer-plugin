@@ -9,6 +9,13 @@
   "_comment": "Pre-0.1.0 development history (0.1.0..0.6.2 before the version reset) is preserved in CHANGELOG.md.",
   "versions": [
     {
+      "version": "0.2.1",
+      "min_core_version": "2.6.2",
+      "changelog": "Update license",
+      "sourceUrl": "",
+      "checksum": ""
+    },
+    {
       "version": "0.2.0",
       "min_core_version": "2.6.2",
       "changelog": "Search matches album, artist and song title (shows albums containing a match). Deep-scan queueing is idempotent: repeat clicks while the 'deep scan queued' tag is set enqueue nothing, and the button is disabled meanwhile (a plain Re-analyze clears a stuck tag). New overview button: 'Deep scan all non-CLEAN' queues a whole-file deep scan for every unverified non-CLEAN track in the library and reports how many were queued.",
