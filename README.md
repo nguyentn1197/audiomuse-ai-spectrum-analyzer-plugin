@@ -55,7 +55,11 @@ These are heuristics — treat `FAKE_SUSPECT` as "look at the spectrogram," not 
 python3 -m pip install --user numpy soundfile matplotlib   # once
 python3 -m unittest discover tests -v
 
-# 2. build the installable package (versioned; no arg = reuse newest dist/ version)
+# 2a. dev loop: rebuild the fixed local-catalog zip (serve dist-local/ and add
+#     its manifest.json as a repository in AudioMuse; reinstall to pick up changes)
+./build.sh local                                            # -> dist-local/spectrum_analyzer.zip
+
+# 2b. build a release package (versioned; no arg = reuse newest dist/ version)
 ./build.sh 0.2.0                                            # -> dist/spectrum_analyzer-0.2.0.zip
 
 # 3. release: add the version + changelog entry in plugin.json (history: CHANGELOG.md),

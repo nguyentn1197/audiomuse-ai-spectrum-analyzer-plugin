@@ -1,14 +1,29 @@
 #!/usr/bin/env bash
-# Build the distributable plugin package into dist/.
-# Usage: ./build.sh [version]
-#   with an argument : build dist/spectrum_analyzer-<version>.zip
+# Build the distributable plugin package.
+# Usage: ./build.sh [version|local]
+#   local            : replace dist-local/spectrum_analyzer.zip (fast dev
+#                      iteration; dist-local/ has its own fixed catalog files)
+#   with a version   : build dist/spectrum_analyzer-<version>.zip
 #   without          : reuse the version of the newest spectrum_analyzer-*.zip
 #                      already in dist/, falling back to plugin.json
-# The sourceUrl of the matching version entry in plugin.json is updated to
-# point at the built file. Old versioned zips are kept so previously
-# published plugin.json entries stay downloadable.
+# For versioned builds the sourceUrl of the matching version entry in
+# plugin.json is updated to point at the built file. Old versioned zips are
+# kept so previously published plugin.json entries stay downloadable.
 set -euo pipefail
 cd "$(dirname "$0")"
+
+if [ "${1:-}" = "local" ]; then
+    [ -d dist-local ] || { echo "dist-local/ does not exist" >&2; exit 1; }
+    python3 - <<'EOF'
+import zipfile
+with zipfile.ZipFile('dist-local/spectrum_analyzer.zip', 'w', zipfile.ZIP_DEFLATED) as z:
+    for f in ('__init__.py', 'jobs.py', 'dsp.py'):
+        z.write(f'plugins/SpectrumAnalyzer/{f}', f)
+print('built dist-local/spectrum_analyzer.zip')
+EOF
+    exit 0
+fi
+
 VERSION="${1:-}" python3 - <<'EOF'
 import glob
 import json
