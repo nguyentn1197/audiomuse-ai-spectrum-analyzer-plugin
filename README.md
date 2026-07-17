@@ -42,8 +42,8 @@ These are heuristics — treat `FAKE_SUSPECT` as "look at the spectrogram," not 
 ## Install (local repository, per the official docs)
 
 1. Run `./build.sh [version]` — it packages the plugin code into `dist/spectrum_analyzer-<version>.zip` and points the matching `plugin.json` entry's `sourceUrl` at it. Without an argument the version is taken from the newest zip in `dist/` (or `plugin.json` on a fresh checkout).
-2. Edit `plugin.json` and `manifest.json`: replace the host in the URLs with an address your AudioMuse containers can reach (e.g. an LXC IP on your services VLAN — not `localhost`).
-3. `python3 -m http.server 8120` in the **repo root** (so `/manifest.json`, `/plugin.json` and `/dist/spectrum_analyzer.zip` are all served).
+2. Edit `plugins/SpectrumAnalyzer/plugin.json` and `manifest.json`: replace the host in the URLs with an address your AudioMuse containers can reach (for LAN serving; the committed files point at this repo's GitHub raw URLs, which work as-is).
+3. For LAN serving: `python3 -m http.server 8120` in the **repo root**; otherwise just add the GitHub raw `manifest.json` URL.
 4. AudioMuse-AI → Plugins → Repositories → add `http://<your-ip>:8120/manifest.json`.
 5. Install from the Catalog tab, then **Apply now (restart)**.
 
@@ -63,10 +63,15 @@ python3 -m unittest discover tests -v
 # 2b. build a release package (versioned; no arg = reuse newest dist/ version)
 ./build.sh 0.2.0                                            # -> dist/spectrum_analyzer-0.2.0.zip
 
-# 3. release: add the version + changelog entry in plugin.json (history: CHANGELOG.md),
-#    run ./build.sh <version> (it syncs that entry's sourceUrl), serve the repo
-#    root, and update the plugin from the AudioMuse catalog. Old versioned zips
-#    stay in dist/ so earlier plugin.json entries remain downloadable.
+# 3. release (CI/CD): open a PR that changes the code AND adds a new top entry
+#    (version + changelog) to plugins/SpectrumAnalyzer/plugin.json (history:
+#    CHANGELOG.md). CI runs the tests on every PR update; when the PR is
+#    MERGED into main, it verifies every published zip still matches its
+#    checksum, fails if plugin code changed without a version bump, then
+#    builds dist/spectrum_analyzer-<version>.zip, writes the entry's
+#    sourceUrl + md5 checksum, and commits the result back. Published versions
+#    are immutable (locally, build.sh refuses to rebuild too; FORCE=1 only for
+#    never-published versions).
 ```
 
 See `tests/README.md` for the fixture set, ad-hoc analysis of arbitrary files
@@ -80,11 +85,16 @@ constants behind the detection thresholds.
 - **Database size**: at the default 800×280 px, a spectrogram is roughly 100–300 KB of base64. 10 000 songs ≈ 1–3 GB in Postgres. Tune the image size in settings if that matters; deleting rows for an album and rescanning regenerates them.
 - **Verify mode** downloads every track (to hash it) — heavy on a big library over the network; use it when you suspect in-place file edits that Navidrome metadata wouldn't reveal.
 
+## License
+
+AGPL-3.0-only (same as AudioMuse-AI core, and required for the community plugin catalog). See [LICENSE](LICENSE).
+
 ## Files
 
 - `plugins/SpectrumAnalyzer/__init__.py` — blueprint, pages (album overview with suspect filters, per-album detail), settings, migration, `register(ctx)`
 - `plugins/SpectrumAnalyzer/jobs.py` — scan orchestrator + per-album child tasks, single-track re-run, fingerprints, hook, DB upsert
 - `plugins/SpectrumAnalyzer/dsp.py` — STFT profile, cutoff/edge/shelf/aliasing/bit-depth metrics, verdict, deep scan, spectrogram PNG
-- `build.sh` → `dist/spectrum_analyzer.zip` — the flat code zip AudioMuse installs
-- `plugin.json`, `manifest.json` — descriptor + local catalog (`CHANGELOG.md` holds the version history)
+- `build.sh` → `dist/spectrum_analyzer-<version>.zip` — the flat code zip AudioMuse installs (run by CI on push to main)
+- `plugins/SpectrumAnalyzer/plugin.json` — the plugin descriptor (community-catalog layout: it lives next to the code, so the folder is a drop-in PR payload)
+- `manifest.json` — self-hosted catalog pointing at the descriptor (`CHANGELOG.md` holds the version history)
 - `tests/` — out-of-the-box unit tests, committed ground-truth fixtures, fixture generator, ad-hoc verdict runner
