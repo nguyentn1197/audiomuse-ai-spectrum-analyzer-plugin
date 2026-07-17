@@ -1,0 +1,100 @@
+name: build
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, closed]
+
+jobs:
+  test:
+    # run on PR updates, and once more on the merge itself (gates the release)
+    if: github.event.action != 'closed' || github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install numpy soundfile matplotlib
+      - run: python -m unittest discover tests -v
+
+  release:
+    # CI/CD model: releases happen only when a PR is merged into main.
+    # Gates before building:
+    #   1. every already-published zip must exist and match its plugin.json
+    #      checksum (published versions are immutable)
+    #   2. if the merged PR changed plugin code, the newest plugin.json
+    #      version must be a new (unbuilt) one — code changes without a
+    #      version bump fail the build
+    if: github.event.action == 'closed' && github.event.pull_request.merged == true
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 2
+      - name: verify published versions and version bump
+        run: |
+          set -euo pipefail
+          git diff --name-only HEAD^ HEAD > /tmp/changed_files.txt
+          echo "merged changes:"; cat /tmp/changed_files.txt
+          python3 - <<'EOF'
+          import hashlib
+          import json
+          import os
+          import sys
+
+          with open('plugins/SpectrumAnalyzer/plugin.json') as fh:
+              desc = json.load(fh)
+          versions = desc['versions']
+          newest = versions[0]['version']
+
+          failures = []
+          for v in versions:
+              zip_path = f"dist/spectrum_analyzer-{v['version']}.zip"
+              published = bool(v.get('checksum'))
+              if not published and v['version'] == newest:
+                  continue  # new release entry, not built yet
+              if not os.path.exists(zip_path):
+                  failures.append(f"{zip_path} is missing but {v['version']} is published")
+                  continue
+              with open(zip_path, 'rb') as fh:
+                  md5 = hashlib.md5(fh.read()).hexdigest()
+              if published and md5 != v['checksum']:
+                  failures.append(
+                      f"{zip_path} md5 {md5} != plugin.json checksum {v['checksum']} "
+                      f"— published versions are immutable")
+          if failures:
+              sys.exit('INTEGRITY FAILURE:\n  ' + '\n  '.join(failures))
+
+          # any file under the plugin folder is shipped code, except this
+          # exclusion list (metadata that never goes into the zip)
+          PLUGIN_DIR = 'plugins/SpectrumAnalyzer/'
+          EXCLUDED = {'plugin.json'}
+          with open('/tmp/changed_files.txt') as fh:
+              changed = {line.strip() for line in fh if line.strip()}
+          changed_code = sorted(
+              f for f in changed
+              if f.startswith(PLUGIN_DIR) and f[len(PLUGIN_DIR):] not in EXCLUDED)
+          newest_built = os.path.exists(f'dist/spectrum_analyzer-{newest}.zip')
+          if changed_code and newest_built:
+              sys.exit(
+                  f'VERSION BUMP MISSING: this PR changed plugin code '
+                  f'({changed_code}) but the newest plugin.json '
+                  f'version {newest} is already built. Add a new version entry.')
+          with open(os.environ['GITHUB_ENV'], 'a') as fh:
+              fh.write(f'RELEASE_VERSION={"" if newest_built else newest}\n')
+          print('nothing to release' if newest_built else f'will build {newest}')
+          EOF
+      - name: build and publish the new version
+        if: env.RELEASE_VERSION != ''
+        run: |
+          set -euo pipefail
+          ./build.sh "${RELEASE_VERSION}"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add dist/ plugins/SpectrumAnalyzer/plugin.json
+          git commit -m "release: build ${RELEASE_VERSION} [skip ci]"
+          git push

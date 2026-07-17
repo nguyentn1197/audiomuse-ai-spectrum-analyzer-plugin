@@ -4,21 +4,23 @@
   "author": "Nguyen",
   "description": "Runs spectrum analysis on the whole library, album by album: detects fake lossless / lossy transcodes / fake hi-res (upsampled) / fake 24-bit (upscaled) via frequency-cutoff, noise-shelf, aliasing-image and bit-depth heuristics, and stores a spectrogram (base64 PNG) per song. Parallel per-album scanning, per-track deep (whole-file) dark-master analysis, manual verification flags. Tracks are analyzed once and re-analyzed only when the underlying file changes; results are removed automatically by the core cleanup task.",
   "requirements": [
-    "matplotlib"
+    "matplotlib>=3.8,<4"
   ],
   "_comment": "Pre-0.1.0 development history (0.1.0..0.6.2 before the version reset) is preserved in CHANGELOG.md.",
   "versions": [
     {
       "version": "0.2.0",
-      "min_core_version": "2.5.0",
+      "min_core_version": "2.6.2",
       "changelog": "Search matches album, artist and song title (shows albums containing a match). Deep-scan queueing is idempotent: repeat clicks while the 'deep scan queued' tag is set enqueue nothing, and the button is disabled meanwhile (a plain Re-analyze clears a stuck tag). New overview button: 'Deep scan all non-CLEAN' queues a whole-file deep scan for every unverified non-CLEAN track in the library and reports how many were queued.",
-      "sourceUrl": "https://raw.githubusercontent.com/nguyentn1197/audiomuse-ai-spectrum-analyzer-plugin/refs/heads/main/dist/spectrum_analyzer-0.2.0.zip"
+      "sourceUrl": "https://raw.githubusercontent.com/nguyentn1197/audiomuse-ai-spectrum-analyzer-plugin/refs/heads/main/dist/spectrum_analyzer-0.2.0.zip",
+      "checksum": "e1cc1ef6fb9011e2d690fe999e456283"
     },
     {
       "version": "0.1.0",
-      "min_core_version": "2.5.0",
+      "min_core_version": "2.6.2",
       "changelog": "First release. Parallel album-by-album scanning (orchestrator + per-album worker tasks), change detection (metadata fingerprint + audio MD5), verdicts CLEAN / CONSISTENT_LOSSY / LOWPASSED / UPSAMPLED / UPSCALED / TRANSCODED_LOSSY / FAKE_SUSPECT calibrated against ground-truth fixtures, aliasing-image and bit-depth probes, per-track deep whole-file dark-master analysis with status tags, manual verification flags, per-status album filters, base64 spectrograms, on_song_analyzed hook, optional weekly incremental cron.",
-      "sourceUrl": "https://raw.githubusercontent.com/nguyentn1197/audiomuse-ai-spectrum-analyzer-plugin/refs/heads/main/dist/spectrum_analyzer-0.1.0.zip"
+      "sourceUrl": "https://raw.githubusercontent.com/nguyentn1197/audiomuse-ai-spectrum-analyzer-plugin/refs/heads/main/dist/spectrum_analyzer-0.1.0.zip",
+      "checksum": "b9d13f1ac7348dadc9ae30fdf2cbb99e"
     }
   ]
 }

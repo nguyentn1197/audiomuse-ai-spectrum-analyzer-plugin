@@ -1,3 +1,12 @@
+# SpectrumAnalyzer - an AudioMuse-AI plugin
+# https://github.com/nguyentn1197/audiomuse-ai-spectrum-analyzer-plugin
+# Copyright (C) 2026 Nguyen
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# This program is free software: you can redistribute it and/or modify it under
+# the terms of the GNU Affero General Public License v3.0. See the LICENSE file
+# in the project root.
+
 """Worker-side jobs for the SpectrumAnalyzer plugin.
 
 Scan architecture (mirrors the core's run_analysis_task / analyze_album_task)
