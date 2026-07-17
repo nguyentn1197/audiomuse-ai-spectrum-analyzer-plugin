@@ -493,14 +493,14 @@ def _clear_deep_pending(item_id):
 def analyze_track_job(item_id, deep=False):
     """Manual re-run of one song. Always recomputes. deep=True analyzes the
     entire file instead of a segment (dark-master check)."""
-    if deep:
-        # the flag is set by the deep_rescan route at queue time; clear it
-        # however this job ends so it can never stick
-        try:
-            return _analyze_track(item_id, deep=True)
-        finally:
-            _clear_deep_pending(item_id)
-    return _analyze_track(item_id, deep=False)
+    # deep_pending is set by the queueing routes; clear it however this job
+    # ends so it can never stick. A plain re-analysis clears it too — that is
+    # the escape hatch for a tag orphaned by a lost deep-scan job (the queue
+    # routes refuse to re-queue while the tag is set).
+    try:
+        return _analyze_track(item_id, deep=deep)
+    finally:
+        _clear_deep_pending(item_id)
 
 
 def _analyze_track(item_id, deep):

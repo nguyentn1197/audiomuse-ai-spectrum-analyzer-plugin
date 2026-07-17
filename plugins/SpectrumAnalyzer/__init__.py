@@ -118,6 +118,11 @@ def home():
 
     having = []
     having_params = []
+    if q:
+        # match albums containing any song whose album, artist or title
+        # matches — counts still cover the whole album
+        having.append('bool_or(album ILIKE %s OR artist ILIKE %s OR title ILIKE %s)')
+        having_params += [f'%{q}%'] * 3
     if sel_verdicts:
         # albums containing at least one song with any selected status
         cond = 'verdict = ANY(%s)' + (' AND NOT verified' if unverified_only else '')
@@ -130,14 +135,14 @@ def home():
         having.append('COUNT(*) FILTER (WHERE verified) > 0')
     having_sql = (' HAVING ' + ' AND '.join(having)) if having else ''
 
-    params = ([SUSPECT_VERDICTS, f'%{q}%'] + having_params
+    params = ([SUSPECT_VERDICTS] + having_params
               + [SUSPECT_VERDICTS, per_page + 1, page * per_page])
     cur.execute(
         'SELECT album, COUNT(*), ' + bad_expr + ','
         ' COUNT(*) FILTER (WHERE verified),'
         ' COUNT(*) FILTER (WHERE deep_pending),'
         ' MIN(cutoff_hz), to_char(MAX(analyzed_at), \'DD-MM-YYYY HH24:MI\')'
-        ' FROM ' + tbl + ' WHERE album ILIKE %s GROUP BY album'
+        ' FROM ' + tbl + ' GROUP BY album'
         + having_sql +
         ' ORDER BY ' + bad_expr + ' DESC, album'
         ' LIMIT %s OFFSET %s',
@@ -159,7 +164,23 @@ def home():
              'Downloads every track and re-analyzes only when the audio bytes changed'),
             ('force', 'Force re-analyze all',
              'Recomputes everything, including unchanged files'),
-        ))
+        )) + (
+        f'<form method="post" action="{url_for("spectrum_analyzer.deep_rescan_all")}" '
+        f'style="display:inline;">'
+        f'<button type="submit" class="btn" title="Queue a deep (whole-file) scan for '
+        f'every track in the library whose verdict is not CLEAN. Verified and '
+        f'already-queued tracks are skipped.">Deep scan all non-CLEAN</button></form>')
+
+    queued_msg = ''
+    try:
+        queued = int(request.args.get('queued', ''))
+    except ValueError:
+        queued = None
+    if queued is not None:
+        queued_msg = (f'<p style="color:#16a34a;font-weight:600;">Queued {queued} '
+                      f'deep scan{"s" if queued != 1 else ""}'
+                      + (' (all non-CLEAN tracks are already queued or verified)'
+                         if queued == 0 else '') + '.</p>')
 
     def _album_tags(ver, pending):
         tags = ''
@@ -210,13 +231,15 @@ def home():
         f'(fake lossless, transcode or fake hi-res), '
         f'<strong style="color:#6b7280;">{n_verified}</strong> manually verified '
         f'(excluded from suspect counts).</p>'
+        f'{queued_msg}'
         f'<div style="margin:.8rem 0;">{scan_buttons}</div>'
         '<p style="font-size:.85rem;color:#6b7280;">Scans run on the worker, album by album; '
         'progress appears under Active Tasks. Already-analyzed tracks are skipped unless '
         'their file changed.</p>'
         f'<form method="get" style="margin:.8rem 0;">'
         f'<div style="display:flex;gap:.8rem;align-items:center;flex-wrap:wrap;">'
-        f'<input name="q" value="{_esc(q)}" placeholder="filter albums...">'
+        f'<input name="q" value="{_esc(q)}" placeholder="album / artist / song..." '
+        f'title="Shows albums containing a match on album, artist or song title">'
         f'<label style="white-space:nowrap;">min suspect tracks '
         f'<input type="number" name="min_bad" min="0" value="{min_bad}" '
         f'style="width:4rem;"></label>'
@@ -312,9 +335,8 @@ def album():
             'Re-analyze</button></form>'
             f'<form method="post" action="{url_for("spectrum_analyzer.deep_rescan", item_id=item_id)}" '
             f'style="display:inline;margin-left:.4rem;">'
-            f'<button type="submit" class="btn" title="Analyze the ENTIRE file (not a segment) '
-            f'and track the spectral edge over time: an edge that follows the music means a '
-            f'genuine dark master, a constant wall means a resampler/encoder">'
+            f'<button type="submit" class="btn" {"disabled" if deep_pending else ""} '
+            f'title="{"A deep scan is already queued for this track" if deep_pending else "Analyze the ENTIRE file (not a segment) and track the spectral edge over time: an edge that follows the music means a genuine dark master, a constant wall means a resampler/encoder"}">'
             'Deep analyze</button></form></div></div>'
             f'<p style="margin:.4rem 0;font-size:.9rem;">Cutoff <strong>{_khz(cutoff)} kHz</strong>'
             f' &middot; edge {edge if edge is not None else "?"} dB/kHz'
@@ -381,35 +403,53 @@ def rescan(item_id):
 @bp.route('/deep_rescan/<item_id>', methods=['POST'])
 def deep_rescan(item_id):
     # tag first so the page shows "deep scan queued" immediately; the job
-    # clears the flag when it finishes
+    # clears the flag when it finishes. The NOT deep_pending guard makes the
+    # button idempotent: repeat clicks while a scan is queued enqueue nothing.
     db = get_db()
     cur = db.cursor()
-    cur.execute('UPDATE ' + table('results') + ' SET deep_pending=TRUE WHERE item_id=%s',
+    cur.execute('UPDATE ' + table('results') + ' SET deep_pending=TRUE'
+                ' WHERE item_id=%s AND NOT deep_pending RETURNING item_id',
                 (item_id,))
+    tagged = cur.fetchone()
     db.commit()
     cur.close()
-    enqueue(jobs.analyze_track_job, item_id, deep=True, queue='high')
+    if tagged:
+        enqueue(jobs.analyze_track_job, item_id, deep=True, queue='high')
     return redirect(request.referrer or url_for('spectrum_analyzer.home'))
+
+
+def _queue_deep_non_clean(album=None):
+    """Tag-and-collect atomically; skip CLEAN, already-queued, and verified
+    tracks. Returns how many deep scans were queued. Default queue: bulk deep
+    scans are slow, let all workers share them instead of hogging high."""
+    db = get_db()
+    cur = db.cursor()
+    sql = ('UPDATE ' + table('results') + ' SET deep_pending=TRUE'
+           " WHERE verdict IS DISTINCT FROM 'CLEAN'"
+           ' AND NOT verified AND NOT deep_pending')
+    if album is None:
+        cur.execute(sql + ' RETURNING item_id')
+    else:
+        cur.execute(sql + ' AND album = %s RETURNING item_id', (album,))
+    item_ids = [r[0] for r in cur.fetchall()]
+    db.commit()
+    cur.close()
+    for item_id in item_ids:
+        enqueue(jobs.analyze_track_job, item_id, deep=True)
+    return len(item_ids)
 
 
 @bp.route('/album/deep_all', methods=['POST'])
 def deep_rescan_album():
     name = request.form.get('name') or ''
-    # tag-and-collect atomically; skip CLEAN, already-queued, and verified tracks
-    db = get_db()
-    cur = db.cursor()
-    cur.execute(
-        'UPDATE ' + table('results') + ' SET deep_pending=TRUE'
-        " WHERE album = %s AND verdict IS DISTINCT FROM 'CLEAN'"
-        ' AND NOT verified AND NOT deep_pending RETURNING item_id', (name,))
-    item_ids = [r[0] for r in cur.fetchall()]
-    db.commit()
-    cur.close()
-    # default queue: bulk deep scans are slow, let all workers share them
-    # instead of hogging the high queue
-    for item_id in item_ids:
-        enqueue(jobs.analyze_track_job, item_id, deep=True)
+    _queue_deep_non_clean(album=name)
     return redirect(request.referrer or url_for('spectrum_analyzer.album', name=name))
+
+
+@bp.route('/deep_all', methods=['POST'])
+def deep_rescan_all():
+    queued = _queue_deep_non_clean()
+    return redirect(url_for('spectrum_analyzer.home', queued=queued))
 
 
 @bp.route('/verify/<item_id>', methods=['POST'])

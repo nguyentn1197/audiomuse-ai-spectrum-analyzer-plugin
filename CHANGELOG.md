@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.2.0
+
+- Search matches album, artist and song title (shows albums containing a
+  match; per-album counts still cover the whole album).
+- Deep-scan queueing is idempotent: repeat clicks while the "deep scan
+  queued" tag is set enqueue nothing; the per-song button is disabled while
+  pending. A plain Re-analyze clears an orphaned tag (escape hatch for lost
+  jobs).
+- Overview: "Deep scan all non-CLEAN" queues a whole-file deep scan for every
+  unverified non-CLEAN track in the library (default queue) and reports how
+  many were queued.
+
 ## 0.1.0 — first release
 
 Everything below was developed pre-release; the version counter was reset to
