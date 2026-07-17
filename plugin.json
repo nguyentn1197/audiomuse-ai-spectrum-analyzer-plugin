@@ -2,68 +2,17 @@
   "id": "spectrum_analyzer",
   "name": "SpectrumAnalyzer",
   "author": "Nguyen",
-  "description": "Runs spectrum analysis on the whole library, album by album: detects fake lossless / lossy transcodes via frequency-cutoff heuristics and stores a spectrogram (base64 PNG) per song. Tracks are analyzed once and re-analyzed only when the underlying file changes; results are removed automatically by the core cleanup task.",
-  "requirements": ["matplotlib"],
+  "description": "Runs spectrum analysis on the whole library, album by album: detects fake lossless / lossy transcodes / fake hi-res (upsampled) / fake 24-bit (upscaled) via frequency-cutoff, noise-shelf, aliasing-image and bit-depth heuristics, and stores a spectrogram (base64 PNG) per song. Parallel per-album scanning, per-track deep (whole-file) dark-master analysis, manual verification flags. Tracks are analyzed once and re-analyzed only when the underlying file changes; results are removed automatically by the core cleanup task.",
+  "requirements": [
+    "matplotlib"
+  ],
+  "_comment": "Pre-0.1.0 development history (0.1.0..0.6.2 before the version reset) is preserved in CHANGELOG.md.",
   "versions": [
-    {
-      "version": "0.6.1",
-      "min_core_version": "2.5.0",
-      "changelog": "Album page: 'Deep scan all non-CLEAN' button queues a whole-file deep scan for every track whose verdict is not CLEAN (verified and already-queued tracks are skipped; jobs run on the default queue so all workers share them).",
-      "sourceUrl": "http://10.10.1.203:8120/spectrum_analyzer.zip"
-    },
-    {
-      "version": "0.6.0",
-      "min_core_version": "2.5.0",
-      "changelog": "Overview filter rework: filter albums by the statuses their songs contain via per-verdict chips (CLEAN / CONSISTENT_LOSSY / LOWPASSED / UPSAMPLED / UPSCALED / TRANSCODED_LOSSY / FAKE_SUSPECT, any combination), optionally matching unverified tracks only. Combines with the min-suspect-count and has-verified filters; pagination preserves all filters.",
-      "sourceUrl": "http://10.10.1.203:8120/spectrum_analyzer.zip"
-    },
-    {
-      "version": "0.5.1",
-      "min_core_version": "2.5.0",
-      "changelog": "Deep-scan tracking: queuing a deep scan tags the track (deep_pending), shown as a 'deep scan queued' badge on the song and cleared automatically when the scan finishes (even on failure). The album overview now shows per-album tags: 'deep scan xN' (amber) for tracks awaiting deep scan and 'verified xN' (green) for manually verified tracks.",
-      "sourceUrl": "http://10.10.1.203:8120/spectrum_analyzer.zip"
-    },
-    {
-      "version": "0.5.0",
-      "min_core_version": "2.5.0",
-      "changelog": "Deep analyze button per track: scans the ENTIRE file (chunked) and tracks the spectral edge over time — an edge that follows the music downgrades UPSAMPLED/FAKE_SUSPECT to a likely genuine dark master, a constant wall raises confidence. Manual 'verified' checkbox per track: verified tracks are excluded from all suspect counts, shown as an overview column, and filterable ('only albums with verified tracks').",
-      "sourceUrl": "http://10.10.1.203:8120/spectrum_analyzer.zip"
-    },
-    {
-      "version": "0.4.1",
-      "min_core_version": "2.5.0",
-      "changelog": "Fix: album names containing &, ?, # or other URL-special characters broke the album page link (query string was built without percent-encoding). All album links and pagination URLs are now properly URL-encoded.",
-      "sourceUrl": "http://10.10.1.203:8120/spectrum_analyzer.zip"
-    },
-    {
-      "version": "0.4.0",
-      "min_core_version": "2.5.0",
-      "changelog": "Fake 24-bit detection: PCM samples are probed for zero-padded low bits (new UPSCALED verdict, effective/container bits stored and shown per track). UPSAMPLED confidence is now corroborated by aliasing-image analysis: content above the cutoff that mirrors the band below it is a resampler artifact, not a dark master.",
-      "sourceUrl": "http://10.10.1.203:8120/spectrum_analyzer.zip"
-    },
-    {
-      "version": "0.3.1",
-      "min_core_version": "2.5.0",
-      "changelog": "UPSAMPLED detection now matches the cutoff against every standard rate's Nyquist (22.05/24/44.1/48 kHz), so 48 kHz->96 kHz upsamples (content stopping at 24 kHz) are caught, not just 44.1 kHz sources. Confidence is graded by edge sharpness and shelf silence.",
-      "sourceUrl": "http://10.10.1.203:8120/spectrum_analyzer.zip"
-    },
-    {
-      "version": "0.3.0",
-      "min_core_version": "2.5.0",
-      "changelog": "New UPSAMPLED verdict for fake hi-res: a >48 kHz container whose content stops at CD bandwidth (with digital silence above) is flagged as a resampled 44.1/48 kHz source instead of CLEAN. UPSAMPLED counts as suspect in the overview filters.",
-      "sourceUrl": "http://10.10.1.203:8120/spectrum_analyzer.zip"
-    },
-    {
-      "version": "0.2.0",
-      "min_core_version": "2.5.0",
-      "changelog": "Parallel scans: one task per album fanned out across all workers, with a parent task tracking done/remaining. Fewer false FAKE_SUSPECT verdicts: content reaching ~20.5 kHz counts as full bandwidth, and a sharp edge with audible noise above the cutoff is now LOWPASSED, not FAKE. UI: filter albums by suspect count, re-analyze a whole album from its page.",
-      "sourceUrl": "http://10.10.1.203:8120/spectrum_analyzer.zip"
-    },
     {
       "version": "0.1.0",
       "min_core_version": "2.5.0",
-      "changelog": "Initial release: library scan grouped by album, change detection (metadata fingerprint + audio MD5), fake-lossless verdicts, base64 spectrograms, per-track re-analysis, on_song_analyzed hook, optional weekly incremental cron.",
-      "sourceUrl": "http://10.10.1.203:8120/spectrum_analyzer.zip"
+      "changelog": "First release. Parallel album-by-album scanning (orchestrator + per-album worker tasks), change detection (metadata fingerprint + audio MD5), verdicts CLEAN / CONSISTENT_LOSSY / LOWPASSED / UPSAMPLED / UPSCALED / TRANSCODED_LOSSY / FAKE_SUSPECT calibrated against ground-truth fixtures, aliasing-image and bit-depth probes, per-track deep whole-file dark-master analysis with status tags, manual verification flags, per-status album filters, base64 spectrograms, on_song_analyzed hook, optional weekly incremental cron.",
+      "sourceUrl": "http://10.10.1.203:8120/dist/spectrum_analyzer-0.1.0.zip"
     }
   ]
 }

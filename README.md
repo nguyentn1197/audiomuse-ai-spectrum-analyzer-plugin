@@ -1,6 +1,9 @@
 # SpectrumAnalyzer — AudioMuse-AI plugin
 
-Spectrum analysis over the whole library with fake-lossless / transcode detection and a stored spectrogram per song.
+A plugin for Audiomuse-AI to run spectrum analysis over the whole library with fake-lossless / transcode detection and a stored spectrogram per song.
+
+> [!CAUTION]
+> This entire project is made with AI. Use at your own risk.
 
 ## What it does
 
@@ -33,17 +36,37 @@ A 90 s segment from the middle of the track is loaded at native sample rate, STF
 - lossy container whose cutoff is far below what its declared bitrate should reach → `TRANSCODED_LOSSY`
 - otherwise → `CONSISTENT_LOSSY`
 
-These are heuristics — treat `FAKE_SUSPECT` as "look at the spectrogram," not a conviction. Note the deliberate trade-off in the CLEAN rule: a 320 kbps transcode (cutoff ~20.5 kHz) is spectrally indistinguishable from a genuine master, so it will read as CLEAN rather than risk false accusations against real lossless files.
+These are heuristics — treat `FAKE_SUSPECT` as "look at the spectrogram," not a conviction. Thresholds are calibrated against real ground-truth fixtures (see `tests/`): LAME 320 kbps transcodes (cutoff ~20.1 kHz, dither-only shelf) are caught, but very-high-bitrate transcodes whose cutoff reaches ≥ 20.5 kHz (e.g. AAC 256) still read as CLEAN — spectrally indistinguishable from a genuine master, and false accusations are worse.
 
 ## Install (local repository, per the official docs)
 
-1. Put `spectrum_analyzer.zip`, `plugin.json` and `manifest.json` in one folder.
-2. Edit both JSON files: replace `http://<your-ip>:8000` with an address your AudioMuse containers can reach (e.g. an LXC IP on your services VLAN — not `localhost`).
-3. `python3 -m http.server 8000` in that folder.
-4. AudioMuse-AI → Plugins → Repositories → add `http://<your-ip>:8000/manifest.json`.
+1. Run `./build.sh [version]` — it packages the plugin code into `dist/spectrum_analyzer-<version>.zip` and points the matching `plugin.json` entry's `sourceUrl` at it. Without an argument the version is taken from the newest zip in `dist/` (or `plugin.json` on a fresh checkout).
+2. Edit `plugin.json` and `manifest.json`: replace the host in the URLs with an address your AudioMuse containers can reach (e.g. an LXC IP on your services VLAN — not `localhost`).
+3. `python3 -m http.server 8120` in the **repo root** (so `/manifest.json`, `/plugin.json` and `/dist/spectrum_analyzer.zip` are all served).
+4. AudioMuse-AI → Plugins → Repositories → add `http://<your-ip>:8120/manifest.json`.
 5. Install from the Catalog tab, then **Apply now (restart)**.
 
 `matplotlib` is pulled in automatically at install (`requirements` in plugin.json) — this means **Docker/Kubernetes only**; the standalone builds can't install extra pip packages.
+
+## Development
+
+```bash
+# 1. unit tests (real DSP code against committed ground-truth fixtures)
+python3 -m pip install --user numpy soundfile matplotlib   # once
+python3 -m unittest discover tests -v
+
+# 2. build the installable package (versioned; no arg = reuse newest dist/ version)
+./build.sh 0.2.0                                            # -> dist/spectrum_analyzer-0.2.0.zip
+
+# 3. release: add the version + changelog entry in plugin.json (history: CHANGELOG.md),
+#    run ./build.sh <version> (it syncs that entry's sourceUrl), serve the repo
+#    root, and update the plugin from the AudioMuse catalog. Old versioned zips
+#    stay in dist/ so earlier plugin.json entries remain downloadable.
+```
+
+See `tests/README.md` for the fixture set, ad-hoc analysis of arbitrary files
+(`tests/run_verdicts.py`), fixture regeneration, and the measured calibration
+constants behind the detection thresholds.
 
 ## Notes & caveats
 
@@ -56,6 +79,7 @@ These are heuristics — treat `FAKE_SUSPECT` as "look at the spectrogram," not 
 
 - `plugins/SpectrumAnalyzer/__init__.py` — blueprint, pages (album overview with suspect filters, per-album detail), settings, migration, `register(ctx)`
 - `plugins/SpectrumAnalyzer/jobs.py` — scan orchestrator + per-album child tasks, single-track re-run, fingerprints, hook, DB upsert
-- `plugins/SpectrumAnalyzer/dsp.py` — STFT profile, cutoff/edge/shelf metrics, verdict, spectrogram PNG
-- `spectrum_analyzer.zip` — the flat code zip AudioMuse installs
-- `plugin.json`, `manifest.json` — descriptor + local catalog
+- `plugins/SpectrumAnalyzer/dsp.py` — STFT profile, cutoff/edge/shelf/aliasing/bit-depth metrics, verdict, deep scan, spectrogram PNG
+- `build.sh` → `dist/spectrum_analyzer.zip` — the flat code zip AudioMuse installs
+- `plugin.json`, `manifest.json` — descriptor + local catalog (`CHANGELOG.md` holds the version history)
+- `tests/` — out-of-the-box unit tests, committed ground-truth fixtures, fixture generator, ad-hoc verdict runner

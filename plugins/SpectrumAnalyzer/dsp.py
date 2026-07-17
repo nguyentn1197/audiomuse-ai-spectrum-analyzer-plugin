@@ -188,10 +188,13 @@ def _expected_cutoff_for_bitrate(bitrate_kbps):
     return None
 
 
-# Above the cutoff a real encoder wall leaves essentially digital silence
-# (the dB profile bottoms out ~200 dB below any signal); a genuine master
-# keeps dither / analog noise, typically within ~120 dB of the reference.
-SILENT_SHELF_DB = -120.0
+# Above the cutoff a transcode/resample leaves only the container's
+# quantization floor: measured on real 16-bit re-encodes of lossy sources the
+# shelf sits 73-106 dB below the reference (the encoder's digital silence is
+# refilled by 16-bit dither at re-encode, so a float-era -120 dB threshold
+# never fires). Genuine masters keep analog/tape noise well above that
+# (~-45..-65 dB relative). -68 splits the two populations.
+SILENT_SHELF_DB = -68.0
 
 # Nyquist frequencies of the standard rates a hi-res file may be upsampled from.
 _STD_NYQUISTS = (22050.0, 24000.0, 44100.0, 48000.0)
@@ -255,13 +258,28 @@ def _alias_image_corr(freqs, profile, mirror_hz, width_hz=4000.0):
 
 
 def _resample_match(nyquist, cutoff_hz):
-    """Source sample rate whose Nyquist the cutoff aligns with (within 5%),
+    """Source sample rate whose Nyquist the cutoff aligns with (within ~6%),
     when that Nyquist sits well below the container's own — the signature a
-    resampler's anti-alias filter leaves in an upsampled file."""
+    resampler's anti-alias filter leaves in an upsampled file. The window is
+    asymmetric: resampler image leakage pushes the *detected* cutoff above
+    the true wall, never below it."""
     for q in _STD_NYQUISTS:
-        if q <= 0.75 * nyquist and abs(cutoff_hz - q) <= 0.05 * q:
+        if q <= 0.75 * nyquist and -0.03 * q <= (cutoff_hz - q) <= 0.07 * q:
             return int(q * 2)
     return None
+
+
+def _best_alias_match(freqs, profile, nyquist):
+    """(correlation, source_rate) of the standard Nyquist whose mirrored
+    bands correlate best — images mirror around the source's Nyquist, not
+    around the detected cutoff (leakage shifts the latter upward)."""
+    best_corr, best_rate = None, None
+    for q in _STD_NYQUISTS:
+        if q <= 0.75 * nyquist:
+            c = _alias_image_corr(freqs, profile, q)
+            if c is not None and (best_corr is None or c > best_corr):
+                best_corr, best_rate = c, int(q * 2)
+    return best_corr, best_rate
 
 
 def _verdict(sr, suffix, bitrate_kbps, cutoff_hz, edge_db_khz, shelf_db,
@@ -286,25 +304,36 @@ def _verdict(sr, suffix, bitrate_kbps, cutoff_hz, edge_db_khz, shelf_db,
         if nyquist > 24000.0:
             src_rate = _resample_match(nyquist, cutoff_hz)
             if src_rate or cutoff_hz < 23000.0:
-                if src_rate:
-                    est = f'likely {src_rate / 1000.0:g} kHz source'
-                else:
-                    est = ('likely 44.1/48 kHz source'
-                           if cutoff_hz >= 21600.0 else 'CD-bandwidth source')
-                conf = 0.5 + (0.25 if sharp else 0.0) + (0.15 if silent_shelf else 0.0)
-                if silent_shelf:
+                corr, corr_rate = ((None, None) if freqs is None or profile is None
+                                   else _best_alias_match(freqs, profile, nyquist))
+                aliased = corr is not None and corr >= 0.6
+                if aliased and corr_rate:
+                    src_rate = corr_rate  # images name the true source rate
+                if silent_shelf or aliased or sharp:
+                    if src_rate:
+                        est = f'likely {src_rate / 1000.0:g} kHz source'
+                    else:
+                        est = ('likely 44.1/48 kHz source'
+                               if cutoff_hz >= 21600.0 else 'CD-bandwidth source')
+                    conf = (0.5 + (0.25 if sharp else 0.0)
+                            + (0.15 if silent_shelf else 0.0))
+                    if aliased:
+                        # the "noise" above the wall mirrors the band below it:
+                        # resampler aliasing images, not a genuine noise floor
+                        notes.append(f'content above the cutoff mirrors the band '
+                                     f'below (correlation {corr:.2f}): resampler '
+                                     f'aliasing images')
+                        conf = max(conf, 0.9)
+                    elif not silent_shelf:
+                        notes.append('some content above the cutoff: '
+                                     'could be a genuine but dark master')
                     return 'UPSAMPLED', est, conf, notes
-                corr = (None if freqs is None or profile is None
-                        else _alias_image_corr(freqs, profile, cutoff_hz))
-                if corr is not None and corr >= 0.6:
-                    # the "noise" above the cutoff mirrors the band below it:
-                    # resampler aliasing images, not a genuine noise floor
-                    notes.append(f'content above the cutoff mirrors the band below '
-                                 f'(correlation {corr:.2f}): resampler aliasing images')
-                    return 'UPSAMPLED', est, max(conf, 0.9), notes
-                notes.append('some content above the cutoff: '
-                             'could be a genuine but dark master')
-                return 'UPSAMPLED', est, conf, notes
+                # soft edge + audible noise + no aliasing: a genuine dark
+                # master fading out, not a resampler wall
+                notes.append('bandwidth is limited but the edge is gradual with '
+                             'audible noise above and no aliasing images: likely '
+                             'a genuine dark master')
+                return 'CLEAN', 'limited bandwidth (dark master?)', 0.6, notes
         return 'CLEAN', 'full bandwidth', 0.9, notes
 
     if nyquist > 24000.0 and cutoff_hz < 23000.0:
@@ -382,6 +411,7 @@ def analyze_file(path, suffix=None, bitrate_kbps=None, segment_seconds=90,
         suffix = os.path.splitext(path)[1].lstrip('.')
 
     edge_var = edge_med = None
+    pinned_q = None
     if deep:
         S_db, profile, freqs, sr, seg_len, edge_series = _deep_spectrum(path, drop_db)
         offset = 0.0
@@ -389,6 +419,15 @@ def analyze_file(path, suffix=None, bitrate_kbps=None, segment_seconds=90,
             arr = np.asarray(edge_series)
             edge_var = float(np.std(arr))
             edge_med = float(np.median(arr))
+            # a resampler wall caps the edge at the source Nyquist: content may
+            # dip below on quiet seconds (large variance!) but never crosses it;
+            # a dark master's edge wanders freely with no standard-rate ceiling
+            for q in _STD_NYQUISTS:
+                if (q <= 0.75 * (sr / 2.0)
+                        and float(np.mean(np.abs(arr - q) <= 0.04 * q)) >= 0.5
+                        and float(np.mean(arr > 1.06 * q)) <= 0.05):
+                    pinned_q = q
+                    break
     else:
         y, sr, offset = _load_segment(path, segment_seconds)
         seg_len = y.size / float(sr)
@@ -404,19 +443,25 @@ def analyze_file(path, suffix=None, bitrate_kbps=None, segment_seconds=90,
         if edge_var is None:
             notes.append('deep scan: not enough loud content to track the spectral edge')
         elif verdict in ('UPSAMPLED', 'FAKE_SUSPECT', 'LOWPASSED'):
-            if edge_var >= 500.0:
+            if pinned_q is not None:
+                notes.append(
+                    f'deep scan: the spectral edge stays capped at '
+                    f'{pinned_q / 1000.0:g} kHz (the Nyquist of a '
+                    f'{pinned_q * 2 / 1000.0:g} kHz source) for the whole file: '
+                    f'a resampler wall, not natural content')
+                conf = max(conf, 0.9)
+            elif edge_var >= 2000.0:
                 notes.append(
                     f'deep scan: the spectral edge follows the music '
-                    f'(varies ±{edge_var:.0f} Hz over the whole file) — a resampler '
-                    f'or encoder wall would be constant; consistent with a genuine '
-                    f'dark master')
+                    f'(varies ±{edge_var:.0f} Hz over the whole file) with no '
+                    f'standard-rate ceiling — consistent with a genuine dark master')
                 if verdict in ('UPSAMPLED', 'FAKE_SUSPECT'):
                     verdict = 'LOWPASSED'
                     est = 'likely genuine dark master'
                     conf = 0.4
                 else:
                     conf = min(0.9, conf + 0.2)
-            elif edge_var <= 150.0:
+            elif edge_var <= 300.0:
                 notes.append(
                     f'deep scan: constant spectral edge across the whole file '
                     f'(±{edge_var:.0f} Hz): a machine low-pass, not natural content')
