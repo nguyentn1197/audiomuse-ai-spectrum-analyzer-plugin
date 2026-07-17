@@ -9,6 +9,11 @@
   "_comment": "Pre-0.1.0 development history (0.1.0..0.6.2 before the version reset) is preserved in CHANGELOG.md.",
   "versions": [
     {
+      "version": "0.2.2",
+      "min_core_version": "2.6.2",
+      "changelog": "Overview: LOWPASSED counts are now visible — a total in the header stats and a per-album 'Lowpassed' column (amber), both excluding manually verified tracks. These are the ambiguous possibly-dark-master files worth a deep scan. UI: secondary buttons (Filter, Re-analyze, Deep analyze, Deep scan all non-CLEAN) restyled amber/brown — the core's default gray-on-white was barely visible; a queued Deep analyze button now looks properly disabled."
+    },
+    {
       "version": "0.2.1",
       "min_core_version": "2.6.2",
       "changelog": "Update license",
