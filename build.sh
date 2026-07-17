@@ -80,6 +80,11 @@ with open(out, 'rb') as fh:
     checksum = hashlib.md5(fh.read()).hexdigest()
 print(f'built {out} (md5 {checksum}): {names}')
 
+# raw URL of dist/ on this repo's main branch: the default when no previous
+# version entry exists to inherit the URL base from
+DEFAULT_BASE_URL = ('https://raw.githubusercontent.com/nguyentn1197/'
+                    'audiomuse-ai-spectrum-analyzer-plugin/main/dist')
+
 with open(PLUGIN_JSON) as fh:
     desc = json.load(fh)
 entry = next((v for v in desc['versions'] if v['version'] == version), None)
@@ -87,8 +92,18 @@ if entry is None:
     print(f'WARNING: {version} has no entry in plugin.json — '
           f'add one with a changelog before publishing')
 else:
-    new_url = re.sub(r'/dist/[^/]*$', f'/dist/spectrum_analyzer-{version}.zip',
-                     entry['sourceUrl'])
+    # a new release entry has no sourceUrl yet: inherit the URL base from the
+    # entry itself if present, else from any older published entry, else the
+    # default above
+    filename = f'spectrum_analyzer-{version}.zip'
+    new_url = None
+    for v in [entry] + desc['versions']:
+        base = v.get('sourceUrl') or ''
+        if '/dist/' in base:
+            new_url = re.sub(r'/dist/[^/]*$', f'/dist/{filename}', base)
+            break
+    if new_url is None:
+        new_url = f'{DEFAULT_BASE_URL}/{filename}'
     if new_url != entry.get('sourceUrl') or checksum != entry.get('checksum'):
         entry['sourceUrl'] = new_url
         entry['checksum'] = checksum
