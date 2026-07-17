@@ -30,6 +30,13 @@ from . import jobs
 
 bp = Blueprint('spectrum_analyzer', __name__)
 
+# The core's plain .btn renders white-on-gray and is barely visible; give
+# secondary action buttons an explicit amber/brown look instead.
+BTN_STYLE = ('background:#fbbf24;color:#78350f;border:1px solid #d97706;'
+             'border-radius:4px;padding:.35rem .8rem;font-weight:600;cursor:pointer;')
+BTN_DISABLED_STYLE = ('background:#f3f4f6;color:#9ca3af;border:1px solid #e5e7eb;'
+                      'border-radius:4px;padding:.35rem .8rem;cursor:not-allowed;')
+
 VERDICT_STYLE = {
     'CLEAN':            ('#16a34a', 'Full bandwidth'),
     'CONSISTENT_LOSSY': ('#2563eb', 'Lossy, consistent with container'),
@@ -114,16 +121,17 @@ def home():
         min_bad = max(1, min_bad)
     per_page = 100
 
-    # manually verified tracks never count as suspect
+    # manually verified tracks never count as suspect or lowpassed
     bad_expr = 'COUNT(*) FILTER (WHERE verdict IN %s AND NOT verified)'
+    low_expr = "COUNT(*) FILTER (WHERE verdict = 'LOWPASSED' AND NOT verified)"
 
     db = get_db()
     cur = db.cursor()
     cur.execute(
-        'SELECT COUNT(*), ' + bad_expr + ','
+        'SELECT COUNT(*), ' + bad_expr + ', ' + low_expr + ','
         ' COUNT(*) FILTER (WHERE verified),'
         ' COUNT(DISTINCT album) FROM ' + tbl, (SUSPECT_VERDICTS,))
-    total, suspects, n_verified, n_albums = cur.fetchone()
+    total, suspects, n_lowpassed, n_verified, n_albums = cur.fetchone()
 
     having = []
     having_params = []
@@ -147,7 +155,7 @@ def home():
     params = ([SUSPECT_VERDICTS] + having_params
               + [SUSPECT_VERDICTS, per_page + 1, page * per_page])
     cur.execute(
-        'SELECT album, COUNT(*), ' + bad_expr + ','
+        'SELECT album, COUNT(*), ' + bad_expr + ', ' + low_expr + ','
         ' COUNT(*) FILTER (WHERE verified),'
         ' COUNT(*) FILTER (WHERE deep_pending),'
         ' MIN(cutoff_hz), to_char(MAX(analyzed_at), \'DD-MM-YYYY HH24:MI\')'
@@ -176,7 +184,8 @@ def home():
         )) + (
         f'<form method="post" action="{url_for("spectrum_analyzer.deep_rescan_all")}" '
         f'style="display:inline;">'
-        f'<button type="submit" class="btn" title="Queue a deep (whole-file) scan for '
+        f'<button type="submit" class="btn" style="{BTN_STYLE}" '
+        f'title="Queue a deep (whole-file) scan for '
         f'every track in the library whose verdict is not CLEAN. Verified and '
         f'already-queued tracks are skipped.">Deep scan all non-CLEAN</button></form>')
 
@@ -214,11 +223,13 @@ def home():
         f'<td style="padding:.3rem .6rem;border-top:1px solid #ccc;text-align:right;'
         f'color:{"#dc2626" if bad else "#16a34a"};font-weight:600;">{bad}</td>'
         f'<td style="padding:.3rem .6rem;border-top:1px solid #ccc;text-align:right;'
+        f'color:{"#d97706" if low else "#6b7280"};font-weight:600;">{low or ""}</td>'
+        f'<td style="padding:.3rem .6rem;border-top:1px solid #ccc;text-align:right;'
         f'color:#6b7280;">{ver or ""}</td>'
         f'<td style="padding:.3rem .6rem;border-top:1px solid #ccc;text-align:right;">{_khz(min_cut)} kHz</td>'
         f'<td style="padding:.3rem .6rem;border-top:1px solid #ccc;">{_esc(last)}</td>'
         '</tr>'
-        for album, count, bad, ver, pending, min_cut, last in rows)
+        for album, count, bad, low, ver, pending, min_cut, last in rows)
 
     def page_url(p):
         params = {'q': q, 'min_bad': min_bad, 'p': p, 'v': sel_verdicts}
@@ -238,8 +249,10 @@ def home():
         f'<p><strong>{total}</strong> songs analyzed across <strong>{n_albums}</strong> albums; '
         f'<strong style="color:#dc2626;">{suspects}</strong> suspect '
         f'(fake lossless, transcode or fake hi-res), '
+        f'<strong style="color:#d97706;">{n_lowpassed}</strong> lowpassed '
+        f'(ambiguous: possibly genuine dark masters), '
         f'<strong style="color:#6b7280;">{n_verified}</strong> manually verified '
-        f'(excluded from suspect counts).</p>'
+        f'(excluded from suspect and lowpassed counts).</p>'
         f'{queued_msg}'
         f'<div style="margin:.8rem 0;">{scan_buttons}</div>'
         '<p style="font-size:.85rem;color:#6b7280;">Scans run on the worker, album by album; '
@@ -254,7 +267,7 @@ def home():
         f'style="width:4rem;"></label>'
         f'<label style="white-space:nowrap;"><input type="checkbox" name="verified" '
         f'value="1" {"checked" if verified_only else ""}> only albums with verified tracks</label>'
-        f'<button type="submit" class="btn">Filter</button></div>'
+        f'<button type="submit" class="btn" style="{BTN_STYLE}">Filter</button></div>'
         f'<div style="display:flex;gap:.2rem .6rem;align-items:center;flex-wrap:wrap;'
         f'margin-top:.5rem;">'
         f'<span style="font-size:.85rem;color:#6b7280;margin-right:.2rem;" '
@@ -277,6 +290,9 @@ def home():
         '<tr><th style="text-align:left;padding:.3rem .6rem;">Album</th>'
         '<th style="text-align:right;padding:.3rem .6rem;">Tracks</th>'
         '<th style="text-align:right;padding:.3rem .6rem;">Suspect</th>'
+        '<th style="text-align:right;padding:.3rem .6rem;" '
+        'title="LOWPASSED verdicts: limited bandwidth without a clear encoder '
+        'signature — possibly genuine dark masters, worth a deep scan">Lowpassed</th>'
         '<th style="text-align:right;padding:.3rem .6rem;">Verified</th>'
         '<th style="text-align:right;padding:.3rem .6rem;">Lowest cutoff</th>'
         '<th style="text-align:left;padding:.3rem .6rem;">Last analyzed</th></tr>'
@@ -340,11 +356,13 @@ def album():
             'verified</label></form>'
             f'<form method="post" action="{url_for("spectrum_analyzer.rescan", item_id=item_id)}" '
             f'style="display:inline;margin-left:.6rem;">'
-            f'<button type="submit" class="btn" title="Force re-download and re-analyze this song">'
+            f'<button type="submit" class="btn" style="{BTN_STYLE}" '
+            f'title="Force re-download and re-analyze this song">'
             'Re-analyze</button></form>'
             f'<form method="post" action="{url_for("spectrum_analyzer.deep_rescan", item_id=item_id)}" '
             f'style="display:inline;margin-left:.4rem;">'
             f'<button type="submit" class="btn" {"disabled" if deep_pending else ""} '
+            f'style="{BTN_DISABLED_STYLE if deep_pending else BTN_STYLE}" '
             f'title="{"A deep scan is already queued for this track" if deep_pending else "Analyze the ENTIRE file (not a segment) and track the spectral edge over time: an edge that follows the music means a genuine dark master, a constant wall means a resampler/encoder"}">'
             'Deep analyze</button></form></div></div>'
             f'<p style="margin:.4rem 0;font-size:.9rem;">Cutoff <strong>{_khz(cutoff)} kHz</strong>'
@@ -367,7 +385,7 @@ def album():
         f'<form method="post" action="{url_for("spectrum_analyzer.deep_rescan_album")}" '
         f'style="display:inline;margin-left:.4rem;">'
         f'<input type="hidden" name="name" value="{_esc(name)}">'
-        f'<button type="submit" class="btn" '
+        f'<button type="submit" class="btn" style="{BTN_STYLE}" '
         f'title="Queue a deep (whole-file) scan for every track whose verdict is not '
         f'CLEAN. Verified and already-queued tracks are skipped.">'
         'Deep scan all non-CLEAN</button></form>') if rows else ''

@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.2.2
+
+- Overview shows LOWPASSED counts: a header total and a per-album "Lowpassed"
+  column (amber), both excluding manually verified tracks — the ambiguous
+  possibly-dark-master bucket worth deep scanning.
+- Secondary buttons (Filter, Re-analyze, Deep analyze, Deep scan all
+  non-CLEAN) restyled amber/brown; the core's default gray-on-white was barely
+  visible. A queued Deep analyze button now renders as clearly disabled.
+
+## 0.2.1
+
+- License: AGPL-3.0-only (LICENSE file + SPDX headers in the shipped modules).
+
 ## 0.2.0
 
 - Search matches album, artist and song title (shows albums containing a
