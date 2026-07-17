@@ -24,6 +24,24 @@ A plugin for Audiomuse-AI to run spectrum analysis over the whole library with f
 - **Bonus hook** — `on_song_analyzed` analyzes new songs for free during core analysis (the audio is already on disk; deduped by MD5). Toggleable in settings.
 - **Optional cron** — a `plugin.spectrum_analyzer.scan_changed` schedule is seeded *disabled* (Sun 04:00); enable it under Administration → Scheduled Tasks for automatic incremental scans.
 
+## Screenshots
+
+**Library overview** — per-album suspect counts, scan buttons, free-text search (album / artist / song) and per-verdict filter chips:
+
+![Album overview with verdict filters](image/main-page.png)
+
+**Fake hi-res caught** — a 96 kHz / 24-bit FLAC whose content stops at ~22 kHz: flagged `UPSAMPLED` (likely 44.1 kHz source), red dashed line at the detected cutoff:
+
+![UPSAMPLED verdict on a fake hi-res FLAC](image/song-1.png)
+
+**Genuine dark master spared** — also 96 kHz with limited bandwidth, but the gradual edge, audible noise above the cutoff and absence of aliasing images keep it `CLEAN` with a "dark master?" note:
+
+![CLEAN dark-master verdict with explanatory note](image/song-2.png)
+
+**Deep scan** — whole-file analysis (note the full-track spectrogram) with the per-second edge-variability verdict in the raw metrics, and the amber "deep scan queued" status tag:
+
+![Deep-scanned track with LOWPASSED verdict and queue tag](image/song-3.png)
+
 ## How the fake detection works
 
 A 90 s segment from the middle of the track is loaded at native sample rate, STFT'd (n_fft 4096), and reduced to a robust per-frequency "max hold" profile (95th percentile over time). The cutoff is the highest frequency still within 40 dB of the 1–8 kHz reference level. A lossy encoder's low-pass leaves a near-vertical wall (high dB/kHz edge) with digital silence above it; a genuine master rolls off gradually and keeps dither/analog noise above the rolloff. Verdict logic:
@@ -98,3 +116,4 @@ AGPL-3.0-only (same as AudioMuse-AI core, and required for the community plugin 
 - `plugins/SpectrumAnalyzer/plugin.json` — the plugin descriptor (community-catalog layout: it lives next to the code, so the folder is a drop-in PR payload)
 - `manifest.json` — self-hosted catalog pointing at the descriptor (`CHANGELOG.md` holds the version history)
 - `tests/` — out-of-the-box unit tests, committed ground-truth fixtures, fixture generator, ad-hoc verdict runner
+- `image/` — README screenshots
