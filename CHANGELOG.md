@@ -1,5 +1,45 @@
 # Changelog
 
+## 0.3.0 — AudioMuse-AI 3.0 support
+
+- v3.0's multi-server architecture keys `score` by canonical fingerprint ids
+  (`fp_...`) instead of native media-server ids. All id handling now translates
+  at the edges (`track_server_map` / `tasks.mediaserver.registry`), fixing scans
+  reporting every track as `not_in_score` on 3.x. Results rows are keyed by the
+  canonical id; new `provider_track_id`/`server_id` columns keep the native id
+  for downloads and re-analysis. The `on_song_analyzed` hook now uses
+  `media_item._catalog_item_id` (its `item_id` field is the native id on v3).
+- **Lossless data migration**: the results FK is recreated as
+  `ON UPDATE CASCADE ON DELETE CASCADE`, so the core's in-place id relabel
+  migrates our rows automatically — verdicts, spectrograms, verified flags and
+  the MD5 change-detection cache all survive, no re-analysis needed. This also
+  fixes core 3.0 boot migrations that were failing/retrying because of the old
+  plugin FK (update the plugin + Apply restart; the next boot completes the
+  core migration). A defensive re-key via `track_server_map` covers tables
+  whose FK was removed. Verified against live Postgres 16 in four upgrade
+  scenarios (plugin-first upgrade, stuck 3.0 migration, orphaned rows,
+  fresh 3.x install).
+- Multi-server scanning: a manual library scan plans across **every**
+  configured media server, launching each album child bound to the server it
+  was listed on (the core's server binding is a contextvar and does not cross
+  RQ job boundaries, so every job binds its own). Tracks shared between
+  servers collapse onto one canonical id — no duplicate rows. Per-track
+  re-analysis and deep scans bind the server that supplied the row (stored
+  `server_id`), so downloads hit the right catalogue. Cron scans follow the
+  schedule's server scope (the core binds each run).
+- Task rows are keyed by the RQ job id: the 3.x janitor fails any top-level
+  task row whose id has no RQ job behind it, so a route-invented uuid row got
+  reaped as "orphaned" mid-scan (Error 9999 / "task disappeared from the
+  queue"). Routes no longer pre-create rows; each job creates its own, keyed
+  by its job id. The orchestrator also reports progress while settling
+  unchanged albums, so long planning phases no longer look stalled.
+- Hook-analyzed tracks skip the next scan cheaply: `on_song_analyzed` now
+  stores the same metadata fingerprint a scan computes (from the raw media
+  item), so a follow-up `changed` scan skips those tracks outright instead of
+  re-downloading each one to discover its MD5 is unchanged.
+- Single codebase supports both 2.6.2 and 3.0.1+ (graceful fallbacks when the
+  3.x translation APIs are absent).
+
 ## 0.2.2
 
 - Overview shows LOWPASSED counts: a header total and a per-album "Lowpassed"
