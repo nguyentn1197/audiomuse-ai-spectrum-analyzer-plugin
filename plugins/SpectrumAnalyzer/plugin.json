@@ -12,7 +12,8 @@
       "version": "0.3.1",
       "min_core_version": "2.6.2",
       "changelog": "Self-healing provider-id backfill: library and album scans now re-run the provider_track_id/server_id backfill from track_server_map at start. Fixes rows left empty when the 0.3.0 migration raced the core's v3 migration (on a stuck 3.0 boot the map is still empty when the plugin updates, so the one-shot install-time backfill found nothing), and repairs rows pointing at a media-server entry the core has since re-keyed (a scan during that window reported every track as not_in_score). One cheap idempotent UPDATE per scan; no re-analysis needed.",
-      "sourceUrl": "https://raw.githubusercontent.com/nguyentn1197/audiomuse-ai-spectrum-analyzer-plugin/refs/heads/main/dist/spectrum_analyzer-0.3.1.zip"
+      "sourceUrl": "https://raw.githubusercontent.com/nguyentn1197/audiomuse-ai-spectrum-analyzer-plugin/refs/heads/main/dist/spectrum_analyzer-0.3.1.zip",
+      "checksum": "9966d500f73069eb6af5f764f1c297a2"
     },
     {
       "version": "0.3.0",
