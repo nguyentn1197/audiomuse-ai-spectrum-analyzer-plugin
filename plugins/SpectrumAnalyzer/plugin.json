@@ -9,6 +9,12 @@
   "_comment": "Pre-0.1.0 development history (0.1.0..0.6.2 before the version reset) is preserved in CHANGELOG.md.",
   "versions": [
     {
+      "version": "0.3.1",
+      "min_core_version": "2.6.2",
+      "changelog": "Self-healing provider-id backfill: library and album scans now re-run the provider_track_id/server_id backfill from track_server_map at start. Fixes rows left empty when the 0.3.0 migration raced the core's v3 migration (on a stuck 3.0 boot the map is still empty when the plugin updates, so the one-shot install-time backfill found nothing), and repairs rows pointing at a media-server entry the core has since re-keyed (a scan during that window reported every track as not_in_score). One cheap idempotent UPDATE per scan; no re-analysis needed.",
+      "sourceUrl": "https://raw.githubusercontent.com/nguyentn1197/audiomuse-ai-spectrum-analyzer-plugin/refs/heads/main/dist/spectrum_analyzer-0.3.1.zip"
+    },
+    {
       "version": "0.3.0",
       "min_core_version": "2.6.2",
       "changelog": "AudioMuse-AI 3.0 support (multi-server canonical fp ids). Scans, re-analysis, deep scans and the analysis hook now translate native media-server ids to the canonical ids score is keyed by (track_server_map), fixing 'everything not_in_score' on 3.x. Existing data migrates automatically and losslessly: the results FK becomes ON UPDATE CASCADE so the core's id relabel carries our rows (verdicts, spectrograms, verified flags, MD5 cache all preserved) — this also unblocks core 3.0 upgrades that were failing at boot due to the old FK. If you are still on 2.x: update the plugin BEFORE upgrading the core. If your 3.0 upgrade is stuck: update the plugin + Apply restart, the next boot completes it. Multi-server: manual scans cover every configured server, re-analysis downloads from the server that supplied the track, cron scans follow the schedule's server scope. Task rows are keyed by the RQ job id so the 3.x janitor no longer fails a running scan as orphaned, and hook-analyzed tracks now store the scan fingerprint so the next changed scan skips them without re-downloading. Works on both 2.6.2 and 3.0.1+.",

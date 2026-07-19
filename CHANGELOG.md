@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.3.1
+
+- Self-healing provider-id backfill: library and album scans re-run the
+  `provider_track_id`/`server_id` backfill from `track_server_map` at start
+  (one cheap idempotent UPDATE). The 0.3.0 install-time backfill was a
+  one-shot that could race the core's v3 migration — on a stuck 3.0 boot the
+  map table exists but is still empty when the plugin updates (the core
+  commits the id relabel and the map in one transaction, on the next boot), so
+  the columns stayed NULL. The backfill also repairs rows pointing at a
+  media-server entry the core has since re-keyed (delete/re-add or provider
+  migration); a scan during such a window reported every track as
+  `not_in_score` because the id translation ran against a server id whose
+  mappings did not exist yet. No re-analysis needed — once the map is
+  consistent, the next scan heals the rows and settles everything as skipped.
+
 ## 0.3.0 — AudioMuse-AI 3.0 support
 
 - v3.0's multi-server architecture keys `score` by canonical fingerprint ids

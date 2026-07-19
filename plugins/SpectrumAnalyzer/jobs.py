@@ -267,6 +267,45 @@ def _existing_rows(item_ids=None):
     return rows
 
 
+def _backfill_provider_ids():
+    """Re-run migrate()'s provider_track_id/server_id backfill from
+    track_server_map.
+
+    migrate() is a one-shot that can race the core's v3 migration: on a stuck
+    3.0 boot the map table exists but is still empty when the plugin updates
+    (the canonicalization commits relabel + map in one transaction, on the
+    NEXT boot), so the install-time backfill finds nothing. Scans re-apply it
+    — one cheap idempotent UPDATE — healing rows whenever the map has
+    entries, including ones added later by a server alignment sweep."""
+    db = get_db()
+    cur = db.cursor()
+    try:
+        cur.execute("SELECT to_regclass('track_server_map')")
+        if cur.fetchone()[0] is None:
+            return
+        # also repairs rows pointing at a server that no longer exists (the
+        # core can re-key a server entry; its map is rebuilt by an alignment
+        # sweep, ours follows here)
+        cur.execute(
+            'UPDATE ' + table('results') + ' r'
+            ' SET provider_track_id = m.provider_track_id, server_id = m.server_id'
+            ' FROM track_server_map m'
+            ' WHERE m.item_id = r.item_id'
+            '   AND (r.provider_track_id IS NULL OR r.server_id IS NULL'
+            '        OR NOT EXISTS (SELECT 1 FROM music_servers s'
+            '                       WHERE s.server_id = r.server_id))')
+        healed = cur.rowcount
+        db.commit()
+        if healed:
+            logger.info('spectrum_analyzer: backfilled provider ids for %d rows',
+                        healed)
+    except Exception:
+        db.rollback()
+        logger.exception('spectrum_analyzer: provider-id backfill failed')
+    finally:
+        cur.close()
+
+
 def _score_ids(item_ids=None):
     db = get_db()
     cur = db.cursor()
@@ -434,6 +473,8 @@ def scan_album_job(album_id, album_name, mode='changed', task_id=None,
 
     status(TASK_STATUS_STARTED, 0, 'listing tracks')
     try:
+        if parent_task_id is None:  # standalone: parent already did this
+            _backfill_provider_ids()
         server_id = server_id or _active_server_id() or _album_server(album_id)
         with _bind_server(server_id):
             tracks = get_tracks_from_album(album_id)
@@ -511,6 +552,7 @@ def scan_library_job(mode='changed', task_id=None, all_servers=False):
 
     status(TASK_STATUS_STARTED, 0, 'listing albums')
     try:
+        _backfill_provider_ids()
         bound = _active_server_id()  # set when a cron scope bound this run
         server_ids = [bound] if bound or not all_servers else _list_server_ids()
         plan = []  # (server_id, album) pairs, albums listed per server
