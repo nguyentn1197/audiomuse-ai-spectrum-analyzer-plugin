@@ -16,14 +16,13 @@ Cleanup: results table cascades on DELETE FROM score (the core cleanup task).
 """
 
 import html
-import uuid
 from urllib.parse import urlencode
 
 from flask import Blueprint, request, redirect, url_for
 
 from plugin.api import (
     get_db, get_setting, set_setting, table, render_page, manage_plugins_url,
-    enqueue, save_task_status, TASK_STATUS_PENDING,
+    enqueue,
 )
 
 from . import jobs
@@ -54,7 +53,14 @@ def migrate(db):
     tbl = table('results')
     cur.execute(
         'CREATE TABLE IF NOT EXISTS ' + tbl + ' ('
-        ' item_id TEXT PRIMARY KEY REFERENCES score (item_id) ON DELETE CASCADE,'
+        # ON UPDATE CASCADE is load-bearing: AudioMuse-AI 3.0 relabels
+        # score.item_id in place (native ids -> canonical fp_ ids) and only
+        # detaches its own FKs around that UPDATE; with plain NO ACTION our
+        # rows would block the core migration, with CASCADE they are relabeled
+        # for us (same declaration core uses for track_server_map).
+        ' item_id TEXT PRIMARY KEY REFERENCES score (item_id)'
+        '   ON UPDATE CASCADE ON DELETE CASCADE,'
+        ' provider_track_id TEXT, server_id TEXT,'
         ' title TEXT, artist TEXT, album TEXT, album_id TEXT,'
         ' file_path TEXT, suffix TEXT, bitrate INTEGER,'
         ' meta_fp TEXT, audio_md5 TEXT,'
@@ -74,6 +80,7 @@ def migrate(db):
     # 0.5.1: set while a deep scan is queued/running, cleared when it finishes
     cur.execute('ALTER TABLE ' + tbl +
                 ' ADD COLUMN IF NOT EXISTS deep_pending BOOLEAN NOT NULL DEFAULT FALSE')
+    _migrate_v3_ids(db, cur, tbl)
     cur.execute('CREATE INDEX IF NOT EXISTS ' + tbl + '_album_idx ON ' + tbl + ' (album)')
     # optional weekly incremental scan, shipped disabled (admin enables it)
     cur.execute(
@@ -84,6 +91,75 @@ def migrate(db):
     )
     db.commit()
     cur.close()
+
+
+def _migrate_v3_ids(db, cur, tbl):
+    """AudioMuse-AI 3.0 compatibility (0.3.0). Idempotent; safe on 2.x.
+
+    3.0 rewrote score.item_id from native media-server ids to canonical fp_
+    ids (track_server_map translates). Steps, in a deliberate order:
+    1. add provider_track_id/server_id columns (native id kept for
+       download/rescan; item_id is the canonical id from now on),
+    2. re-key any native-keyed rows left orphaned by an already-completed core
+       migration (only possible in exotic states, e.g. a manually dropped FK),
+    3. replace the FK with ON UPDATE CASCADE ON DELETE CASCADE so the core's
+       in-place relabel cascades into our rows instead of being blocked by
+       them (for users stuck on a failing 3.0 boot migration, the next retry
+       succeeds and migrates our data in the same transaction),
+    4. backfill provider_track_id/server_id from track_server_map.
+    """
+    cur.execute('ALTER TABLE ' + tbl + ' ADD COLUMN IF NOT EXISTS provider_track_id TEXT')
+    cur.execute('ALTER TABLE ' + tbl + ' ADD COLUMN IF NOT EXISTS server_id TEXT')
+
+    cur.execute("SELECT to_regclass('track_server_map')")
+    has_map = cur.fetchone()[0] is not None
+
+    if has_map:
+        # 2. defensive re-key: native-keyed rows that no longer match score but
+        # translate via the map (skip if the canonical row already exists)
+        cur.execute(
+            'UPDATE ' + tbl + ' r SET item_id = m.item_id,'
+            ' provider_track_id = COALESCE(r.provider_track_id, m.provider_track_id),'
+            ' server_id = COALESCE(r.server_id, m.server_id)'
+            ' FROM track_server_map m'
+            " WHERE m.provider_track_id = r.item_id AND r.item_id NOT LIKE 'fp\\_%'"
+            '   AND NOT EXISTS (SELECT 1 FROM score s WHERE s.item_id = r.item_id)'
+            '   AND NOT EXISTS (SELECT 1 FROM ' + tbl + ' r2 WHERE r2.item_id = m.item_id)')
+
+    # 3. FK repair: drop any item_id->score FK that is not ON UPDATE CASCADE,
+    # then (re)create it with the cascade. NOT VALID + best-effort VALIDATE so
+    # a stray unmatchable row can never brick the plugin update; cascades
+    # apply to new writes and to the core relabel either way.
+    cur.execute(
+        'SELECT con.conname, con.confupdtype FROM pg_constraint con'
+        " WHERE con.conrelid = %s::regclass AND con.confrelid = 'score'::regclass"
+        "   AND con.contype = 'f'", (tbl,))
+    fks = cur.fetchall()
+    needs_fk = not fks
+    for name, upd in fks:
+        if upd != 'c':  # 'c' = ON UPDATE CASCADE
+            cur.execute('ALTER TABLE ' + tbl + ' DROP CONSTRAINT "' + name + '"')
+            needs_fk = True
+    if needs_fk:
+        con = tbl + '_item_id_fkey'
+        cur.execute(
+            'ALTER TABLE ' + tbl + ' ADD CONSTRAINT "' + con + '"'
+            ' FOREIGN KEY (item_id) REFERENCES score (item_id)'
+            ' ON UPDATE CASCADE ON DELETE CASCADE NOT VALID')
+        cur.execute('SAVEPOINT spectrum_fk_validate')
+        try:
+            cur.execute('ALTER TABLE ' + tbl + ' VALIDATE CONSTRAINT "' + con + '"')
+        except Exception:
+            cur.execute('ROLLBACK TO SAVEPOINT spectrum_fk_validate')
+        cur.execute('RELEASE SAVEPOINT spectrum_fk_validate')
+
+    if has_map:
+        # 4. backfill native ids for rows analyzed before this version
+        cur.execute(
+            'UPDATE ' + tbl + ' r SET provider_track_id = m.provider_track_id,'
+            ' server_id = m.server_id'
+            ' FROM track_server_map m'
+            ' WHERE r.provider_track_id IS NULL AND m.item_id = r.item_id')
 
 
 def _esc(v):
@@ -407,14 +483,17 @@ def scan():
     mode = request.form.get('mode', 'changed')
     if mode not in ('changed', 'verify', 'force'):
         mode = 'changed'
-    task_id = str(uuid.uuid4())
-    save_task_status(task_id, jobs.TASK_TYPE, TASK_STATUS_PENDING,
-                     details={'mode': mode, 'info': 'queued'})
     # the orchestrator lives on the high queue so its per-album children
-    # (default queue) can be picked up by every default worker in parallel
-    enqueue(jobs.scan_library_job, mode=mode, task_id=task_id, queue='high')
+    # (default queue) can be picked up by every default worker in parallel;
+    # all_servers: a manual scan covers every configured media server, not
+    # just the default one (no-op on a single-server / 2.x install).
+    # No task row is created here: the job keys its own row by its RQ job id
+    # (a route-invented uuid has no job behind it, so the core janitor would
+    # reap the row as orphaned mid-scan)
+    enqueue(jobs.scan_library_job, mode=mode, all_servers=True, queue='high')
     return render_page(
-        f'<p>Library scan started (mode: <strong>{_esc(mode)}</strong>). '
+        f'<p>Library scan started (mode: <strong>{_esc(mode)}</strong>), '
+        'covering every configured media server. '
         'Albums are dispatched as parallel worker tasks; follow overall progress '
         'and per-album sub-tasks under Active Tasks.</p>'
         f'<p><a href="{url_for("spectrum_analyzer.home")}">Back</a></p>',
@@ -495,11 +574,9 @@ def rescan_album():
     name = request.form.get('name') or ''
     album_id = (request.form.get('album_id') or '').strip()
     if album_id:
-        task_id = str(uuid.uuid4())
-        save_task_status(task_id, jobs.ALBUM_TASK_TYPE, TASK_STATUS_PENDING,
-                         sub_type_identifier=name,
-                         details={'mode': 'force', 'album': name, 'info': 'queued'})
-        enqueue(jobs.scan_album_job, album_id, name, mode='force', task_id=task_id)
+        # no pre-created task row: the job keys its own row by its RQ job id,
+        # which is what the core janitor probes top-level rows against
+        enqueue(jobs.scan_album_job, album_id, name, mode='force')
     else:
         # no album id stored (e.g. hook-inserted rows): re-run track by track
         db = get_db()

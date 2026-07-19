@@ -28,6 +28,7 @@ verify  : download everything, but re-analyze only when the audio MD5 changed
 force   : re-download and re-analyze everything.
 """
 
+import contextlib
 import hashlib
 import json
 import os
@@ -57,6 +58,108 @@ POLL_SECONDS = 5
 # bitRate, created, ...); other providers contribute what they have.
 _FP_KEYS = ('path', 'Path', 'size', 'Size', 'suffix', 'Container',
             'bitRate', 'bitrate', 'created', 'changed', 'duration')
+
+
+# ------------------------------------------------- canonical-id translation --
+# AudioMuse-AI 3.0 keys `score` by canonical fingerprint ids (fp_...) and maps
+# them to native media-server ids in `track_server_map`. Media-server track
+# dicts still carry native ids in 'Id'/'id', so everything we store is keyed by
+# the canonical id and translated at the edges. On a pre-3.0 core the registry
+# module does not exist and both directions collapse to identity/no-op.
+
+def _active_server_id():
+    try:
+        from plugin.api import active_server_id
+    except ImportError:
+        return None  # pre-3.0 core: single server
+    try:
+        return active_server_id()
+    except Exception:
+        return None
+
+
+def _list_server_ids():
+    """Every configured server's id, default first; [None] on 2.x or failure
+    (None = the lone/default server everywhere in this module)."""
+    try:
+        from plugin.api import list_servers
+    except ImportError:
+        return [None]
+    try:
+        ids = [s.get('server_id') for s in list_servers()]
+        return [i for i in ids if i] or [None]
+    except Exception:
+        logger.exception('spectrum_analyzer: listing servers failed')
+        return [None]
+
+
+def _rq_task_id():
+    """The running RQ job's id, to key our task_status row by.
+
+    The core janitor fails any top-level non-terminal task row older than a
+    grace period whose task_id has no RQ job behind it (Job.fetch by that id).
+    A row keyed by a self-invented uuid therefore gets reaped mid-scan; rows
+    MUST be keyed by the actual job id. Corollary: routes must not pre-create
+    the row either — run_plugin_task fetches the row keyed by the job id
+    before the task runs and, when it exists, overwrites it with a bare
+    SUCCESS (details wiped) afterwards. The job creates its own row instead.
+    """
+    try:
+        from rq import get_current_job
+        job = get_current_job()
+        return job.id if job is not None else None
+    except Exception:
+        return None
+
+
+def _bind_server(server_id):
+    """Context manager binding every media-server call in scope to server_id.
+
+    The core's binding is a contextvar, which does NOT cross RQ job boundaries:
+    a child job never inherits the parent's binding, so every job that lists,
+    matches or downloads tracks must bind the server it was planned against
+    itself. No-op (default server) when server_id is None or on a 2.x core.
+    """
+    if not server_id:
+        return contextlib.nullcontext()
+    try:
+        from plugin.api import use_server
+    except ImportError:
+        return contextlib.nullcontext()
+    return use_server(server_id)
+
+
+def _native_to_fp(native_ids, server_id=None):
+    """{native_id: canonical id}. Identity mapping on a pre-3.0 core."""
+    ids = [str(i) for i in native_ids if i]
+    if not ids:
+        return {}
+    try:
+        from tasks.mediaserver.registry import reverse_translate_ids
+    except ImportError:
+        return {i: i for i in ids}
+    try:
+        mapped = reverse_translate_ids(ids, server_id=server_id)
+    except Exception:
+        logger.exception('spectrum_analyzer: native->canonical translation failed')
+        return {i: i for i in ids}
+    return {i: str(mapped.get(i, i)) for i in ids}
+
+
+def _fp_to_native(fp_ids, server_id=None):
+    """{canonical id: native provider id} for this server; {} on a pre-3.0 core."""
+    ids = [str(i) for i in fp_ids if i]
+    if not ids:
+        return {}
+    try:
+        from tasks.mediaserver.registry import translate_ids
+    except ImportError:
+        return {}
+    try:
+        return {str(k): str(v) for k, v in translate_ids(ids, server_id=server_id).items()}
+    except Exception:
+        logger.exception('spectrum_analyzer: canonical->native translation failed')
+        return {}
 
 
 def meta_fingerprint(track):
@@ -107,12 +210,14 @@ def _upsert(item_id, info, result, meta_fp, audio_md5):
     db = get_db()
     cur = db.cursor()
     cur.execute(
-        'INSERT INTO ' + tbl + ' (item_id, title, artist, album, album_id, file_path, '
+        'INSERT INTO ' + tbl + ' (item_id, provider_track_id, server_id, title, '
+        'artist, album, album_id, file_path, '
         'suffix, bitrate, meta_fp, audio_md5, sample_rate, seg_offset, seg_seconds, '
         'cutoff_hz, edge_db_khz, shelf_db, verdict, est_source, confidence, details, '
         'container_bits, effective_bits, spectrogram_b64, analyzed_at) '
-        'VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s, now()) '
+        'VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s, now()) '
         'ON CONFLICT (item_id) DO UPDATE SET '
+        'provider_track_id=EXCLUDED.provider_track_id, server_id=EXCLUDED.server_id, '
         'title=EXCLUDED.title, artist=EXCLUDED.artist, album=EXCLUDED.album, '
         'album_id=EXCLUDED.album_id, file_path=EXCLUDED.file_path, suffix=EXCLUDED.suffix, '
         'bitrate=EXCLUDED.bitrate, meta_fp=EXCLUDED.meta_fp, audio_md5=EXCLUDED.audio_md5, '
@@ -124,7 +229,8 @@ def _upsert(item_id, info, result, meta_fp, audio_md5):
         'container_bits=EXCLUDED.container_bits, effective_bits=EXCLUDED.effective_bits, '
         'spectrogram_b64=EXCLUDED.spectrogram_b64, analyzed_at=now()',
         (
-            item_id, info.get('title'), info.get('artist'), info.get('album'),
+            item_id, info.get('provider_track_id'), info.get('server_id'),
+            info.get('title'), info.get('artist'), info.get('album'),
             info.get('album_id'), info.get('file_path'), info.get('suffix'),
             info.get('bitrate'), meta_fp, audio_md5,
             result['sample_rate'], result['seg_offset'], result['seg_seconds'],
@@ -261,9 +367,20 @@ def _analyze_download(track, info, meta_fp, settings, existing, mode, deep=False
         shutil.rmtree(tmp, ignore_errors=True)
 
 
-def _info_from_track(track, album):
+def _native_id(track):
+    v = track.get('Id') or track.get('id')
+    return str(v) if v else None
+
+
+def _info_from_track(track, album, fp_map=None, server_id=None):
+    """fp_map: {native_id: canonical_id} from a per-album _native_to_fp batch;
+    item_id is the canonical id (identical to the native id on a v2 core)."""
+    native = _native_id(track)
+    canonical = (fp_map or {}).get(native, native)
     return {
-        'item_id': track.get('Id') or track.get('id'),
+        'item_id': canonical,
+        'provider_track_id': native,
+        'server_id': server_id,
         'title': track.get('Name') or track.get('title'),
         'artist': track.get('AlbumArtist') or track.get('artist'),
         'album': track.get('Album') or (album or {}).get('Name'),
@@ -274,11 +391,29 @@ def _info_from_track(track, album):
     }
 
 
+def _album_server(album_id):
+    """Server that previously supplied this album's rows (None if unknown)."""
+    if not album_id:
+        return None
+    try:
+        db = get_db()
+        cur = db.cursor()
+        cur.execute('SELECT server_id FROM ' + table('results')
+                    + ' WHERE album_id=%s AND server_id IS NOT NULL LIMIT 1',
+                    (album_id,))
+        row = cur.fetchone()
+        cur.close()
+        return row[0] if row else None
+    except Exception:
+        return None
+
+
 def scan_album_job(album_id, album_name, mode='changed', task_id=None,
-                   parent_task_id=None):
-    """Analyze one album. Child of scan_library_job, or standalone for the
-    per-album Re-analyze button (mode=force, no parent)."""
-    task_id = task_id or str(uuid.uuid4())
+                   parent_task_id=None, server_id=None):
+    """Analyze one album. Child of scan_library_job (which passes the server it
+    planned the album against), or standalone for the per-album Re-analyze
+    button (mode=force, no parent; server recovered from the stored rows)."""
+    task_id = task_id or _rq_task_id() or str(uuid.uuid4())
     settings = _settings()
     counters = {k: 0 for k in COUNTER_KEYS}
 
@@ -299,38 +434,45 @@ def scan_album_job(album_id, album_name, mode='changed', task_id=None,
 
     status(TASK_STATUS_STARTED, 0, 'listing tracks')
     try:
-        tracks = get_tracks_from_album(album_id)
-        ids = [t.get('Id') or t.get('id') for t in tracks]
-        ids = [i for i in ids if i]
-        score_ids = _score_ids(ids)
-        existing = _existing_rows(ids)
-        total = max(1, len(tracks))
+        server_id = server_id or _active_server_id() or _album_server(album_id)
+        with _bind_server(server_id):
+            tracks = get_tracks_from_album(album_id)
+            # one batched native->canonical translation per album, like the
+            # core's attach_catalog_item_ids; score and our rows are keyed by
+            # canonical ids
+            fp_map = _native_to_fp([_native_id(t) for t in tracks], server_id)
+            ids = [i for i in fp_map.values() if i]
+            score_ids = _score_ids(ids)
+            existing = _existing_rows(ids)
+            total = max(1, len(tracks))
 
-        for i, track in enumerate(tracks):
-            info = _info_from_track(track, {'Id': album_id, 'Name': album_name})
-            item_id = info['item_id']
-            if not item_id:
-                continue
-            if item_id not in score_ids:
-                # not analyzed by the core yet -> no score row to attach to
-                # (the on_song_analyzed hook will pick it up later)
-                counters['not_in_score'] += 1
-            else:
-                meta_fp = meta_fingerprint(track)
-                prev = existing.get(item_id)
-                if mode == 'changed' and prev and meta_fp and prev[0] == meta_fp:
-                    counters['skipped'] += 1
+            for i, track in enumerate(tracks):
+                info = _info_from_track(track,
+                                        {'Id': album_id, 'Name': album_name},
+                                        fp_map, server_id)
+                item_id = info['item_id']
+                if not item_id:
+                    continue
+                if item_id not in score_ids:
+                    # not analyzed by the core yet -> no score row to attach to
+                    # (the on_song_analyzed hook will pick it up later)
+                    counters['not_in_score'] += 1
                 else:
-                    try:
-                        tag = _analyze_download(track, info, meta_fp, settings,
-                                                existing, mode)
-                        counters[tag] += 1
-                    except Exception:
-                        logger.exception('spectrum_analyzer: failed on %s',
-                                         info.get('title'))
-                        counters['error'] += 1
-            status(TASK_STATUS_PROGRESS, int((i + 1) * 100 / total),
-                   info.get('title') or '?')
+                    meta_fp = meta_fingerprint(track)
+                    prev = existing.get(item_id)
+                    if mode == 'changed' and prev and meta_fp and prev[0] == meta_fp:
+                        counters['skipped'] += 1
+                    else:
+                        try:
+                            tag = _analyze_download(track, info, meta_fp,
+                                                    settings, existing, mode)
+                            counters[tag] += 1
+                        except Exception:
+                            logger.exception('spectrum_analyzer: failed on %s',
+                                             info.get('title'))
+                            counters['error'] += 1
+                status(TASK_STATUS_PROGRESS, int((i + 1) * 100 / total),
+                       info.get('title') or '?')
 
         status(TASK_STATUS_SUCCESS, 100, 'done')
         return counters
@@ -341,14 +483,20 @@ def scan_album_job(album_id, album_name, mode='changed', task_id=None,
 
 # ------------------------------------------------------ parent orchestrator --
 
-def scan_library_job(mode='changed', task_id=None):
+def scan_library_job(mode='changed', task_id=None, all_servers=False):
     """Fan the library scan out into one scan_album_job per album.
 
     Runs on the high queue so it never competes with its own children for a
     default worker. In 'changed' mode albums whose every track is unchanged
     (or not yet in score) are settled here without launching a child.
+
+    all_servers=True (the UI scan buttons) plans the scan across every
+    configured media server, launching each album child with the server it was
+    listed on; duplicates across servers collapse onto the same canonical id.
+    The cron entry point keeps the default False: a schedule's server scope
+    already runs the task once per server, bound by the core.
     """
-    task_id = task_id or str(uuid.uuid4())
+    task_id = task_id or _rq_task_id() or str(uuid.uuid4())
     max_in_flight = max(1, int(getattr(config, 'MAX_QUEUED_ANALYSIS_JOBS', 25)))
 
     def status(state, progress, detail, extra=None):
@@ -363,8 +511,14 @@ def scan_library_job(mode='changed', task_id=None):
 
     status(TASK_STATUS_STARTED, 0, 'listing albums')
     try:
-        albums = get_recent_albums(0)  # 0 = every album
-        albums_total = max(1, len(albums))
+        bound = _active_server_id()  # set when a cron scope bound this run
+        server_ids = [bound] if bound or not all_servers else _list_server_ids()
+        plan = []  # (server_id, album) pairs, albums listed per server
+        for sid in server_ids:
+            with _bind_server(sid):
+                for album in get_recent_albums(0):  # 0 = every album
+                    plan.append((sid, album))
+        albums_total = max(1, len(plan))
         albums_skipped = 0
         launched = 0
         launched_jobs = {}  # child task_id -> rq Job, for lost-job reconciliation
@@ -394,11 +548,12 @@ def scan_library_job(mode='changed', task_id=None):
             extra = {
                 'albums_total': albums_total, 'albums_launched': launched,
                 'albums_no_work': albums_skipped, 'albums_done': albums_done,
-                'albums_remaining': albums_total - albums_done, **agg,
+                'albums_remaining': albums_total - albums_done,
+                'servers': len(server_ids), **agg,
             }
             return done, int(albums_done * 100 / albums_total), extra
 
-        def launch(album, album_name):
+        def launch(album, album_name, sid):
             child_id = str(uuid.uuid4())
             save_task_status(child_id, ALBUM_TASK_TYPE, TASK_STATUS_PENDING,
                              parent_task_id=task_id, sub_type_identifier=album_name,
@@ -406,9 +561,9 @@ def scan_library_job(mode='changed', task_id=None):
                                       'info': 'queued'})
             launched_jobs[child_id] = enqueue(
                 scan_album_job, album.get('Id'), album_name, mode=mode,
-                task_id=child_id, parent_task_id=task_id)
+                task_id=child_id, parent_task_id=task_id, server_id=sid)
 
-        for album in albums:
+        for sid, album in plan:
             if revoked():
                 logger.info('spectrum_analyzer scan %s cancelled during launch', task_id)
                 return
@@ -417,17 +572,22 @@ def scan_library_job(mode='changed', task_id=None):
             if mode == 'changed':
                 # settle all-unchanged albums here, without a child job
                 try:
-                    tracks = get_tracks_from_album(album.get('Id'))
+                    with _bind_server(sid):
+                        tracks = get_tracks_from_album(album.get('Id'))
                 except Exception:
                     logger.exception('spectrum_analyzer: album listing failed: %s',
                                      album_name)
                     parent_counters['error'] += 1
                     albums_skipped += 1
+                    done, progress, extra = snapshot(album_name)
+                    status(TASK_STATUS_PROGRESS, progress,
+                           f'listing failed: {album_name}', extra)
                     continue
+                fp_map = _native_to_fp([_native_id(t) for t in tracks], sid)
                 pending = 0
                 tallies = {'skipped': 0, 'not_in_score': 0}
                 for track in tracks:
-                    item_id = track.get('Id') or track.get('id')
+                    item_id = fp_map.get(_native_id(track))
                     if not item_id:
                         continue
                     if item_id not in score_ids:
@@ -443,6 +603,12 @@ def scan_library_job(mode='changed', task_id=None):
                     parent_counters['skipped'] += tallies['skipped']
                     parent_counters['not_in_score'] += tallies['not_in_score']
                     albums_skipped += 1
+                    # keep progress moving on the settle path too: a library of
+                    # mostly-unchanged albums would otherwise show no update
+                    # (and look stalled) for the whole planning phase
+                    done, progress, extra = snapshot(album_name)
+                    status(TASK_STATUS_PROGRESS, progress,
+                           f'unchanged: {album_name}', extra)
                     continue
 
             # throttle: keep at most max_in_flight children unfinished
@@ -459,7 +625,7 @@ def scan_library_job(mode='changed', task_id=None):
                        extra)
                 time.sleep(POLL_SECONDS)
 
-            launch(album, album_name)
+            launch(album, album_name, sid)
             launched += 1
             done, progress, extra = snapshot(album_name)
             status(TASK_STATUS_PROGRESS, progress, f'queued: {album_name}', extra)
@@ -517,7 +683,8 @@ def _analyze_track(item_id, deep):
     db = get_db()
     cur = db.cursor()
     cur.execute(
-        'SELECT title, artist, album, album_id, file_path, suffix, bitrate FROM '
+        'SELECT title, artist, album, album_id, file_path, suffix, bitrate,'
+        ' provider_track_id, server_id FROM '
         + table('results') + ' WHERE item_id=%s', (item_id,))
     row = cur.fetchone()
     cur.close()
@@ -525,29 +692,38 @@ def _analyze_track(item_id, deep):
         logger.warning('spectrum_analyzer: no stored row for %s', item_id)
         return
 
-    title, artist, album, album_id, file_path, suffix, bitrate = row
+    (title, artist, album, album_id, file_path, suffix, bitrate,
+     provider_id, row_server) = row
+    server_id = row_server or _active_server_id()
+    # the media server speaks native ids: stored provider id, else translate
+    # the canonical id, else item_id itself (v2 rows, where they are the same)
+    native = (provider_id
+              or _fp_to_native([item_id], server_id).get(item_id)
+              or item_id)
 
-    # Prefer fresh metadata from the media server (also refreshes fingerprint)
-    track = None
-    if album_id:
-        try:
-            for t in get_tracks_from_album(album_id):
-                if (t.get('Id') or t.get('id')) == item_id:
-                    track = t
-                    break
-        except Exception:
-            logger.exception('spectrum_analyzer: album lookup failed for rescan')
-    if track is None:
-        # minimal item accepted by every provider backend
-        track = {'id': item_id, 'Id': item_id, 'title': title,
-                 'suffix': suffix, 'path': file_path, 'Path': file_path}
+    with _bind_server(server_id):
+        # Prefer fresh metadata from the media server (also refreshes fingerprint)
+        track = None
+        if album_id:
+            try:
+                for t in get_tracks_from_album(album_id):
+                    if _native_id(t) in (native, item_id):
+                        track = t
+                        break
+            except Exception:
+                logger.exception('spectrum_analyzer: album lookup failed for rescan')
+        if track is None:
+            # minimal item accepted by every provider backend
+            track = {'id': native, 'Id': native, 'title': title,
+                     'suffix': suffix, 'path': file_path, 'Path': file_path}
 
-    info = _info_from_track(track, {'Id': album_id, 'Name': album})
-    info['title'] = info['title'] or title
-    info['artist'] = info['artist'] or artist
-    info['album'] = info['album'] or album
-    _analyze_download(track, info, meta_fingerprint(track), settings, {}, 'force',
-                      deep=deep)
+        info = _info_from_track(track, {'Id': album_id, 'Name': album},
+                                {_native_id(track): item_id}, server_id)
+        info['title'] = info['title'] or title
+        info['artist'] = info['artist'] or artist
+        info['album'] = info['album'] or album
+        _analyze_download(track, info, meta_fingerprint(track), settings, {},
+                          'force', deep=deep)
     logger.info('spectrum_analyzer: re-analyzed %s%s', info.get('title'),
                 ' (deep)' if deep else '')
 
@@ -562,10 +738,19 @@ def on_song_analyzed(song):
     try:
         if not get_setting('hook_enabled', True):
             return
-        item_id = song.get('item_id')
+        native_id = song.get('item_id')  # v3: the NATIVE provider id
         path = song.get('audio_path')
-        if not item_id or not path or not os.path.exists(path):
+        if not native_id or not path or not os.path.exists(path):
             return
+        # v3 attaches the canonical fp id (what score is keyed by) to the raw
+        # media item; on v2 it is absent and the native id IS the score key
+        media_item = song.get('media_item') or {}
+        item_id = str(media_item.get('_catalog_item_id') or native_id)
+
+        # media_item is the raw provider track dict — the same shape the scans
+        # fingerprint — so store the fingerprint a scan would compute and the
+        # next 'changed' scan skips this track outright, no download needed
+        meta_fp = meta_fingerprint(media_item) or None
 
         md5 = file_md5(path)
         db = get_db()
@@ -575,12 +760,16 @@ def on_song_analyzed(song):
         row = cur.fetchone()
         cur.close()
         if row and row[0] == md5:
+            if meta_fp:
+                _touch_fingerprint(item_id, meta_fp)  # backfill older hook rows
             return  # same bytes, nothing to do
 
         meta = song.get('metadata') or {}
         settings = _settings()
         info = {
             'item_id': item_id,
+            'provider_track_id': str(native_id),
+            'server_id': song.get('server_id'),
             'title': meta.get('title'),
             'artist': meta.get('artist') or meta.get('album_artist'),
             'album': meta.get('album') or meta.get('album_name'),
@@ -594,8 +783,9 @@ def on_song_analyzed(song):
             segment_seconds=settings['segment_seconds'], drop_db=settings['drop_db'],
             img_w=settings['img_w'], img_h=settings['img_h'],
         )
-        # meta_fp stays NULL: the next 'changed' scan sees a mismatch, downloads
-        # once, notices the MD5 matches, and just backfills the fingerprint.
-        _upsert(item_id, info, result, None, md5)
+        # (if the payload had no media_item — e.g. an older core — meta_fp is
+        # NULL and the next 'changed' scan downloads once, notices the MD5
+        # matches, and just backfills the fingerprint)
+        _upsert(item_id, info, result, meta_fp, md5)
     except Exception:
         logger.exception('spectrum_analyzer: on_song_analyzed failed')
