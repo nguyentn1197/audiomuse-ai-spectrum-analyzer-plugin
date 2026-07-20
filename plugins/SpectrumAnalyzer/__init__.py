@@ -69,17 +69,21 @@ def migrate(db):
         ' verdict TEXT, est_source TEXT, confidence REAL, details TEXT,'
         ' container_bits INTEGER, effective_bits INTEGER,'
         ' spectrogram_b64 TEXT,'
+        ' analysis_rev TEXT,'
         ' analyzed_at TIMESTAMP DEFAULT now())'
     )
-    # 0.4.0: bit-depth columns for installs upgrading from older schemas
+    # Prerelease - 0.4.0: bit-depth columns for installs upgrading from older schemas
     cur.execute('ALTER TABLE ' + tbl + ' ADD COLUMN IF NOT EXISTS container_bits INTEGER')
     cur.execute('ALTER TABLE ' + tbl + ' ADD COLUMN IF NOT EXISTS effective_bits INTEGER')
-    # 0.5.0: manual verification flag (verified tracks don't count as suspect)
+    # Prerelease - 0.5.0: manual verification flag (verified tracks don't count as suspect)
     cur.execute('ALTER TABLE ' + tbl +
                 ' ADD COLUMN IF NOT EXISTS verified BOOLEAN NOT NULL DEFAULT FALSE')
-    # 0.5.1: set while a deep scan is queued/running, cleared when it finishes
+    # Prerelease - 0.5.1: set while a deep scan is queued/running, cleared when it finishes
     cur.execute('ALTER TABLE ' + tbl +
                 ' ADD COLUMN IF NOT EXISTS deep_pending BOOLEAN NOT NULL DEFAULT FALSE')
+    # 0.4.0: analysis-revision stamp; NULL on old rows = stale, re-analyzed on
+    # the next changed/verify scan (skip paths require a rev match)
+    cur.execute('ALTER TABLE ' + tbl + ' ADD COLUMN IF NOT EXISTS analysis_rev TEXT')
     _migrate_v3_ids(db, cur, tbl)
     cur.execute('CREATE INDEX IF NOT EXISTS ' + tbl + '_album_idx ON ' + tbl + ' (album)')
     # optional weekly incremental scan, shipped disabled (admin enables it)

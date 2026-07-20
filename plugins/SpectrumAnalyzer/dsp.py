@@ -27,6 +27,16 @@ LOSSY_SUFFIXES = {'mp3', 'ogg', 'opus', 'aac', 'm4a', 'mp4', 'wma', 'mpc'}
 
 N_FFT = 4096
 
+# Bump when verdict logic changes so stored results re-analyze on the next
+# non-force scan (the skip paths in jobs.py require a rev match).
+ANALYSIS_REV = 1
+
+
+def analysis_rev(drop_db, segment_seconds):
+    """Revision stamp stored with each result: the analyzer constant folded
+    with the verdict-relevant settings (rendering settings excluded)."""
+    return f'r{ANALYSIS_REV}-d{drop_db}-s{segment_seconds}'
+
 # Deep scan: analyze the whole file in chunks (bounded so a mislabelled
 # 10-hour stream can't eat the worker).
 DEEP_MAX_SECONDS = 1800
@@ -518,4 +528,5 @@ def analyze_file(path, suffix=None, bitrate_kbps=None, segment_seconds=90,
             'notes': notes,
         }),
         'spectrogram_b64': png_b64,
+        'analysis_rev': analysis_rev(drop_db, segment_seconds),
     }

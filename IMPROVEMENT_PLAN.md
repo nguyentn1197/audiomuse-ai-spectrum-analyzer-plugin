@@ -108,7 +108,7 @@ have is deferred.
 
 ## Phase 1 — verdict reliability at (roughly) current cost
 
-- [ ] **Analysis-revision stamp (do this first).** The skip logic
+- [x] **Analysis-revision stamp (do this first).** The skip logic
       (`changed` = fingerprint match, `verify` = encoded-MD5 match,
       `jobs.py:394`) has no notion of *which analyzer* produced a stored
       result — so every improvement below would leave unchanged tracks on

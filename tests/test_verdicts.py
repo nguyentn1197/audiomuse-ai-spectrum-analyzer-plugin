@@ -65,10 +65,19 @@ class TestSegmentVerdicts(unittest.TestCase):
     def test_result_contract(self):
         r = _analyze('genuine_cd_1644.flac', 'flac', 900)
         for key in ('sample_rate', 'cutoff_hz', 'edge_db_khz', 'verdict',
-                    'confidence', 'details', 'spectrogram_b64'):
+                    'confidence', 'details', 'spectrogram_b64', 'analysis_rev'):
             self.assertIn(key, r)
         self.assertTrue(len(r['spectrogram_b64']) > 1000)
         json.loads(r['details'])  # must be valid JSON
+        self.assertEqual(r['analysis_rev'], dsp.analysis_rev(40, 90))  # defaults
+
+    def test_analysis_rev(self):
+        # the stamp must move with the analyzer constant and every
+        # verdict-relevant setting, so stored results re-analyze on change
+        base = dsp.analysis_rev(40, 90)
+        self.assertNotEqual(base, dsp.analysis_rev(45, 90))
+        self.assertNotEqual(base, dsp.analysis_rev(40, 120))
+        self.assertIn(f'r{dsp.ANALYSIS_REV}-', base)
 
 
 class TestDeepVerdicts(unittest.TestCase):
