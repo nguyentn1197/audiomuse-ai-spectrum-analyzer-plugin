@@ -79,6 +79,22 @@ class TestSegmentVerdicts(unittest.TestCase):
         self.assertNotEqual(base, dsp.analysis_rev(40, 120))
         self.assertIn(f'r{dsp.ANALYSIS_REV}-', base)
 
+    def test_decode_failure_is_inconclusive(self):
+        # a file that can't be decoded at all must come back as a storable
+        # INCONCLUSIVE result, not a raised exception -- otherwise the
+        # track silently vanishes from scans instead of surfacing as
+        # "never meaningfully analyzed" (jobs.py drops uncaught exceptions)
+        import tempfile
+        with tempfile.NamedTemporaryFile(suffix='.flac') as f:
+            f.write(b'not actually audio' * 100)
+            f.flush()
+            r = dsp.analyze_file(f.name, suffix='flac', bitrate_kbps=900)
+        self.assertEqual(r['verdict'], 'INCONCLUSIVE')
+        self.assertFalse(r['deep_eligible'])
+        self.assertEqual(r['analysis_rev'], dsp.analysis_rev(40, 90))
+        d = json.loads(r['details'])
+        self.assertEqual(d['substatus'], 'decode_failed')
+
 
 class TestDeepVerdicts(unittest.TestCase):
     def test_verdicts(self):

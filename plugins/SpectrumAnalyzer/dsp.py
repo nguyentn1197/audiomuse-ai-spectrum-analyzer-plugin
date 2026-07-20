@@ -417,6 +417,39 @@ def _render_spectrogram(S_db, sr, seg_offset, seg_len_s, cutoff_hz,
     return base64.b64encode(buf.getvalue()).decode('ascii')
 
 
+def _inconclusive_result(suffix, bitrate_kbps, deep, drop_db, segment_seconds, exc):
+    """Result dict for a file that could not be decoded at all: a stored,
+    visible INCONCLUSIVE row instead of a silently dropped analysis.
+    deep_eligible=False — if the file couldn't be decoded once, a repeat
+    attempt (segment or deep) won't fare better. Same key shape as a normal
+    result so callers (_upsert, on_song_analyzed) need no special-casing."""
+    return {
+        'sample_rate': None,
+        'seg_offset': 0.0,
+        'seg_seconds': None,
+        'cutoff_hz': None,
+        'edge_db_khz': None,
+        'shelf_db': None,
+        'verdict': 'INCONCLUSIVE',
+        'est_source': 'could not decode audio',
+        'confidence': 0.0,
+        'container_bits': None,
+        'effective_bits': None,
+        'deep_eligible': False,
+        'details': json.dumps({
+            'substatus': 'decode_failed',
+            'decode_error': str(exc),
+            'declared_bitrate_kbps': bitrate_kbps,
+            'suffix': suffix,
+            'deep': deep,
+            'drop_db': drop_db,
+            'notes': [f'decode failed: {exc}'],
+        }),
+        'spectrogram_b64': None,
+        'analysis_rev': analysis_rev(drop_db, segment_seconds),
+    }
+
+
 def analyze_file(path, suffix=None, bitrate_kbps=None, segment_seconds=90,
                  drop_db=40, img_w=800, img_h=280, deep=False):
     """Full pipeline. Returns a dict ready to be stored.
@@ -431,9 +464,19 @@ def analyze_file(path, suffix=None, bitrate_kbps=None, segment_seconds=90,
 
     edge_var = edge_med = None
     pinned_q = None
+    try:
+        if deep:
+            S_db, profile, freqs, sr, seg_len, edge_series = _deep_spectrum(path, drop_db)
+            offset = 0.0
+        else:
+            y, sr, offset = _load_segment(path, segment_seconds)
+            seg_len = y.size / float(sr)
+            S_db, profile, freqs = _spectrum(y, sr)
+    except ValueError as exc:
+        return _inconclusive_result(suffix, bitrate_kbps, deep, drop_db,
+                                    segment_seconds, exc)
+
     if deep:
-        S_db, profile, freqs, sr, seg_len, edge_series = _deep_spectrum(path, drop_db)
-        offset = 0.0
         if len(edge_series) >= 10:
             arr = np.asarray(edge_series)
             edge_var = float(np.std(arr))
@@ -447,10 +490,6 @@ def analyze_file(path, suffix=None, bitrate_kbps=None, segment_seconds=90,
                         and float(np.mean(arr > 1.06 * q)) <= 0.05):
                     pinned_q = q
                     break
-    else:
-        y, sr, offset = _load_segment(path, segment_seconds)
-        seg_len = y.size / float(sr)
-        S_db, profile, freqs = _spectrum(y, sr)
 
     cutoff_hz, ref = _find_cutoff(freqs, profile, drop_db)
     edge = _edge_sharpness(freqs, profile, cutoff_hz)
@@ -512,6 +551,7 @@ def analyze_file(path, suffix=None, bitrate_kbps=None, segment_seconds=90,
         'confidence': round(conf, 2),
         'container_bits': container_bits,
         'effective_bits': effective_bits,
+        'deep_eligible': True,
         'details': json.dumps({
             'ref_level_db': round(ref, 2),
             'drop_db': drop_db,

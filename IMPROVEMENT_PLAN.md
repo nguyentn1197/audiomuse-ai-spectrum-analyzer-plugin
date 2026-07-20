@@ -126,7 +126,7 @@ have is deferred.
       signatures, calibration-table revisions — one string is enough.
       *Cost: one column + one comparison.*
 
-- [ ] **Verdict/substatus contract.** New states introduced by this plan
+- [x] **Verdict/substatus contract.** New states introduced by this plan
       (integrity, DSD, unsupported formats) are **substatuses in the details
       JSON, never new primary verdicts** — `bad_expr`, the album filters and
       the bulk `deep_rescan_all` route are all keyed to the fixed verdict

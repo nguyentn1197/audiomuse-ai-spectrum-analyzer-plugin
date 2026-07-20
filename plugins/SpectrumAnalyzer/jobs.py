@@ -214,8 +214,9 @@ def _upsert(item_id, info, result, meta_fp, audio_md5):
         'artist, album, album_id, file_path, '
         'suffix, bitrate, meta_fp, audio_md5, sample_rate, seg_offset, seg_seconds, '
         'cutoff_hz, edge_db_khz, shelf_db, verdict, est_source, confidence, details, '
-        'container_bits, effective_bits, spectrogram_b64, analysis_rev, analyzed_at) '
-        'VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s, now()) '
+        'container_bits, effective_bits, spectrogram_b64, analysis_rev, deep_eligible, '
+        'analyzed_at) '
+        'VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s, now()) '
         'ON CONFLICT (item_id) DO UPDATE SET '
         'provider_track_id=EXCLUDED.provider_track_id, server_id=EXCLUDED.server_id, '
         'title=EXCLUDED.title, artist=EXCLUDED.artist, album=EXCLUDED.album, '
@@ -228,7 +229,8 @@ def _upsert(item_id, info, result, meta_fp, audio_md5):
         'confidence=EXCLUDED.confidence, details=EXCLUDED.details, '
         'container_bits=EXCLUDED.container_bits, effective_bits=EXCLUDED.effective_bits, '
         'spectrogram_b64=EXCLUDED.spectrogram_b64, '
-        'analysis_rev=EXCLUDED.analysis_rev, analyzed_at=now()',
+        'analysis_rev=EXCLUDED.analysis_rev, deep_eligible=EXCLUDED.deep_eligible, '
+        'analyzed_at=now()',
         (
             item_id, info.get('provider_track_id'), info.get('server_id'),
             info.get('title'), info.get('artist'), info.get('album'),
@@ -239,7 +241,7 @@ def _upsert(item_id, info, result, meta_fp, audio_md5):
             result['verdict'], result['est_source'], result['confidence'],
             result['details'], result.get('container_bits'),
             result.get('effective_bits'), result['spectrogram_b64'],
-            result['analysis_rev'],
+            result['analysis_rev'], result.get('deep_eligible', True),
         ),
     )
     db.commit()
