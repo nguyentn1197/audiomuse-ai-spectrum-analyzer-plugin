@@ -54,3 +54,17 @@ is fine — extract the .tar.xz with `python3 -m tarfile` if `xz` is missing).
   meanwhile `tests/test_verdicts.py::TestCutoffDetection` covers the mask
   logic (gap tolerance, min-width rejection, tone exclusion, sample-rate
   independence) with synthetic spectra.
+- Codec-aware transcode gating (`_verdict`'s `TRANSCODED_LOSSY` branch):
+  verdict-changing effect restricted to `_CALIBRATED_TRANSCODE_CODECS =
+  {'mp3'}` (the only codec `_expected_cutoff_for_bitrate`'s table is tuned
+  against); `_TRANSCODE_GATE_CONFIDENCE_PENALTY = 0.10` (floored at 0.5) on
+  top of the existing margin formula, plus a note naming the
+  intentionally-low-passed-first-gen alternative, even for MP3. A real
+  intentionally-low-passed-MP3 fixture to arbitrate this margin is deferred
+  to "minimum adversarial fixtures" (needs `ffmpeg`'s `libmp3lame` to
+  generate); meanwhile `tests/test_verdicts.py::TestCodecGating` covers the
+  gate logic (calibrated vs. uncalibrated vs. unknown codec, the mp3
+  suffix-trust fallback, the ffprobe tier-3 fallback's failure/success paths)
+  with synthetic/mocked calls, and `test_transcode_gate_mp3_reduced_confidence`
+  confirms the real `transcoded_128as320.mp3` fixture still verdicts
+  `TRANSCODED_LOSSY` at reduced confidence.

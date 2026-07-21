@@ -251,8 +251,32 @@ have is deferred.
       Recalibrate against `tests/fixtures/` and update `tests/README.md`
       constants.*
 
-- [ ] **Codec-aware transcode gating.** *(Moved here from "rejected" — the
-      original rejection was factually wrong.)* `_expected_cutoff_for_bitrate`
+- [x] **Codec-aware transcode gating.** *(Moved here from "rejected" — the
+      original rejection was factually wrong.)*
+      *Shipped: the ffprobe tier-3 fallback deferred by the previous checkbox
+      (`_probe_codec_ffprobe`, m4a/mp4/ogg — this is what fixes ALAC-in-.m4a,
+      since libsndfile can't open MP4 at all), plus tier 2 now reading
+      `soundfile.info().subtype` for MP3/Vorbis codec ID at no extra cost.
+      The `TRANSCODED_LOSSY`-changing effect of `_expected_cutoff_for_bitrate`
+      is gated to `_CALIBRATED_TRANSCODE_CODECS = {'mp3'}`; every other lossy
+      codec (including unresolved/"unknown") gets the evidence note without a
+      verdict change. The MP3 gate keeps firing even with no ffprobe on PATH
+      (`_resolve_lossy_codec`'s suffix-trust fallback — verified against the
+      real `transcoded_128as320.mp3` fixture, no regression) and now carries
+      `_TRANSCODE_GATE_CONFIDENCE_PENALTY = 0.10` (floored at 0.5) plus a note
+      naming the low-passed-first-gen alternative, per the round-5 resolution
+      below. `ANALYSIS_REV` bumped to 3. Deferred: a real
+      intentionally-low-passed-MP3 fixture to arbitrate the margin (needs
+      `ffmpeg`'s `libmp3lame`, not available in this dev sandbox — rides with
+      "Minimum adversarial fixtures" below, which already owns real-fixture
+      generation) — until it lands, the gate logic itself is covered by
+      synthetic direct calls to `_verdict`/`_resolve_lossy_codec` in
+      `tests/test_verdicts.py::TestCodecGating`, and the ffprobe fallback's
+      failure path is exercised for real (ffprobe genuinely absent here) with
+      its success path covered by a mocked `subprocess.run`. Also deferred:
+      "lazy bitrate resolution" mentioned in the previous checkbox's deferral
+      note — not required by this item's own text, no consumer for it yet.*
+      `_expected_cutoff_for_bitrate`
       is not cosmetic: its output directly gates the `TRANSCODED_LOSSY`
       verdict (`dsp.py:365-370`) and the one MP3-shaped table is applied to
       every lossy suffix — AAC, Opus, Vorbis, WMA, Musepack, and `m4a`/`mp4`/

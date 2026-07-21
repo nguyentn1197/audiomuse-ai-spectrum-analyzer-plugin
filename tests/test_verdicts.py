@@ -128,7 +128,25 @@ class TestSegmentVerdicts(unittest.TestCase):
         self.assertEqual(d['integrity'], {'status': 'sampled_decode_ok', 'coverage': 'sampled'})
         self.assertIsNone(d['delivery'])
         r = _analyze('consistent_320.mp3', 'mp3', 320)
-        self.assertIsNone(json.loads(r['details'])['delivery'])
+        # tier-2 soundfile subtype resolves the codec for free -- 'delivery'
+        # is no longer None, but the resolved codec itself is a true no-op
+        self.assertEqual(json.loads(r['details'])['delivery'], {'codec': 'mp3'})
+
+    def test_transcode_gate_mp3_reduced_confidence(self):
+        # the shipped, fixture-validated MP3 gate must still fire -- but at
+        # reduced confidence, with a note naming the low-passed-first-gen
+        # alternative explanation (codec-aware transcode gating)
+        r = _analyze('transcoded_128as320.mp3', 'mp3', 320)
+        self.assertEqual(r['verdict'], 'TRANSCODED_LOSSY')
+        d = json.loads(r['details'])
+        self.assertEqual(d['delivery']['codec'], 'mp3')
+        self.assertTrue(any('low-passed first-generation' in n for n in d['notes']),
+                        d['notes'])
+        # confidence must be strictly below what the pre-penalty formula gives
+        full_threshold = min(0.93 * (r['sample_rate'] / 2.0), 20500.0)
+        margin = max(0.0, min(1.0, (full_threshold - r['cutoff_hz']) / full_threshold))
+        pre_penalty_conf = min(0.9, 0.55 + 0.5 * margin)
+        self.assertLess(r['confidence'], pre_penalty_conf)
 
 
 class TestDeepVerdicts(unittest.TestCase):
@@ -231,6 +249,59 @@ class TestCutoffDetection(unittest.TestCase):
                 cutoff_hz, _, tone = dsp._find_cutoff(freqs, profile, drop_db=30)
                 self.assertAlmostEqual(cutoff_hz, 12000, delta=250)
                 self.assertTrue(tone)
+
+
+class TestCodecGating(unittest.TestCase):
+    """Codec-aware transcode gating: the TRANSCODED_LOSSY-changing effect of
+    _expected_cutoff_for_bitrate is calibrated on MP3 only. Direct synthetic
+    calls -- no real AAC/Opus fixtures are available (would need ffmpeg to
+    generate, deferred to "Minimum adversarial fixtures")."""
+
+    # a cutoff/bitrate combo that trips the ~320 kbps expected-cutoff gate
+    # (19500 - 1500 = 18000 threshold) for any lossy suffix
+    _GATED_KWARGS = dict(sr=44100, bitrate_kbps=320, cutoff_hz=15500,
+                         edge_db_khz=10.0, shelf_db=-40.0, is_lossless=False)
+
+    def test_uncalibrated_codec_does_not_flip_verdict(self):
+        verdict, est, conf, notes = dsp._verdict(
+            suffix='m4a', codec='aac', **self._GATED_KWARGS)
+        self.assertEqual(verdict, 'CONSISTENT_LOSSY')
+        self.assertTrue(any('no calibrated' in n for n in notes), notes)
+
+    def test_unknown_codec_gate_disabled(self):
+        verdict, est, conf, notes = dsp._verdict(
+            suffix='m4a', codec=None, **self._GATED_KWARGS)
+        self.assertEqual(verdict, 'CONSISTENT_LOSSY')
+        self.assertTrue(any('no calibrated' in n for n in notes), notes)
+
+    def test_mp3_codec_flips_verdict(self):
+        verdict, est, conf, notes = dsp._verdict(
+            suffix='mp3', codec='mp3', **self._GATED_KWARGS)
+        self.assertEqual(verdict, 'TRANSCODED_LOSSY')
+        self.assertTrue(any('low-passed first-generation' in n for n in notes), notes)
+
+    def test_resolve_lossy_codec_mp3_suffix_fallback(self):
+        self.assertEqual(dsp._resolve_lossy_codec('mp3', None), 'mp3')
+        self.assertIsNone(dsp._resolve_lossy_codec('aac', None))
+        self.assertEqual(dsp._resolve_lossy_codec('m4a', 'alac'), 'alac')
+
+    def test_probe_codec_ffprobe_missing_binary(self):
+        # ffprobe is genuinely absent from PATH in this sandbox -- exercises
+        # the degrade path for real, not just via a mock
+        import tempfile
+        with tempfile.NamedTemporaryFile(suffix='.m4a') as f:
+            f.write(b'not actually audio')
+            f.flush()
+            self.assertIsNone(dsp._probe_codec_ffprobe(f.name, timeout=2.0))
+
+    def test_probe_codec_ffprobe_parses_success(self):
+        import subprocess
+        import unittest.mock as mock
+
+        payload = json.dumps({'streams': [{'codec_name': 'alac'}]}).encode()
+        fake = subprocess.CompletedProcess(args=[], returncode=0, stdout=payload)
+        with mock.patch('subprocess.run', return_value=fake):
+            self.assertEqual(dsp._probe_codec_ffprobe('irrelevant.m4a'), 'alac')
 
 
 if __name__ == '__main__':

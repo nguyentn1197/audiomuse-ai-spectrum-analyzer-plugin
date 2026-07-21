@@ -29,7 +29,7 @@ N_FFT = 4096
 
 # Bump when verdict logic changes so stored results re-analyze on the next
 # non-force scan (the skip paths in jobs.py require a rev match).
-ANALYSIS_REV = 2
+ANALYSIS_REV = 3
 
 
 def analysis_rev(drop_db, segment_seconds):
@@ -329,7 +329,10 @@ def _estimate_source(cutoff_hz):
 
 def _expected_cutoff_for_bitrate(bitrate_kbps):
     """Rough lower bound of the cutoff a *first-generation* lossy file of this
-    bitrate should reach. Used to flag lossy->lossy transcodes."""
+    bitrate should reach. Used to flag lossy->lossy transcodes. Calibrated on
+    MP3/LAME fixtures only -- gating this table's verdict-changing effect to
+    _CALIBRATED_TRANSCODE_CODECS is the caller's job (_verdict), not this
+    function's."""
     if not bitrate_kbps:
         return None
     if bitrate_kbps >= 300:
@@ -398,24 +401,94 @@ def _bit_depth_probe(path, max_seconds=30.0):
 _SNDFILE_LOSSLESS_FORMATS = {'FLAC', 'WAV', 'WAVEX', 'AIFF', 'W64', 'CAF', 'RF64'}
 _SNDFILE_LOSSY_FORMATS = {'MP3', 'OGG'}
 
+# soundfile.info().subtype for the lossy formats above names the actual
+# codec for free (verified: 'MPEG_LAYER_III' for this repo's MP3 fixtures) -
+# no subprocess needed for the common case.
+_SNDFILE_SUBTYPE_CODEC = {'MPEG_LAYER_III': 'mp3', 'MPEG_LAYER_II': 'mp2',
+                          'VORBIS': 'vorbis', 'OPUS': 'opus'}
+
 
 def _probe_container(path):
     """Tier 2 of the codec probe: identify the actual container/codec for
     formats libsndfile can read natively, independent of a (possibly wrong)
-    file extension. Returns (detected_format, is_lossless), or (None, None)
-    when soundfile can't open the file at all (m4a/opus/wma/mpc - an ffprobe
-    fallback tier, not implemented here)."""
+    file extension. Returns (detected_format, is_lossless, codec), or
+    (None, None, None) when soundfile can't open the file at all
+    (m4a/opus/wma/mpc - tier 3, _probe_codec_ffprobe)."""
     try:
         import soundfile as sf
         info = sf.info(path)
     except Exception:
-        return None, None
+        return None, None, None
     fmt = (info.format or '').upper()
     if fmt in _SNDFILE_LOSSLESS_FORMATS:
-        return fmt, True
+        return fmt, True, None  # codec identity irrelevant for the gate here
     if fmt in _SNDFILE_LOSSY_FORMATS:
-        return fmt, False
-    return fmt or None, None  # readable but unclassified: don't override suffix
+        codec = _SNDFILE_SUBTYPE_CODEC.get((info.subtype or '').upper())
+        return fmt, False, codec
+    return fmt or None, None, None  # readable but unclassified: don't override suffix
+
+
+# ffmpeg codec_name values relevant to a music library (not exhaustive -
+# extend as real fixtures surface gaps). Used only to classify a tier-3
+# ffprobe result as lossy/lossless when tier 2 couldn't open the file at all
+# (m4a/mp4 - this is what actually resolves ALAC-in-.m4a, which libsndfile
+# can't read).
+_FFPROBE_LOSSLESS_CODECS = {'alac', 'flac', 'wavpack', 'ape', 'tta', 'shorten',
+                            'pcm_s16le', 'pcm_s16be', 'pcm_s24le', 'pcm_s24be',
+                            'pcm_s32le', 'pcm_s32be', 'pcm_f32le', 'wmalossless'}
+_FFPROBE_LOSSY_CODECS = {'aac', 'mp3', 'mp2', 'vorbis', 'opus', 'wmav1', 'wmav2',
+                         'wmapro', 'musepack'}
+
+
+def _probe_codec_ffprobe(path, timeout=10.0):
+    """Tier 3 of the codec probe: shell out to ffprobe for containers
+    soundfile can't classify (m4a/mp4/ogg-opus/wma/mpc). Returns the audio
+    stream's lowercase codec_name (e.g. 'aac', 'alac', 'opus'), or None on
+    any failure -- missing binary, timeout, non-zero exit, no audio stream,
+    malformed output. Callers must treat None as "unknown codec, gate
+    disabled" and never guess."""
+    import subprocess
+    try:
+        proc = subprocess.run(
+            ['ffprobe', '-v', 'error', '-print_format', 'json', '-show_streams',
+             '-select_streams', 'a:0', path],
+            capture_output=True, timeout=timeout,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None
+    try:
+        streams = json.loads(proc.stdout).get('streams') or []
+        return (streams[0].get('codec_name') or '').lower() or None
+    except (ValueError, AttributeError, IndexError, TypeError):
+        return None
+
+
+# The one codec _expected_cutoff_for_bitrate's table is actually calibrated
+# against (LAME/MP3 fixtures) -- the TRANSCODED_LOSSY-changing gate below
+# applies only here; every other lossy codec gets a note, not a verdict
+# change (a native ffmpeg AAC/WMA encode legitimately cuts lower than MP3 at
+# the same declared bitrate).
+_CALIBRATED_TRANSCODE_CODECS = {'mp3'}
+# Even the calibrated MP3 gate is evidence, not proof -- an intentionally
+# low-passed first-generation MP3 at the declared bitrate is a legitimate
+# alternative explanation, so the gate never claims full confidence.
+_TRANSCODE_GATE_CONFIDENCE_PENALTY = 0.10
+
+
+def _resolve_lossy_codec(suffix, probed_codec):
+    """Codec name used by the transcode gate. Prefers the probed value
+    (tier-2 subtype or tier-3 ffprobe); falls back to the suffix only for
+    mp3 -- the one calibrated codec, and the shipped, fixture-validated
+    TRANSCODED_LOSSY detector must keep firing on it even when neither probe
+    tier resolves anything (e.g. no ffprobe on PATH). Every other suffix
+    without a probed codec returns None: "unknown codec, gate disabled"."""
+    if probed_codec:
+        return probed_codec
+    if suffix == 'mp3':
+        return 'mp3'
+    return None
 
 
 def _alias_image_corr(freqs, profile, mirror_hz, width_hz=4000.0):
@@ -466,7 +539,7 @@ def _best_alias_match(freqs, profile, nyquist):
 
 
 def _verdict(sr, suffix, bitrate_kbps, cutoff_hz, edge_db_khz, shelf_db,
-             freqs=None, profile=None, is_lossless=None):
+             freqs=None, profile=None, is_lossless=None, codec=None):
     nyquist = sr / 2.0
     suffix = (suffix or '').lower().lstrip('.')
     # Genuine 44.1 kHz masters legitimately roll off at 20-21 kHz (ADC
@@ -539,10 +612,19 @@ def _verdict(sr, suffix, bitrate_kbps, cutoff_hz, edge_db_khz, shelf_db,
     # lossy container
     expected = _expected_cutoff_for_bitrate(bitrate_kbps)
     if expected and cutoff_hz < expected - 1500:
+        if codec in _CALIBRATED_TRANSCODE_CODECS:
+            notes.append(
+                f'declared ~{bitrate_kbps} kbps but bandwidth matches a lower-bitrate '
+                f'source; could also be an intentionally low-passed first-generation '
+                f'{codec} encode at the declared bitrate'
+            )
+            conf = min(0.9, 0.55 + 0.5 * margin) - _TRANSCODE_GATE_CONFIDENCE_PENALTY
+            return 'TRANSCODED_LOSSY', est, max(0.5, conf), notes
         notes.append(
-            f'declared ~{bitrate_kbps} kbps but bandwidth matches a lower-bitrate source'
+            f'bandwidth lower than expected for declared ~{bitrate_kbps} kbps '
+            f'({codec or "unknown"} codec); no calibrated bitrate-to-bandwidth '
+            f'mapping for this codec, verdict not changed on this evidence alone'
         )
-        return 'TRANSCODED_LOSSY', est, min(0.9, 0.55 + 0.5 * margin), notes
     return 'CONSISTENT_LOSSY', est, 0.7, notes
 
 
@@ -666,12 +748,27 @@ def analyze_file(path, suffix=None, bitrate_kbps=None, segment_seconds=90,
         return _unsupported_format_result(suffix, bitrate_kbps, deep, drop_db,
                                           segment_seconds, dsd_fmt)
 
-    detected_fmt, detected_lossless = _probe_container(path)
+    detected_fmt, detected_lossless, codec_name = _probe_container(path)
+
+    if suffix in LOSSY_SUFFIXES and codec_name is None:
+        ffprobe_codec = _probe_codec_ffprobe(path)
+        if ffprobe_codec:
+            codec_name = ffprobe_codec
+            if detected_lossless is None:  # tier 2 couldn't open it at all
+                if ffprobe_codec in _FFPROBE_LOSSLESS_CODECS:
+                    detected_lossless = True
+                    detected_fmt = ffprobe_codec.upper()
+                elif ffprobe_codec in _FFPROBE_LOSSY_CODECS:
+                    detected_lossless = False
+                    detected_fmt = ffprobe_codec.upper()
+
     codec_mismatch = None
     if detected_lossless is True and suffix in LOSSY_SUFFIXES:
         codec_mismatch = f'suffix .{suffix} suggests lossy, container is {detected_fmt} (lossless)'
     elif detected_lossless is False and suffix in LOSSLESS_SUFFIXES:
         codec_mismatch = f'suffix .{suffix} suggests lossless, container is {detected_fmt} (lossy)'
+
+    gate_codec = _resolve_lossy_codec(suffix, codec_name)
 
     edge_var = edge_med = None
     pinned_q = None
@@ -709,7 +806,7 @@ def analyze_file(path, suffix=None, bitrate_kbps=None, segment_seconds=90,
     shelf = _shelf_level(freqs, profile, cutoff_hz, ref)
     verdict, est, conf, notes = _verdict(sr, suffix, bitrate_kbps, cutoff_hz, edge, shelf,
                                          freqs=freqs, profile=profile,
-                                         is_lossless=detected_lossless)
+                                         is_lossless=detected_lossless, codec=gate_codec)
 
     if deep:
         if edge_var is None:
@@ -763,7 +860,12 @@ def analyze_file(path, suffix=None, bitrate_kbps=None, segment_seconds=90,
         integrity = {'status': 'sampled_decode_ok', 'coverage': 'capped'}
     else:
         integrity = {'status': 'full_decode_ok', 'coverage': 'full'}
-    delivery = {'codec_mismatch': codec_mismatch} if codec_mismatch else None
+    delivery = {}
+    if codec_mismatch:
+        delivery['codec_mismatch'] = codec_mismatch
+    if codec_name:
+        delivery['codec'] = codec_name
+    delivery = delivery or None
 
     return {
         'sample_rate': sr,
