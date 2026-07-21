@@ -29,7 +29,7 @@ N_FFT = 4096
 
 # Bump when verdict logic changes so stored results re-analyze on the next
 # non-force scan (the skip paths in jobs.py require a rev match).
-ANALYSIS_REV = 3
+ANALYSIS_REV = 4
 
 
 def analysis_rev(drop_db, segment_seconds):
@@ -64,8 +64,13 @@ def _sniff_dsd(path):
 
 
 def _load_segment(path, segment_seconds):
-    """Load a mono segment at native sample rate. Prefer the middle of the
-    track (skip intros/fades); fall back to the start for short files."""
+    """Load a single mono segment at native sample rate via librosa. This is
+    now only the last-resort fallback for distributed segment sampling
+    (_load_windows) -- used when a track's duration can't be determined at
+    all, is too short to distribute across several windows, or every
+    windowed decode attempt failed (e.g. ffmpeg missing for a non-seekable
+    container). Not "the middle of the track": offset 30s, falling back to
+    0s for short files."""
     import librosa
 
     for offset in (30.0, 0.0):
@@ -79,6 +84,139 @@ def _load_segment(path, segment_seconds):
     if y is not None and sr and y.size > 0:
         return y, int(sr), 0.0
     raise ValueError('could not decode audio (empty signal)')
+
+
+# Distributed segment sampling: several shorter windows spread through the
+# track instead of one fixed-offset segment, so a single low-bandwidth
+# passage can't be missed by sampling bad luck. Natively seekable containers
+# (FLAC/WAV/AIFF/MP3/OGG via SoundFile) cost nothing extra per window, so get
+# 5; everything else needs an ffmpeg subprocess per window, so starts at 3
+# (round-5 decision -- a real-library perf spot check decides whether to
+# raise it, see IMPROVEMENT_PLAN.md).
+_NATIVE_WINDOW_POSITIONS = (0.10, 0.30, 0.50, 0.70, 0.85)
+_FFMPEG_WINDOW_POSITIONS = (0.20, 0.50, 0.80)
+_WINDOW_MIN_SECONDS = 5.0  # viability floor, mirrors _load_segment's own bar
+# Conservative on purpose: only true silence/dropouts should be skipped, not
+# quiet-but-real content (a quiet classical passage is diagnostically valid).
+_WINDOW_NEAR_SILENT_REF_DB = -85.0
+# Windows "agree" when their cutoffs fall within this spread; mirrors the
+# scale of the existing transcode-detection margin (_verdict's `expected -
+# 1500`). Not yet fixture-calibrated -- no committed fixture varies
+# bandwidth mid-track (see tests/README.md).
+_WINDOW_AGREEMENT_TOLERANCE_HZ = 1500.0
+
+
+def _soundfile_duration(path):
+    """Track duration in seconds via a SoundFile header read (no decode), or
+    None if soundfile can't open the file at all."""
+    try:
+        import soundfile as sf
+        info = sf.info(path)
+        if info.frames and info.samplerate:
+            return info.frames / float(info.samplerate)
+    except Exception:
+        pass
+    return None
+
+
+def _read_window_soundfile(path, offset_s, duration_s):
+    """One window via SoundFile seek-and-read (cheap, no subprocess). Returns
+    (mono float32 array, sample_rate) or (None, None) on any failure."""
+    import soundfile as sf
+    try:
+        info = sf.info(path)
+        start = int(offset_s * info.samplerate)
+        frames = int(duration_s * info.samplerate)
+        y, sr = sf.read(path, start=start, frames=frames, dtype='float32',
+                        always_2d=True)
+    except Exception:
+        return None, None
+    if y is None or y.size == 0:
+        return None, None
+    return np.ascontiguousarray(y.mean(axis=1), dtype=np.float32), int(sr)
+
+
+def _read_window_ffmpeg(path, offset_s, duration_s, sr, timeout=30.0):
+    """One window via ffmpeg input-seeking (-ss before -i: seeks, doesn't
+    decode from the start), for containers SoundFile can't open at all
+    (m4a/mp4/ogg-opus/wma/mpc). `sr` is the source's own sample rate (from
+    _probe_ffprobe) -- requested explicitly so the raw f32le output can be
+    reshaped without guessing. Returns a mono float32 array, or None on any
+    failure: missing binary, timeout, non-zero exit, empty output."""
+    import subprocess
+    try:
+        proc = subprocess.run(
+            ['ffmpeg', '-v', 'error', '-ss', f'{offset_s:.3f}',
+             '-t', f'{duration_s:.3f}', '-i', path,
+             '-f', 'f32le', '-ac', '1', '-ar', str(sr), 'pipe:1'],
+            capture_output=True, timeout=timeout,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0 or not proc.stdout:
+        return None
+    y = np.frombuffer(proc.stdout, dtype='<f4')
+    return y if y.size else None
+
+
+def _window_offsets(duration, positions, window_seconds):
+    """Start offset for each relative position, clipped into a valid range
+    and deduplicated (short files: distinct positions can collapse onto
+    nearly the same audio -- keep only one when offsets land within 1s of
+    each other)."""
+    max_offset = max(0.0, duration - window_seconds)
+    offsets = []
+    for p in positions:
+        off = min(max_offset, max(0.0, p * duration - window_seconds / 2.0))
+        if not offsets or off - offsets[-1] > 1.0:
+            offsets.append(off)
+    return offsets
+
+
+def _is_near_silent(profile, freqs):
+    """True if a window is near-total silence (dropout, encoder-padded gap),
+    not merely quiet content. Same 1-8kHz reference-band convention as
+    _shelf_level/_deep_spectrum."""
+    band = profile[(freqs >= 1000) & (freqs <= 8000)]
+    ref = float(np.median(band)) if band.size else float(np.max(profile))
+    return ref <= _WINDOW_NEAR_SILENT_REF_DB, ref
+
+
+def _load_windows(path, segment_seconds, native_seekable, ffprobe_info):
+    """Distributed multi-window sampling. Returns a list of (y, sr, offset)
+    triples -- one or more. Falls back to the single _load_segment window
+    when duration can't be determined, the track is too short to distribute
+    meaningfully, or every window in the chosen tier fails to decode (e.g.
+    ffmpeg missing) -- 'fall back to fewer/earlier windows' taken to its
+    simplest honest limit: the one proven single-window path. Never raises
+    except through that same final _load_segment call."""
+    if native_seekable:
+        duration = _soundfile_duration(path)
+    else:
+        duration = ffprobe_info.get('duration') if ffprobe_info else None
+
+    if not duration or duration < _WINDOW_MIN_SECONDS * 2:
+        y, sr, off = _load_segment(path, segment_seconds)
+        return [(y, sr, off)]
+
+    positions = _NATIVE_WINDOW_POSITIONS if native_seekable else _FFMPEG_WINDOW_POSITIONS
+    window_seconds = max(_WINDOW_MIN_SECONDS, segment_seconds / len(positions))
+    offsets = _window_offsets(duration, positions, window_seconds)
+
+    windows = []
+    for off in offsets:
+        if native_seekable:
+            y, sr = _read_window_soundfile(path, off, window_seconds)
+        else:
+            sr = ffprobe_info.get('sample_rate') if ffprobe_info else None
+            y = _read_window_ffmpeg(path, off, window_seconds, sr) if sr else None
+        if y is not None and sr and y.size >= sr * _WINDOW_MIN_SECONDS:
+            windows.append((y, int(sr), off))
+
+    if windows:
+        return windows
+    y, sr, off = _load_segment(path, segment_seconds)
+    return [(y, sr, off)]
 
 
 def _spectrum(y, sr):
@@ -413,7 +551,7 @@ def _probe_container(path):
     formats libsndfile can read natively, independent of a (possibly wrong)
     file extension. Returns (detected_format, is_lossless, codec), or
     (None, None, None) when soundfile can't open the file at all
-    (m4a/opus/wma/mpc - tier 3, _probe_codec_ffprobe)."""
+    (m4a/opus/wma/mpc - tier 3, _probe_ffprobe)."""
     try:
         import soundfile as sf
         info = sf.info(path)
@@ -440,29 +578,37 @@ _FFPROBE_LOSSY_CODECS = {'aac', 'mp3', 'mp2', 'vorbis', 'opus', 'wmav1', 'wmav2'
                          'wmapro', 'musepack'}
 
 
-def _probe_codec_ffprobe(path, timeout=10.0):
-    """Tier 3 of the codec probe: shell out to ffprobe for containers
-    soundfile can't classify (m4a/mp4/ogg-opus/wma/mpc). Returns the audio
-    stream's lowercase codec_name (e.g. 'aac', 'alac', 'opus'), or None on
-    any failure -- missing binary, timeout, non-zero exit, no audio stream,
-    malformed output. Callers must treat None as "unknown codec, gate
-    disabled" and never guess."""
+def _probe_ffprobe(path, timeout=10.0):
+    """Tier 3 of the codec probe, and the duration/sample-rate lookup for the
+    ffmpeg window-seeking tier of distributed segment sampling: one ffprobe
+    call for containers soundfile can't open (m4a/mp4/ogg-opus/wma/mpc).
+    Returns {'codec', 'sample_rate', 'duration'}, each independently None on
+    failure -- missing binary, timeout, non-zero exit, no audio stream,
+    malformed output. Callers must treat every field as optional and never
+    guess."""
     import subprocess
+    empty = {'codec': None, 'sample_rate': None, 'duration': None}
     try:
         proc = subprocess.run(
-            ['ffprobe', '-v', 'error', '-print_format', 'json', '-show_streams',
+            ['ffprobe', '-v', 'error', '-print_format', 'json',
+             '-show_entries', 'format=duration:stream=codec_name,sample_rate',
              '-select_streams', 'a:0', path],
             capture_output=True, timeout=timeout,
         )
     except (OSError, subprocess.SubprocessError):
-        return None
+        return empty
     if proc.returncode != 0:
-        return None
+        return empty
     try:
-        streams = json.loads(proc.stdout).get('streams') or []
-        return (streams[0].get('codec_name') or '').lower() or None
-    except (ValueError, AttributeError, IndexError, TypeError):
-        return None
+        data = json.loads(proc.stdout)
+        stream = (data.get('streams') or [{}])[0]
+        fmt = data.get('format') or {}
+        codec = (stream.get('codec_name') or '').lower() or None
+        sample_rate = int(stream['sample_rate']) if stream.get('sample_rate') else None
+        duration = float(fmt['duration']) if fmt.get('duration') else None
+        return {'codec': codec, 'sample_rate': sample_rate, 'duration': duration}
+    except (ValueError, AttributeError, IndexError, TypeError, KeyError):
+        return empty
 
 
 # The one codec _expected_cutoff_for_bitrate's table is actually calibrated
@@ -749,9 +895,12 @@ def analyze_file(path, suffix=None, bitrate_kbps=None, segment_seconds=90,
                                           segment_seconds, dsd_fmt)
 
     detected_fmt, detected_lossless, codec_name = _probe_container(path)
+    native_seekable = detected_fmt is not None
 
+    ffprobe_info = None
     if suffix in LOSSY_SUFFIXES and codec_name is None:
-        ffprobe_codec = _probe_codec_ffprobe(path)
+        ffprobe_info = _probe_ffprobe(path)
+        ffprobe_codec = ffprobe_info['codec']
         if ffprobe_codec:
             codec_name = ffprobe_codec
             if detected_lossless is None:  # tier 2 couldn't open it at all
@@ -773,15 +922,41 @@ def analyze_file(path, suffix=None, bitrate_kbps=None, segment_seconds=90,
     edge_var = edge_med = None
     pinned_q = None
     capped = chunk_error = False
+    windows_detail = None
+    windows_agree = None
     try:
         if deep:
             (S_db, profile, freqs, sr, seg_len, edge_series,
              capped, chunk_error) = _deep_spectrum(path, drop_db)
             offset = 0.0
         else:
-            y, sr, offset = _load_segment(path, segment_seconds)
-            seg_len = y.size / float(sr)
-            S_db, profile, freqs = _spectrum(y, sr)
+            if not native_seekable and ffprobe_info is None:
+                ffprobe_info = _probe_ffprobe(path)
+            windows = _load_windows(path, segment_seconds, native_seekable, ffprobe_info)
+            scored = []
+            for y, sr_w, off in windows:
+                seg_len_w = y.size / float(sr_w)
+                S_db_w, profile_w, freqs_w = _spectrum(y, sr_w)
+                silent, _ = _is_near_silent(profile_w, freqs_w)
+                cutoff_w, ref_w, narrow_w = _find_cutoff(freqs_w, profile_w, drop_db)
+                scored.append({'sr': sr_w, 'offset': off, 'seg_len': seg_len_w,
+                               'S_db': S_db_w, 'profile': profile_w, 'freqs': freqs_w,
+                               'cutoff_hz': cutoff_w, 'ref': ref_w,
+                               'narrow_tone': narrow_w, 'silent': silent})
+
+            valid = [w for w in scored if not w['silent']] or scored
+            primary = min(valid, key=lambda w: w['cutoff_hz'])
+            cutoffs = [w['cutoff_hz'] for w in valid]
+            windows_agree = ((max(cutoffs) - min(cutoffs) <= _WINDOW_AGREEMENT_TOLERANCE_HZ)
+                             if len(cutoffs) > 1 else None)
+            windows_detail = [{'offset': round(w['offset'], 2),
+                               'seconds': round(w['seg_len'], 2),
+                               'cutoff_hz': round(w['cutoff_hz'], 1),
+                               'silent': w['silent']} for w in scored]
+
+            sr, offset, seg_len = primary['sr'], primary['offset'], primary['seg_len']
+            S_db, profile, freqs = primary['S_db'], primary['profile'], primary['freqs']
+            cutoff_hz, ref, narrow_tone = primary['cutoff_hz'], primary['ref'], primary['narrow_tone']
     except ValueError as exc:
         return _inconclusive_result(suffix, bitrate_kbps, deep, drop_db,
                                     segment_seconds, exc)
@@ -801,7 +976,8 @@ def analyze_file(path, suffix=None, bitrate_kbps=None, segment_seconds=90,
                     pinned_q = q
                     break
 
-    cutoff_hz, ref, narrow_tone = _find_cutoff(freqs, profile, drop_db)
+    if deep:
+        cutoff_hz, ref, narrow_tone = _find_cutoff(freqs, profile, drop_db)
     edge = _edge_sharpness(freqs, profile, cutoff_hz)
     shelf = _shelf_level(freqs, profile, cutoff_hz, ref)
     verdict, est, conf, notes = _verdict(sr, suffix, bitrate_kbps, cutoff_hz, edge, shelf,
@@ -896,6 +1072,8 @@ def analyze_file(path, suffix=None, bitrate_kbps=None, segment_seconds=90,
             'integrity': integrity,
             'delivery': delivery,
             'narrow_high_frequency_tone_present': narrow_tone,
+            'windows': windows_detail,
+            'windows_agree': windows_agree,
             'notes': notes,
         }),
         'spectrogram_b64': png_b64,

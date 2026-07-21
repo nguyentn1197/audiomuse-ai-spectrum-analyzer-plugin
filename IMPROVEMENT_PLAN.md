@@ -311,7 +311,42 @@ have is deferred.
       negligible; it removes false positives rather than adding
       analysis.*
 
-- [ ] **Distributed segment sampling.**
+- [x] **Distributed segment sampling.**
+      *Shipped: two window tiers keyed off the existing container probe —
+      SoundFile seek-and-read (`_read_window_soundfile`, no subprocess cost)
+      for containers it can open natively (FLAC/WAV/AIFF/MP3/OGG), 5 windows
+      at ~10/30/50/70/85%; ffmpeg input-seeking (`_read_window_ffmpeg`,
+      `-ss`/`-t` to raw `f32le`) for everything else (m4a/mp4/opus/wma/mpc),
+      3 windows at ~20/50/80% per the round-5 decision below. Each window is
+      scored independently (`_find_cutoff` per window); the **minimum**
+      cutoff among non-silent windows drives the verdict (worst case, not an
+      average), with `details.windows` (per-window offset/seconds/cutoff/
+      silent) and `details.windows_agree` (spread ≤
+      `_WINDOW_AGREEMENT_TOLERANCE_HZ = 1500 Hz`) surfaced for free through
+      the existing raw-JSON details dump — no UI change needed. Near-silent
+      windows are skipped (`_WINDOW_NEAR_SILENT_REF_DB = -85 dB`, deliberately
+      conservative so quiet-but-real passages are never skipped). Falls back
+      to the old single fixed-offset `_load_segment` window — now honestly
+      docstringed as a last resort, not "the middle of the track" — when
+      duration can't be determined, the file is too short to distribute, or
+      every window in a tier fails to decode (verified for real: ffmpeg is
+      absent in this sandbox, and `_load_windows` correctly collapses to one
+      window in that case). `_probe_codec_ffprobe` renamed/extended to
+      `_probe_ffprobe`, now returning codec + sample_rate + duration from a
+      single ffprobe call (shared between tier-3 codec ID and ffmpeg-tier
+      windowing, instead of two separate subprocess spawns). Regression: the
+      full fixture suite's verdicts are unchanged (confirmed, not assumed —
+      `TestSegmentVerdicts`/`TestDeepVerdicts` pass unmodified), and the 45s
+      FLAC/MP3 fixtures are confirmed to actually engage multiple real
+      windows (`test_native_fixture_uses_multiple_windows`), not silently
+      collapse to one. `ANALYSIS_REV` bumped to 4. Deferred: real m4a/wma
+      fixtures and the "m4a perf spot check" that decides whether to raise
+      the ffmpeg tier from 3 to 5 windows — needs a real library and a real
+      ffmpeg binary, neither available in this dev sandbox; rides with
+      "Minimum adversarial fixtures" below. The `_read_window_ffmpeg`/
+      `_probe_ffprobe` decode paths are covered by a real missing-binary call
+      (failure path) plus a mocked `subprocess.run` (success path), same
+      pattern as the previous two checkboxes.*
       Replace the single fixed-offset window with several shorter windows
       spread through the track (e.g. 4–5 × 10–15 s at ~10/30/50/70/85 %).
       Each window is analyzed **independently** — never concatenate distant

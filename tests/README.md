@@ -68,3 +68,22 @@ is fine — extract the .tar.xz with `python3 -m tarfile` if `xz` is missing).
   with synthetic/mocked calls, and `test_transcode_gate_mp3_reduced_confidence`
   confirms the real `transcoded_128as320.mp3` fixture still verdicts
   `TRANSCODED_LOSSY` at reduced confidence.
+- Distributed segment sampling (`_load_windows`): `_WINDOW_MIN_SECONDS = 5`
+  (window viability floor, mirrors `_load_segment`'s old bar),
+  `_WINDOW_NEAR_SILENT_REF_DB = -85` dB (conservative on purpose — only true
+  silence/dropouts should be skipped, not quiet-but-real content),
+  `_WINDOW_AGREEMENT_TOLERANCE_HZ = 1500` Hz (mirrors the existing
+  transcode-detection margin scale). `_NATIVE_WINDOW_POSITIONS` (5 windows,
+  SoundFile-seekable containers) and `_FFMPEG_WINDOW_POSITIONS` (3 windows,
+  everything else) are none of these fixture-calibrated yet — no committed
+  fixture varies bandwidth mid-track, so there's nothing to arbitrate
+  `windows_agree` against. A real m4a/wma fixture and the "m4a perf spot
+  check" that decides whether to raise the ffmpeg tier from 3 to 5 windows
+  are deferred to "minimum adversarial fixtures" (needs a real library and a
+  real `ffmpeg` binary); meanwhile `tests/test_verdicts.py::
+  TestDistributedSampling` covers the window-offset/silence-detection logic
+  synthetically, the real committed 45s FLAC/MP3 fixtures confirm the
+  5-window native tier actually engages
+  (`test_native_fixture_uses_multiple_windows`), and the ffmpeg tier's
+  failure path is exercised for real (ffmpeg genuinely absent here) with its
+  success path covered by a mocked `subprocess.run`.

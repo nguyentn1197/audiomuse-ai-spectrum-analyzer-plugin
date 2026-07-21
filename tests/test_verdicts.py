@@ -285,23 +285,101 @@ class TestCodecGating(unittest.TestCase):
         self.assertIsNone(dsp._resolve_lossy_codec('aac', None))
         self.assertEqual(dsp._resolve_lossy_codec('m4a', 'alac'), 'alac')
 
-    def test_probe_codec_ffprobe_missing_binary(self):
+    def test_probe_ffprobe_missing_binary(self):
         # ffprobe is genuinely absent from PATH in this sandbox -- exercises
         # the degrade path for real, not just via a mock
         import tempfile
         with tempfile.NamedTemporaryFile(suffix='.m4a') as f:
             f.write(b'not actually audio')
             f.flush()
-            self.assertIsNone(dsp._probe_codec_ffprobe(f.name, timeout=2.0))
+            info = dsp._probe_ffprobe(f.name, timeout=2.0)
+        self.assertEqual(info, {'codec': None, 'sample_rate': None, 'duration': None})
 
-    def test_probe_codec_ffprobe_parses_success(self):
+    def test_probe_ffprobe_parses_success(self):
         import subprocess
         import unittest.mock as mock
 
-        payload = json.dumps({'streams': [{'codec_name': 'alac'}]}).encode()
+        payload = json.dumps({
+            'streams': [{'codec_name': 'alac', 'sample_rate': '48000'}],
+            'format': {'duration': '183.42'},
+        }).encode()
         fake = subprocess.CompletedProcess(args=[], returncode=0, stdout=payload)
         with mock.patch('subprocess.run', return_value=fake):
-            self.assertEqual(dsp._probe_codec_ffprobe('irrelevant.m4a'), 'alac')
+            info = dsp._probe_ffprobe('irrelevant.m4a')
+        self.assertEqual(info, {'codec': 'alac', 'sample_rate': 48000, 'duration': 183.42})
+
+
+class TestDistributedSampling(unittest.TestCase):
+    """Distributed segment sampling: several windows spread through the
+    track instead of one fixed-offset segment."""
+
+    def test_window_offsets_long_file_full_spread(self):
+        # a real-length track: positions should stay distinct
+        offsets = dsp._window_offsets(240.0, dsp._FFMPEG_WINDOW_POSITIONS, 30.0)
+        self.assertEqual(len(offsets), 3)
+        self.assertEqual(offsets, sorted(offsets))
+        for off in offsets:
+            self.assertGreaterEqual(off, 0.0)
+            self.assertLessEqual(off + 30.0, 240.0 + 1e-6)
+
+    def test_window_offsets_short_file_collapses(self):
+        # duration barely above the window size: positions collapse onto
+        # nearly the same audio and must be deduplicated, never producing an
+        # offset that runs past the end of the file
+        offsets = dsp._window_offsets(12.0, dsp._NATIVE_WINDOW_POSITIONS, 10.0)
+        self.assertGreaterEqual(len(offsets), 1)
+        for off in offsets:
+            self.assertGreaterEqual(off, 0.0)
+            self.assertLessEqual(off, 2.0 + 1e-6)
+
+    def test_is_near_silent(self):
+        freqs = np.linspace(0, 22050, 2049)
+        loud = np.full_like(freqs, -20.0)
+        silent = np.full_like(freqs, -95.0)
+        self.assertFalse(dsp._is_near_silent(loud, freqs)[0])
+        self.assertTrue(dsp._is_near_silent(silent, freqs)[0])
+
+    def test_read_window_ffmpeg_missing_binary(self):
+        # ffmpeg genuinely absent from PATH here -- real degrade path
+        self.assertIsNone(dsp._read_window_ffmpeg('irrelevant.m4a', 10.0, 15.0, 44100, timeout=2.0))
+
+    def test_read_window_ffmpeg_parses_success(self):
+        import subprocess
+        import unittest.mock as mock
+
+        raw = np.linspace(-1.0, 1.0, 4410, dtype='<f4').tobytes()
+        fake = subprocess.CompletedProcess(args=[], returncode=0, stdout=raw)
+        with mock.patch('subprocess.run', return_value=fake):
+            y = dsp._read_window_ffmpeg('irrelevant.m4a', 10.0, 0.1, 44100)
+        self.assertIsNotNone(y)
+        self.assertEqual(y.size, 4410)
+
+    def test_load_windows_falls_back_when_ffmpeg_absent(self):
+        # duration known (simulated), but ffmpeg itself is absent -- every
+        # window decode fails, so _load_windows must fall back to the single
+        # proven _load_segment path rather than returning nothing
+        path = os.path.join(FIXTURES, 'consistent_320.mp3')
+        windows = dsp._load_windows(
+            path, segment_seconds=90, native_seekable=False,
+            ffprobe_info={'codec': 'aac', 'sample_rate': 44100, 'duration': 45.0})
+        self.assertEqual(len(windows), 1)
+
+    def test_native_fixture_uses_multiple_windows(self):
+        # the committed 45s FLAC/MP3 fixtures are soundfile-seekable -- the
+        # 5-window native tier must actually engage, not silently collapse
+        # to a single window
+        for name, suffix, kbps in (('genuine_cd_1644.flac', 'flac', 900),
+                                   ('consistent_320.mp3', 'mp3', 320)):
+            with self.subTest(fixture=name):
+                r = _analyze(name, suffix, kbps)
+                d = json.loads(r['details'])
+                self.assertGreater(len(d['windows']), 1)
+                for w in d['windows']:
+                    self.assertIn('offset', w)
+                    self.assertIn('seconds', w)
+                    self.assertIn('cutoff_hz', w)
+                    self.assertIn('silent', w)
+                self.assertIn(d['windows_agree'], (True, False))
 
 
 if __name__ == '__main__':

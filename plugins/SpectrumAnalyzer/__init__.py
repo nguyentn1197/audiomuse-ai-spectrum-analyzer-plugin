@@ -633,7 +633,7 @@ def settings():
     body = (
         '<form method="post">'
         + num('segment_seconds', 90, 'Analyzed segment (s)',
-              'taken from the middle of each track')
+              'total budget, split across several windows spread through the track')
         + num('drop_db', 40, 'Cutoff threshold (dB)',
               'level drop below the 1-8 kHz reference that counts as "no content"')
         + num('img_w', 800, 'Spectrogram width (px)', '')
