@@ -93,7 +93,40 @@ class TestSegmentVerdicts(unittest.TestCase):
         self.assertFalse(r['deep_eligible'])
         self.assertEqual(r['analysis_rev'], dsp.analysis_rev(40, 90))
         d = json.loads(r['details'])
-        self.assertEqual(d['substatus'], 'decode_failed')
+        self.assertEqual(d['integrity'], {'status': 'decode_failed', 'coverage': None})
+
+    def test_dsd_magic_bytes_unsupported(self):
+        # DSD must be recognized (and refused) by content, not extension --
+        # the audioread/ffmpeg fallback would otherwise silently decode DSD
+        # noise shaping as full-bandwidth PCM and read it as CLEAN
+        import struct
+        import tempfile
+
+        cases = [
+            ('dsf', b'DSD ' + b'\x00' * 60),
+            ('dff', b'FRM8' + struct.pack('>Q', 60) + b'DSD ' + b'\x00' * 40),
+        ]
+        for fmt, header in cases:
+            with self.subTest(fmt=fmt):
+                with tempfile.NamedTemporaryFile(suffix=f'.{fmt}') as f:
+                    f.write(header)
+                    f.flush()
+                    r = dsp.analyze_file(f.name, suffix=fmt, bitrate_kbps=2800)
+                self.assertEqual(r['verdict'], 'INCONCLUSIVE')
+                self.assertFalse(r['deep_eligible'])
+                d = json.loads(r['details'])
+                self.assertEqual(d['detected_format'], fmt)
+                self.assertEqual(d['integrity'], {'status': 'unsupported', 'coverage': None})
+
+    def test_container_probe_no_regression(self):
+        # the soundfile-based tier-2 probe must be a no-op for every fixture
+        # we have (suffix and detected format already agree)
+        r = _analyze('genuine_cd_1644.flac', 'flac', 900)
+        d = json.loads(r['details'])
+        self.assertEqual(d['integrity'], {'status': 'sampled_decode_ok', 'coverage': 'sampled'})
+        self.assertIsNone(d['delivery'])
+        r = _analyze('consistent_320.mp3', 'mp3', 320)
+        self.assertIsNone(json.loads(r['details'])['delivery'])
 
 
 class TestDeepVerdicts(unittest.TestCase):
@@ -110,6 +143,13 @@ class TestDeepVerdicts(unittest.TestCase):
     def test_deep_covers_whole_file(self):
         r = _analyze('genuine_cd_1644.flac', 'flac', 900, deep=True)
         self.assertGreater(r['seg_seconds'], 40)  # 45 s fixture, not a segment
+
+    def test_deep_integrity_full_decode(self):
+        # these fixtures (45 s) run off the natural end of file, nowhere near
+        # the 1800 s cap, with no chunk errors -> full_decode_ok/full
+        r = _analyze('genuine_cd_1644.flac', 'flac', 900, deep=True)
+        d = json.loads(r['details'])
+        self.assertEqual(d['integrity'], {'status': 'full_decode_ok', 'coverage': 'full'})
 
 
 if __name__ == '__main__':

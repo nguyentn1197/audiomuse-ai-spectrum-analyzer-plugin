@@ -154,7 +154,15 @@ have is deferred.
       eligible. Everything finer lives in `integrity.*` / `dsd.*` /
       `quality.*`. *Cost: negligible runtime; small UI addition.*
 
-- [ ] **Container/codec probe + progressive integrity states.**
+- [x] **Container/codec probe + progressive integrity states.**
+      *Shipped: magic-byte DSD guard (tier 1), `soundfile.info` container
+      probe (tier 2), `integrity.status`/`integrity.coverage`,
+      `delivery.codec_mismatch`. Deferred to "Codec-aware transcode gating"
+      below: the ffprobe fallback (tier 3, m4a/mp4/ogg codec ID + lazy
+      bitrate resolution) — ffprobe isn't on PATH in the dev sandbox this
+      was built in, so its plumbing is safer to build once, together with
+      its first real consumer (the lazy-bitrate gate), than to ship and
+      spot-check twice.*
       Probe order: magic bytes (catches DSF/DFF *before* any decode) →
       `soundfile.info` for native PCM formats → **ffprobe as the fallback**
       (verified: the AudioMuse Dockerfile installs ffmpeg; keep a runtime

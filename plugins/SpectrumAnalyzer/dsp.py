@@ -43,6 +43,26 @@ DEEP_MAX_SECONDS = 1800
 _DEEP_CHUNK_SECONDS = 120
 
 
+def _sniff_dsd(path):
+    """Recognize DSF/DFF by magic bytes, before any decode is attempted.
+
+    librosa's audioread/ffmpeg fallback will happily decode DSD to PCM, but
+    the noise-shaped 1-bit modulator content reads as full-bandwidth audio to
+    the spectrum heuristics (a lossy-sourced fake DSD would pass as CLEAN).
+    Returns 'dsf', 'dff', or None; suffix-independent since a mislabeled file
+    would otherwise slip past a suffix-based check."""
+    try:
+        with open(path, 'rb') as f:
+            head = f.read(16)
+    except OSError:
+        return None
+    if head[:4] == b'DSD ':
+        return 'dsf'
+    if head[:4] == b'FRM8' and head[12:16] == b'DSD ':
+        return 'dff'
+    return None
+
+
 def _load_segment(path, segment_seconds):
     """Load a mono segment at native sample rate. Prefer the middle of the
     track (skip intros/fades); fall back to the start for short files."""
@@ -88,12 +108,14 @@ def _deep_spectrum(path, drop_db):
     sr = None
     total = 0.0
     t = 0.0
+    chunk_error = False
 
     while total < DEEP_MAX_SECONDS:
         try:
             y, y_sr = librosa.load(path, sr=None, mono=True, offset=t,
                                    duration=_DEEP_CHUNK_SECONDS)
         except Exception:
+            chunk_error = True  # decode error, not a clean end-of-file signal
             break
         if y is None or not y_sr or y.size < y_sr:  # under 1 s left
             break
@@ -129,7 +151,9 @@ def _deep_spectrum(path, drop_db):
     if profile is None or sr is None or total < 5.0:
         raise ValueError('could not decode audio for deep analysis')
     freqs = np.linspace(0, sr / 2.0, profile.shape[0])
-    return np.concatenate(display, axis=1), profile, freqs, sr, total, edge_cutoffs
+    capped = total >= DEEP_MAX_SECONDS
+    return (np.concatenate(display, axis=1), profile, freqs, sr, total,
+            edge_cutoffs, capped, chunk_error)
 
 
 def _find_cutoff(freqs, profile, drop_db):
@@ -254,6 +278,32 @@ def _bit_depth_probe(path, max_seconds=30.0):
     return bits, min(bits, effective)
 
 
+# Formats libsndfile reports for containers it can read natively (verified
+# against this repo's fixtures: libsndfile 1.2.2 reports 'FLAC' and 'MP3'
+# distinctly, so this is a real signal, not a guess).
+_SNDFILE_LOSSLESS_FORMATS = {'FLAC', 'WAV', 'WAVEX', 'AIFF', 'W64', 'CAF', 'RF64'}
+_SNDFILE_LOSSY_FORMATS = {'MP3', 'OGG'}
+
+
+def _probe_container(path):
+    """Tier 2 of the codec probe: identify the actual container/codec for
+    formats libsndfile can read natively, independent of a (possibly wrong)
+    file extension. Returns (detected_format, is_lossless), or (None, None)
+    when soundfile can't open the file at all (m4a/opus/wma/mpc - an ffprobe
+    fallback tier, not implemented here)."""
+    try:
+        import soundfile as sf
+        info = sf.info(path)
+    except Exception:
+        return None, None
+    fmt = (info.format or '').upper()
+    if fmt in _SNDFILE_LOSSLESS_FORMATS:
+        return fmt, True
+    if fmt in _SNDFILE_LOSSY_FORMATS:
+        return fmt, False
+    return fmt or None, None  # readable but unclassified: don't override suffix
+
+
 def _alias_image_corr(freqs, profile, mirror_hz, width_hz=4000.0):
     """Correlation between the band above `mirror_hz` and the band below it,
     mirrored. A cheap resampler folds images of the source content around the
@@ -302,7 +352,7 @@ def _best_alias_match(freqs, profile, nyquist):
 
 
 def _verdict(sr, suffix, bitrate_kbps, cutoff_hz, edge_db_khz, shelf_db,
-             freqs=None, profile=None):
+             freqs=None, profile=None, is_lossless=None):
     nyquist = sr / 2.0
     suffix = (suffix or '').lower().lstrip('.')
     # Genuine 44.1 kHz masters legitimately roll off at 20-21 kHz (ADC
@@ -360,7 +410,8 @@ def _verdict(sr, suffix, bitrate_kbps, cutoff_hz, edge_db_khz, shelf_db,
 
     est = _estimate_source(cutoff_hz)
 
-    if suffix in LOSSLESS_SUFFIXES:
+    lossless = suffix in LOSSLESS_SUFFIXES if is_lossless is None else is_lossless
+    if lossless:
         if sharp and silent_shelf:
             conf = min(0.95, 0.6 + 0.5 * margin + min(0.15, (edge_db_khz - 25.0) / 200.0))
             return 'FAKE_SUSPECT', est, conf, notes
@@ -437,13 +488,47 @@ def _inconclusive_result(suffix, bitrate_kbps, deep, drop_db, segment_seconds, e
         'effective_bits': None,
         'deep_eligible': False,
         'details': json.dumps({
-            'substatus': 'decode_failed',
             'decode_error': str(exc),
             'declared_bitrate_kbps': bitrate_kbps,
             'suffix': suffix,
             'deep': deep,
             'drop_db': drop_db,
+            'integrity': {'status': 'decode_failed', 'coverage': None},
             'notes': [f'decode failed: {exc}'],
+        }),
+        'spectrogram_b64': None,
+        'analysis_rev': analysis_rev(drop_db, segment_seconds),
+    }
+
+
+def _unsupported_format_result(suffix, bitrate_kbps, deep, drop_db, segment_seconds, fmt):
+    """Result dict for a format we recognize but deliberately don't analyze
+    (DSD): an honest 'not evaluated' instead of running PCM heuristics on
+    decoded DSD noise shaping, which silently reads as full-bandwidth content
+    (see _sniff_dsd). Same shape as _inconclusive_result: deep_eligible=False,
+    since nothing about a retry would change the outcome."""
+    return {
+        'sample_rate': None,
+        'seg_offset': 0.0,
+        'seg_seconds': None,
+        'cutoff_hz': None,
+        'edge_db_khz': None,
+        'shelf_db': None,
+        'verdict': 'INCONCLUSIVE',
+        'est_source': f'{fmt.upper()} (DSD): not analyzed, unsupported format',
+        'confidence': 0.0,
+        'container_bits': None,
+        'effective_bits': None,
+        'deep_eligible': False,
+        'details': json.dumps({
+            'detected_format': fmt,
+            'declared_bitrate_kbps': bitrate_kbps,
+            'suffix': suffix,
+            'deep': deep,
+            'drop_db': drop_db,
+            'integrity': {'status': 'unsupported', 'coverage': None},
+            'notes': [f'{fmt.upper()} recognized by magic bytes: DSD content is '
+                      f'not analyzed by the PCM spectrum heuristics'],
         }),
         'spectrogram_b64': None,
         'analysis_rev': analysis_rev(drop_db, segment_seconds),
@@ -462,11 +547,25 @@ def analyze_file(path, suffix=None, bitrate_kbps=None, segment_seconds=90,
     if suffix is None:
         suffix = os.path.splitext(path)[1].lstrip('.')
 
+    dsd_fmt = _sniff_dsd(path)
+    if dsd_fmt:
+        return _unsupported_format_result(suffix, bitrate_kbps, deep, drop_db,
+                                          segment_seconds, dsd_fmt)
+
+    detected_fmt, detected_lossless = _probe_container(path)
+    codec_mismatch = None
+    if detected_lossless is True and suffix in LOSSY_SUFFIXES:
+        codec_mismatch = f'suffix .{suffix} suggests lossy, container is {detected_fmt} (lossless)'
+    elif detected_lossless is False and suffix in LOSSLESS_SUFFIXES:
+        codec_mismatch = f'suffix .{suffix} suggests lossless, container is {detected_fmt} (lossy)'
+
     edge_var = edge_med = None
     pinned_q = None
+    capped = chunk_error = False
     try:
         if deep:
-            S_db, profile, freqs, sr, seg_len, edge_series = _deep_spectrum(path, drop_db)
+            (S_db, profile, freqs, sr, seg_len, edge_series,
+             capped, chunk_error) = _deep_spectrum(path, drop_db)
             offset = 0.0
         else:
             y, sr, offset = _load_segment(path, segment_seconds)
@@ -495,7 +594,8 @@ def analyze_file(path, suffix=None, bitrate_kbps=None, segment_seconds=90,
     edge = _edge_sharpness(freqs, profile, cutoff_hz)
     shelf = _shelf_level(freqs, profile, cutoff_hz, ref)
     verdict, est, conf, notes = _verdict(sr, suffix, bitrate_kbps, cutoff_hz, edge, shelf,
-                                         freqs=freqs, profile=profile)
+                                         freqs=freqs, profile=profile,
+                                         is_lossless=detected_lossless)
 
     if deep:
         if edge_var is None:
@@ -539,6 +639,18 @@ def analyze_file(path, suffix=None, bitrate_kbps=None, segment_seconds=90,
 
     png_b64 = _render_spectrogram(S_db, sr, offset, seg_len, cutoff_hz, img_w, img_h)
 
+    if not deep:
+        integrity = {'status': 'sampled_decode_ok', 'coverage': 'sampled'}
+    elif chunk_error:
+        # a chunk load raised before reaching either the natural end of the
+        # file or the time budget - some usable data, but cut short
+        integrity = {'status': 'sampled_decode_ok', 'coverage': 'partial'}
+    elif capped:
+        integrity = {'status': 'sampled_decode_ok', 'coverage': 'capped'}
+    else:
+        integrity = {'status': 'full_decode_ok', 'coverage': 'full'}
+    delivery = {'codec_mismatch': codec_mismatch} if codec_mismatch else None
+
     return {
         'sample_rate': sr,
         'seg_offset': round(offset, 2),
@@ -565,6 +677,8 @@ def analyze_file(path, suffix=None, bitrate_kbps=None, segment_seconds=90,
             'deep': deep,
             'edge_var_hz': round(edge_var, 1) if edge_var is not None else None,
             'edge_median_hz': round(edge_med, 1) if edge_med is not None else None,
+            'integrity': integrity,
+            'delivery': delivery,
             'notes': notes,
         }),
         'spectrogram_b64': png_b64,
