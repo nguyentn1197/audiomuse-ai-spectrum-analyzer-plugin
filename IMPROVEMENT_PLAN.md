@@ -214,7 +214,18 @@ have is deferred.
       Phase-2 DSD branch exists. *Cost: negligible (metadata only — no extra
       decode pass in the default scan).*
 
-- [ ] **Robust cutoff detection.**
+- [x] **Robust cutoff detection.**
+      *Shipped as specified: Hz-based minimum contiguous bandwidth (250 Hz
+      initial value) and gap-tolerant 75%-occupancy band search (120 Hz max
+      gap), light 100 Hz smoothing, and an isolated-run pilot-tone/spike
+      exclusion (<80 Hz) feeding the nullable
+      `narrow_high_frequency_tone_present` flag — all widths converted to
+      bins per file, never fixed bin counts. Calibrated together against the
+      full fixture suite (unchanged verdicts on the first pass); a real
+      encoded-pilot-tone fixture is deferred to "Minimum adversarial
+      fixtures" below — this item's synthetic-array tests
+      (`TestCutoffDetection` in `tests/test_verdicts.py`) cover the mask
+      logic directly in the meantime. `ANALYSIS_REV` bumped to 2.*
       Require a minimum contiguous bandwidth **specified in hertz** and
       converted to a bin count from the file's actual sample rate (bin
       width is `sr/4096`, so a fixed bin count would mean ~160 Hz at

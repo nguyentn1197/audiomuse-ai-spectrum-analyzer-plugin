@@ -29,7 +29,7 @@ N_FFT = 4096
 
 # Bump when verdict logic changes so stored results re-analyze on the next
 # non-force scan (the skip paths in jobs.py require a rev match).
-ANALYSIS_REV = 1
+ANALYSIS_REV = 2
 
 
 def analysis_rev(drop_db, segment_seconds):
@@ -137,7 +137,7 @@ def _deep_spectrum(path, drop_db):
             wband = win[(freqs >= 1000) & (freqs <= 8000)]
             if not wband.size or float(np.median(wband)) < chunk_ref - 25.0:
                 continue  # quiet second: the edge position is meaningless
-            c, _ = _find_cutoff(freqs, win, drop_db)
+            c, _, _ = _find_cutoff(freqs, win, drop_db)
             edge_cutoffs.append(c)
         # ~1 column per second, max-pooled so peaks survive
         display.append(np.maximum.reduceat(S_db, starts, axis=1))
@@ -156,19 +156,133 @@ def _deep_spectrum(path, drop_db):
             edge_cutoffs, capped, chunk_error)
 
 
+# Cutoff-detection widths, all specified in hertz and converted to bins from
+# each file's actual bin resolution (sr/N_FFT) -- a fixed bin count would
+# mean ~160 Hz at 44.1 kHz but ~1.2 kHz at 96 kHz. Initial values picked
+# during fixture calibration, recalibrated together since they interact
+# (smoothing changes what "sharp" means for _edge_sharpness too).
+_CUTOFF_SMOOTH_HZ = 100.0
+_CUTOFF_MIN_WIDTH_HZ = 250.0
+_CUTOFF_MAX_GAP_HZ = 120.0
+_CUTOFF_OCCUPANCY_FRAC = 0.75
+# Narrower than a real sustained band: an isolated run this short is a pilot
+# tone or numerical spike, not bandwidth -- excluded before gap-closing so it
+# can't get bridged into a genuine band and drag the reported cutoff up.
+_CUTOFF_TONE_MAX_WIDTH_HZ = 80.0
+
+
+def _hz_to_bins(width_hz, bin_hz):
+    return max(1, int(round(width_hz / bin_hz))) if bin_hz > 0 else 1
+
+
+def _smooth_profile(profile, bin_hz, smooth_hz=_CUTOFF_SMOOTH_HZ):
+    """Light moving-average smoothing so a single noisy bin can't flip the
+    threshold mask; edge-replicated padding keeps the array length and
+    avoids pulling boundary bins toward zero."""
+    w = _hz_to_bins(smooth_hz, bin_hz)
+    if w <= 1 or profile.size < 2:
+        return profile
+    kernel = np.ones(w) / w
+    padded = np.pad(profile, (w // 2, w - 1 - w // 2), mode='edge')
+    return np.convolve(padded, kernel, mode='valid')
+
+
+def _exclude_narrow_tones(mask, freqs, tone_max_bins):
+    """Zero out isolated True-runs shorter than `tone_max_bins` -- too narrow
+    to be real sustained bandwidth. Flags (but excludes regardless of
+    location) only when the run sits at/above 8 kHz, matching the reference
+    band's upper edge: that's the region where a pilot tone or spike could
+    otherwise be mistaken for cutoff-extending content."""
+    out = mask.copy()
+    tone_present = False
+    n = mask.size
+    i = 0
+    while i < n:
+        if out[i]:
+            j = i
+            while j < n and out[j]:
+                j += 1
+            if j - i < tone_max_bins:
+                out[i:j] = False
+                if freqs[i] >= 8000.0:
+                    tone_present = True
+            i = j
+        else:
+            i += 1
+    return out, tone_present
+
+
+def _close_gaps(mask, max_gap_bins):
+    """Bridge interior False-runs of at most `max_gap_bins` (harmonic gaps
+    and notches are normal in real spectra); leading/trailing gaps -- no True
+    bin on one side -- are left alone."""
+    if max_gap_bins <= 0:
+        return mask
+    out = mask.copy()
+    n = mask.size
+    i = 0
+    while i < n:
+        if not out[i]:
+            j = i
+            while j < n and not out[j]:
+                j += 1
+            if 0 < i and j < n and (j - i) <= max_gap_bins:
+                out[i:j] = True
+            i = j
+        else:
+            i += 1
+    return out
+
+
+def _sliding_occupancy(mask, w):
+    """Fraction of True bins in a trailing window of width `w` ending at each
+    index (via a cumulative sum -- windows near index 0 are shorter)."""
+    n = mask.size
+    if w <= 1:
+        return mask.astype(np.float64)
+    cum = np.concatenate(([0.0], np.cumsum(mask.astype(np.float64))))
+    idx = np.arange(n)
+    start = np.maximum(0, idx - w + 1)
+    counts = cum[idx + 1] - cum[start]
+    lengths = (idx - start + 1).astype(np.float64)
+    return counts / lengths
+
+
 def _find_cutoff(freqs, profile, drop_db):
     """Highest frequency whose level stays within `drop_db` of the reference
-    (median level of the 1-8 kHz band), sustained over 3 consecutive bins."""
+    (median level of the 1-8 kHz band), over a band at least
+    `_CUTOFF_MIN_WIDTH_HZ` wide where `_CUTOFF_OCCUPANCY_FRAC` of bins are
+    above threshold (gaps up to `_CUTOFF_MAX_GAP_HZ` bridged first) -- real
+    spectra have harmonic gaps/notches, so an unbroken run is too strict, but
+    a lone narrow tone must not count as bandwidth either.
+
+    Returns (cutoff_hz, ref_db, narrow_tone_present).
+    """
     band = profile[(freqs >= 1000) & (freqs <= 8000)]
     ref = float(np.median(band)) if band.size else float(np.max(profile))
-    above = profile >= (ref - drop_db)
-    if above.size < 3:
-        return float(freqs[-1]), ref
-    runs = above[:-2] & above[1:-1] & above[2:]
-    idx = np.where(runs)[0]
-    if idx.size == 0:
-        return float(freqs[int(np.argmax(profile))]), ref
-    return float(freqs[int(idx[-1]) + 2]), ref
+    n = profile.size
+    if n < 3:
+        return float(freqs[-1]), ref, False
+
+    bin_hz = float(freqs[1] - freqs[0])
+    smoothed = _smooth_profile(profile, bin_hz)
+    above = smoothed >= (ref - drop_db)
+
+    tone_max_bins = _hz_to_bins(_CUTOFF_TONE_MAX_WIDTH_HZ, bin_hz)
+    above, tone_present = _exclude_narrow_tones(above, freqs, tone_max_bins)
+
+    max_gap_bins = _hz_to_bins(_CUTOFF_MAX_GAP_HZ, bin_hz)
+    closed = _close_gaps(above, max_gap_bins)
+
+    min_width_bins = min(_hz_to_bins(_CUTOFF_MIN_WIDTH_HZ, bin_hz), n)
+    occ = _sliding_occupancy(closed, min_width_bins)
+    passing = np.where(occ >= _CUTOFF_OCCUPANCY_FRAC)[0]
+    if passing.size == 0:
+        idx = np.where(closed)[0]
+        if idx.size == 0:
+            return float(freqs[int(np.argmax(profile))]), ref, tone_present
+        return float(freqs[int(idx[-1])]), ref, tone_present
+    return float(freqs[int(passing[-1])]), ref, tone_present
 
 
 def _edge_sharpness(freqs, profile, cutoff_hz):
@@ -590,7 +704,7 @@ def analyze_file(path, suffix=None, bitrate_kbps=None, segment_seconds=90,
                     pinned_q = q
                     break
 
-    cutoff_hz, ref = _find_cutoff(freqs, profile, drop_db)
+    cutoff_hz, ref, narrow_tone = _find_cutoff(freqs, profile, drop_db)
     edge = _edge_sharpness(freqs, profile, cutoff_hz)
     shelf = _shelf_level(freqs, profile, cutoff_hz, ref)
     verdict, est, conf, notes = _verdict(sr, suffix, bitrate_kbps, cutoff_hz, edge, shelf,
@@ -679,6 +793,7 @@ def analyze_file(path, suffix=None, bitrate_kbps=None, segment_seconds=90,
             'edge_median_hz': round(edge_med, 1) if edge_med is not None else None,
             'integrity': integrity,
             'delivery': delivery,
+            'narrow_high_frequency_tone_present': narrow_tone,
             'notes': notes,
         }),
         'spectrogram_b64': png_b64,

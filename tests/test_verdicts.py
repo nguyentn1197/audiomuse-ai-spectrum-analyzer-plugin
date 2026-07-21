@@ -10,6 +10,8 @@ import os
 import sys
 import unittest
 
+import numpy as np
+
 _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _HERE)
 sys.path.insert(0, os.path.join(os.path.dirname(_HERE), 'plugins', 'SpectrumAnalyzer'))
@@ -150,6 +152,85 @@ class TestDeepVerdicts(unittest.TestCase):
         r = _analyze('genuine_cd_1644.flac', 'flac', 900, deep=True)
         d = json.loads(r['details'])
         self.assertEqual(d['integrity'], {'status': 'full_decode_ok', 'coverage': 'full'})
+
+
+class TestCutoffDetection(unittest.TestCase):
+    """Synthetic-array tests for the Hz-based, gap-tolerant _find_cutoff --
+    no real audio payload needed since these exercise the mask logic
+    directly. Full adversarial fixtures (real encoded pilot tones etc.) are
+    scoped to the later "minimum adversarial fixtures" plan item."""
+
+    @staticmethod
+    def _spectrum(sr, edge_hz, n=2049, floor_db=-60.0, notches=(), tone=None):
+        # notches: list of (start_hz, end_hz) dropped to floor within the
+        # real band. tone: (center_hz, width_hz) isolated spike at 0 dB.
+        freqs = np.linspace(0, sr / 2.0, n)
+        profile = np.where(freqs <= edge_hz, 0.0, floor_db)
+        for lo, hi in notches:
+            profile[(freqs >= lo) & (freqs < hi)] = floor_db
+        if tone:
+            center, width = tone
+            profile[(freqs >= center - width / 2) & (freqs <= center + width / 2)] = 0.0
+        return freqs, profile
+
+    def test_gap_tolerant_occupancy(self):
+        # four small notches (20 Hz each, well under the 120 Hz max-gap)
+        # packed into the last ~250 Hz before the real edge -- a strict
+        # "every bin in the window must be above threshold" rule would fail
+        # here (combined gap loss ~32%), but gap-closing plus a 75%
+        # occupancy requirement should still find the real edge.
+        freqs, profile = self._spectrum(
+            44100, edge_hz=12000,
+            notches=[(11800, 11820), (11840, 11860), (11880, 11900), (11920, 11940)])
+        cutoff_hz, ref, tone = dsp._find_cutoff(freqs, profile, drop_db=40)
+        self.assertAlmostEqual(cutoff_hz, 12000, delta=150)
+        self.assertFalse(tone)
+
+        # white-box check: without gap-closing, the same window is below the
+        # occupancy threshold -- confirms gap-closing is load-bearing here,
+        # not just the occupancy tolerance alone.
+        bin_hz = float(freqs[1] - freqs[0])
+        above = profile >= (ref - 40)
+        tone_max_bins = dsp._hz_to_bins(dsp._CUTOFF_TONE_MAX_WIDTH_HZ, bin_hz)
+        above, _ = dsp._exclude_narrow_tones(above, freqs, tone_max_bins)
+        min_width_bins = dsp._hz_to_bins(dsp._CUTOFF_MIN_WIDTH_HZ, bin_hz)
+        raw_occ = dsp._sliding_occupancy(above, min_width_bins)
+        edge_idx = int(np.argmin(np.abs(freqs - 12000)))
+        self.assertLess(raw_occ[edge_idx], dsp._CUTOFF_OCCUPANCY_FRAC)
+
+    def test_pilot_tone_excluded_from_cutoff(self):
+        # a lone ~70 Hz-wide tone far above the real edge, deep in the noise
+        # floor -- the same shape that fooled the old 3-consecutive-bin
+        # detector into reporting the tone's frequency as the cutoff
+        # (IMPROVEMENT_PLAN.md's "Verified weaknesses"). The new detector
+        # must ignore it and flag it instead.
+        freqs, profile = self._spectrum(44100, edge_hz=12000, floor_db=-80.0,
+                                        tone=(15000, 70))
+        cutoff_hz, _, tone = dsp._find_cutoff(freqs, profile, drop_db=30)
+        self.assertAlmostEqual(cutoff_hz, 12000, delta=150)
+        self.assertTrue(cutoff_hz < 14000)  # never drags up to the tone
+        self.assertTrue(tone)
+
+    def test_narrow_content_below_min_width_rejected(self):
+        # a genuine-looking bump that's above threshold but only ~100 Hz
+        # wide (below the 250 Hz minimum) must not read as real bandwidth.
+        freqs, profile = self._spectrum(44100, edge_hz=8500)
+        profile[(freqs >= 9000) & (freqs <= 9100)] = 0.0
+        cutoff_hz, _, _ = dsp._find_cutoff(freqs, profile, drop_db=40)
+        self.assertLess(cutoff_hz, 9000)
+
+    def test_hz_widths_are_sample_rate_independent(self):
+        # the same Hz-scale content at two very different bin resolutions
+        # (44.1 kHz vs 88.2 kHz Nyquist) must produce the same qualitative
+        # result -- guards against a fixed-bin-count regression, where the
+        # same bin count would mean a different Hz width at each resolution.
+        for sr, n in ((44100, 2049), (88200, 2049)):
+            with self.subTest(sr=sr):
+                freqs, profile = self._spectrum(sr, edge_hz=12000, n=n, floor_db=-80.0,
+                                                tone=(15000, 70))
+                cutoff_hz, _, tone = dsp._find_cutoff(freqs, profile, drop_db=30)
+                self.assertAlmostEqual(cutoff_hz, 12000, delta=250)
+                self.assertTrue(tone)
 
 
 if __name__ == '__main__':

@@ -45,3 +45,12 @@ is fine — extract the .tar.xz with `python3 -m tarfile` if `xz` is missing).
 - Per-second edge variance (deep scan): encoder wall ±198 Hz, content-varying
   upsample ±1035 Hz, genuine dark master ±7236 Hz — hence the ≤300 / ≥2000
   thresholds.
+- Robust cutoff detection (`_find_cutoff`): all widths in hertz, converted to
+  bins per file. Smoothing 100 Hz, minimum sustained bandwidth 250 Hz,
+  occupancy 75% (gaps up to 120 Hz bridged first), pilot-tone/spike exclusion
+  below 80 Hz. Calibrated by requiring the full fixture suite's verdicts to
+  stay unchanged (they did, on the first pass) — a real narrow-pilot-tone
+  fixture is deferred to the "minimum adversarial fixtures" plan item;
+  meanwhile `tests/test_verdicts.py::TestCutoffDetection` covers the mask
+  logic (gap tolerance, min-width rejection, tone exclusion, sample-rate
+  independence) with synthetic spectra.
