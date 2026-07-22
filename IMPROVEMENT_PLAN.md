@@ -63,6 +63,22 @@ diagnose-before-retuning discipline, adopted. **Plan frozen — per the
 round's own recommendation, the next validation target is the Phase-1
 implementation and its tests, not this document.***
 
+*Revised 2026-07-22 after the first **field validation** of the shipped
+Phase-1 code against real-world files rather than fixtures: five tracks
+from a commercial 96 kHz/24-bit compilation (`test_file/`), cross-checked
+against an independent third-party forensic analysis (`test_file/forensic
+bundle/`) and re-measured from scratch (full-track Welch band power +
+full-track 95th-percentile profile) to arbitrate every disagreement. The
+third party was confirmed correct on all five tracks. Segment mode scored
+2/5 clean hits, one directionally-correct verdict with a wrong source-rate
+label, one **false CLEAN on a confirmed 96 k upscale**, and one **false
+LOWPASSED on a probably-genuine hi-res track**. Every miss traces to
+segment-mode *wiring* — evidence already computed but unused, or measured
+against a biased reference — not to the heuristics themselves (deep mode
+would likely have caught the upscale). The plan is unfrozen for exactly
+one new section: see "Phase 1b" for the case study and the six resulting
+items.*
+
 Assessment of an external suggestion list for turning the plugin into a fuller
 forensic audio analyzer. Each suggestion was checked against the actual code
 (`plugins/SpectrumAnalyzer/dsp.py`, `jobs.py`). Items were kept only when the
@@ -556,6 +572,130 @@ have is deferred.
       `windows_agree` calibration and the m4a 3-vs-5-window performance spot
       check both still need a real library, not a 45s fixture.
 
+## Phase 1b — segment-mode verdict wiring (field validation, 2026-07-22)
+
+The evidence. Five tracks from one commercial 96 kHz/24-bit compilation,
+analyzed three ways: this plugin's segment mode (`test_file/dsp_output/`),
+an independent third-party forensic pass (`test_file/forensic bundle/` —
+full-track 131 072-sample Blackman–Harris spectra, per-band energy, stereo
+coherence, release-history corroboration), and an in-repo re-measurement
+(full-track Welch band power + full-track 95th-percentile profile, same
+statistic segment mode uses per-window) that reproduced the third party's
+numbers to within a couple of dB and arbitrated every disagreement:
+
+| Track | Segment mode | Ground truth (confirmed) | Result |
+| --- | --- | --- | --- |
+| 2-04 | CLEAN 0.9 | genuine hi-res (wall ~28.7 kHz, 24–30 kHz at −32 dB) | hit |
+| 2-15 | CLEAN 0.9 | genuine hi-res (wall ~28.8 kHz, 24–30 kHz at −49 dB) | hit |
+| 2-06 | UPSAMPLED "44.1 kHz source" 0.65 | non-native, **48 kHz**-derived (step at ~24 kHz) | right verdict, wrong rate |
+| 2-05 | LOWPASSED "~320 kbps lossy" 0.46 | probably genuine (content to ~26.3 kHz in 4 of 5 windows) | **false flag** |
+| 2-14 | CLEAN "dark master?" 0.6 | **confirmed 96 k upscale** (constant wall ~22.3 kHz, 24–30 kHz at −77 dB ≈ noise floor) | **false CLEAN** |
+
+Root causes, verified in the code and the numbers:
+
+- **Quiet-window reference bias (2-14's decisive failure).** The
+  verdict-driving window is the *minimum-cutoff* window, and quiet
+  passages have less HF content, so the primary window is systematically
+  a quiet one. 2-14's primary ref was 7.2 dB vs 26–28 dB on every other
+  track; `_shelf_level` measures against that ref, so a truly silent
+  −81 dB shelf read as −61.9 dB and missed `SILENT_SHELF_DB = -68` by
+  exactly the ref deficit. The fake escaped *because* its verdict window
+  was quiet.
+- **`windows.agree` is computed but never used in `_verdict`.** 2-14's
+  five windows, spread across the track, agreed within 656 Hz right at
+  the 22.05 kHz resample-match window — the segment-mode analog of deep
+  mode's pinned-edge corroboration — and the verdict ignored it. (The
+  same numbers finally calibrate the tolerance against real files: wall
+  and genuine-agree tracks spread 305–656 Hz, content-varying spread
+  ~6 kHz — the shipped 1 500 Hz sits comfortably between.)
+- **The 25 dB/kHz "sharp" gate is calibrated on encoder walls, not SRC
+  filters.** 2-14's resampler transition (~26 dB over ~0.7 kHz) reads
+  12.2 dB/kHz through `_edge_sharpness`'s 1.5 kHz averaging span.
+- **The min-window rule can false-flag on content variation.** 2-05's
+  one quiet window scored 19.7 kHz while the other four scored
+  23.5–25.7 kHz; the min window alone drove LOWPASSED with lossy-bitrate
+  wording despite carrying no machine signature (edge 6.3 dB/kHz, shelf
+  −60, no alias).
+- **The source-rate label comes from the min window.** A wall caps the
+  *upper envelope* of window cutoffs, not the minimum: 2-06's max window
+  (23.95 kHz) names the true 24 kHz boundary; the min window (21.8 kHz)
+  first-matched 22 050 instead.
+
+Segment mode is the only line of defense in an unattended scan — CLEAN
+results are never surfaced as deep-scan candidates — so these fixes go in
+segment mode itself. All six items are logic changes on data already
+computed: no extra decode, no new subprocess, no schema change. Items 1–5
+batch into one `ANALYSIS_REV` bump (5 → 6).
+
+- [ ] **Window-consensus corroboration in the UPSAMPLED-candidate
+      branch.** Pass `windows_agree` and the per-window cutoff list into
+      `_verdict`. In the hi-res candidate branch: ≥ 3 valid windows
+      agreeing within tolerance **and** a `_resample_match` hit = a
+      constant wall at a standard Nyquist → UPSAMPLED at ~0.75 (below the
+      0.9 alias/deep-corroborated tier), with a note mirroring deep
+      mode's pinned-edge wording. The "dark master?" CLEAN escape remains
+      only when the windows genuinely wander. True CLEANs are unaffected:
+      2-04/2-15 agree too, but at 28.7/28.8 kHz they never enter the
+      candidate branch. This closes the 2-14 false-CLEAN at zero added
+      cost. *Cost: none (evidence already computed).*
+
+- [ ] **Program-level shelf reference.** Measure the shelf against the
+      **max (or median) per-window ref** across non-silent windows
+      instead of the primary window's own ref — the min-cutoff selection
+      makes the primary systematically quiet, which inflates every shelf
+      reading on quiet-intro tracks and also weakens the ordinary 44.1 k
+      FAKE_SUSPECT silent-shelf path (not just hi-res). Re-verify
+      `SILENT_SHELF_DB = -68` still splits the fixture populations and
+      update `tests/README.md` constants in the same PR (cross-cutting
+      rule). *Cost: none.*
+
+- [ ] **Window-disagreement guard for hi-res lossless containers.** When
+      windows disagree beyond tolerance **and** the max window reaches
+      the full-bandwidth threshold **and** the min window shows no
+      machine signature (not sharp, shelf not silent, no alias): CLEAN
+      with a "bandwidth varies with content" note at modest confidence,
+      `windows.agree = false` staying surfaced as the deep-scan candidate
+      it already is. If the min window *does* carry a machine signature,
+      keep the suspect verdict — that is the splice case the min rule
+      exists for, unchanged. Fixes the 2-05 false flag without touching
+      the splice detector. *Cost: none.*
+
+- [ ] **Source-rate label from the window upper envelope.** Choose the
+      largest standard Nyquist matched by *any* window within the
+      asymmetric `_resample_match` window, subject to no window exceeding
+      it by more than the leakage margin — instead of first-match against
+      the minimum window. Fixes 2-06's "44.1 kHz" → "48 kHz". *Cost:
+      none.*
+
+- [ ] **Bandwidth wording for lossless containers.** `_estimate_source`'s
+      "~320 kbps / high-quality lossy" on a 96 k/24 FLAC (2-05's stored
+      result) misleads an operator triaging thousands of rows. On the
+      LOWPASSED path for a lossless container, word the estimate as
+      bandwidth ("content ends ~19.7 kHz"), keeping bitrate-class wording
+      for lossy containers where it means something. One branch
+      condition — consistent with the standing rejection of per-codec
+      wording *tables*. *Cost: none.*
+
+- [ ] **Upsample + quiet-intro regression fixtures.** Extend
+      `tests/generate_adversarial_fixtures.py` (from the committed
+      `genuine_cd_1644.flac`, ffmpeg-gated like the existing lossy ones):
+      (a) 44.1 k→96 k and 48 k→96 k SRC upsamples with ffmpeg's default
+      soxr filter — the *moderate-slope* wall that beat the sharp gate;
+      (b) the same upsample with a quiet intro prepended so the
+      min-cutoff window is a quiet one — pinning the ref-bias regression;
+      (c) assert the committed genuine hi-res fixtures stay CLEAN under
+      items 1–3. Measured constants documented in `tests/README.md`.
+      *Cost: development-time only.*
+
+Deliberately **not** adopted from the field validation, per the standing
+scope decisions: stereo coherence above the cutoff (the third party's
+strongest secondary signal, but it needs a stereo decode — it belongs to
+the existing Phase-2 two-stage per-channel item); full-track ultrasonic
+band metrics in the default scan (stays rejected — items 1–2 close the
+same hole with data segment mode already has); LUFS/true-peak mastering
+QC (Phase 2/3 quality metrics, never verdict input); release-history /
+catalog lookups (not automatable evidence).
+
 ## Phase 2 — deeper analysis in deep mode (after Phase 1 stabilizes)
 
 Deep mode stays **manually triggered** for this phase (per-track button,
@@ -827,7 +967,13 @@ Rejected as complexity this plugin doesn't need:
   the chunk budget, not a new scheduler.
 - **Phase-1 ultrasonic evidence for all hi-res files.** The escape path is
   real, but routing "dark master?" CLEANs through the escalation trigger
-  closes it at near-zero default-scan cost.
+  closes it at near-zero default-scan cost. *(2026-07-22 field-validation
+  correction: the escape path fired in the wild — a confirmed 96 k upscale
+  landed CLEAN "dark master?", and CLEAN results never reach any
+  escalation surface, so "route it through the trigger" was optimistic.
+  The rejection itself stands: Phase 1b items 1–2 close the same hole
+  using window consensus and an unbiased shelf reference, still without
+  any new ultrasonic band metrics in the default scan.)*
 - **Downgrading the sampled zero-padding verdict.** See the bit-depth item:
   scope is now labelled honestly, but the 0.95 verdict stands.
 - **Regression-residual ultrasonic modeling and a silence-type taxonomy for
