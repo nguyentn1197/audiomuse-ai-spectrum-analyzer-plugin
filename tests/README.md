@@ -20,7 +20,9 @@ confirmed-genuine DSD64 file — genuine hi-res and CD masters, 44.1→96k and
 plus the Phase-1 minimum adversarial set: a narrow ultrasonic pilot tone on a
 sharp 15 kHz wall, AAC and ALAC in `.m4a`, Opus and Vorbis in `.ogg`, an
 honest low-passed first-generation 320k MP3, half-truncated FLAC and MP3, and
-a dithered/DSP-processed 16-into-24-bit FLAC. See "Regenerating fixtures"
+a dithered/DSP-processed 16-into-24-bit FLAC — and the Phase-1b pair: a
+quiet-intro 44.1→96k upsample (ref-bias regression) and a genuine hi-res
+track with one dark passage (window-disagreement guard). See "Regenerating fixtures"
 below for how each is built and `TestAdversarialFixtures` in
 `test_verdicts.py` for what each one arbitrates.
 
@@ -153,6 +155,53 @@ other six untouched.
   a gap this item was meant to close. See
   `TestAdversarialFixtures::test_truncated_flac_partial_windows_vs_deep_decode_failure`
   and `::test_truncated_mp3_decodes_short_without_raising`.
+- Phase 1b segment-mode verdict wiring (field-validated 2026-07-22 against
+  five real 96 kHz tracks, see IMPROVEMENT_PLAN.md "Phase 1b"):
+  - **Program-level shelf reference**: the shelf is measured against the
+    loudest valid window's 1–8 kHz median (`shelf_ref_db` in details), not
+    the verdict window's own ref — the minimum-cutoff window is
+    systematically a quiet one, and its own ref inflates the shelf by the
+    ref deficit (field: a confirmed 96k upscale read −61.9 dB vs its quiet
+    window's ref but −77.5 dB vs program level). `SILENT_SHELF_DB = -68`
+    unchanged — it still splits the populations under the new reference
+    (fixture fakes −73…−108, dark master −56.4, genuine DSD −45.6).
+  - **`_DEEP_SILENCE_SHELF_DB = -85`**: a quiet-but-genuine passage's shelf
+    also reads "silent" against the program ref (−71.7 field-measured), but
+    a resampler's floor sits far deeper (−103…−108 on the upsampled
+    fixtures) — the variable-bandwidth guard uses this floor to tell them
+    apart.
+  - **`_WINDOW_AGREEMENT_TOLERANCE_HZ = 1500` now field-calibrated**:
+    constant walls and genuine full-bandwidth masters spread 108–727 Hz
+    across windows; content-varying bandwidth spreads 2156–7617 Hz.
+    Agreement is asymmetric evidence — a fake can still *disagree*
+    (resampler image leakage pushed `fake_hires_44to96`'s spread to
+    2320 Hz), which is also why the envelope source-rate label
+    (`_consensus_source_rate`) is gated on agreement: ungated it would
+    mislabel that fixture 48 kHz.
+  - `upsampled_quiet_intro_44to96.flac`: 44.1→96k FFT upsample with a
+    moderate-slope wall (−30 dB over ~750 Hz — too soft for the 25 dB/kHz
+    sharp gate, like a real SRC filter), the first 18 s (exactly the first
+    sampled window) 25 dB quieter with an HF tilt so the *quiet* window
+    drives the verdict, plus a calibrated broadband noise floor (shelf
+    −51.5 dB vs the quiet window's own ref = the old escape; −73.1 dB vs
+    program ref = correctly silent). Pins the ref-bias regression:
+    reverting the program ref flips it back to a false CLEAN
+    ("dark master?"). Windows agree (spread 211 Hz) → also exercises the
+    constant-wall corroboration note/confidence and the 44.1 kHz envelope
+    label.
+  - `variable_bandwidth_96k.flac`: genuine hi-res content whose first 18 s
+    are 20 dB quieter with a gradual HF rolloff (window cutoff ~19.5 kHz,
+    below the full-bandwidth threshold) while the other windows stay full
+    bandwidth (up to 48 kHz) — windows disagree, widest reaches full
+    bandwidth, no machine signature (edge 4.5 dB/kHz, shelf −79.6 dB vs
+    program ref, above the −85 deep-silence floor thanks to a calibrated
+    acoustic-floor noise) → CLEAN 'variable bandwidth (content-dependent)',
+    pinning the disagreement guard that fixes the field false LOWPASSED.
+  - `TestPhase1b` in `test_verdicts.py` asserts the mechanisms (ref gap,
+    old-ref escape arithmetic, guard preconditions, corroboration-only
+    pinning via `dark_master_96k` — which *also* pins at a resample-matched
+    frequency and must stay CLEAN — and the 48 kHz envelope label on
+    `fake_hires_48to96`).
 - Bit-depth histogram, real-file counterpart: `dithered_1624.flac` (16-bit
   source, ~3% of samples given genuine content below the 16-bit line —
   simulating a 32-bit float DSP pass before a 24-bit export, not a plain
