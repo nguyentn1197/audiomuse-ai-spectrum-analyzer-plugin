@@ -621,6 +621,7 @@ def settings():
             except (TypeError, ValueError):
                 set_setting(key, dflt)
         set_setting('hook_enabled', bool(request.form.get('hook_enabled')))
+        set_setting('skip_clean_spectrograms', bool(request.form.get('skip_clean_spectrograms')))
         return redirect(manage_plugins_url())
 
     def num(key, dflt, label, hint):
@@ -630,6 +631,7 @@ def settings():
                 f'{hint}</span></label>')
 
     hook = 'checked' if get_setting('hook_enabled', True) else ''
+    skip_clean = 'checked' if get_setting('skip_clean_spectrograms', False) else ''
     body = (
         '<form method="post">'
         + num('segment_seconds', 90, 'Analyzed segment (s)',
@@ -642,6 +644,10 @@ def settings():
         + f'<label style="display:block;margin:.6rem 0;">'
           f'<input type="checkbox" name="hook_enabled" {hook}> '
           'Also analyze songs automatically during core analysis (on_song_analyzed hook)</label>'
+        + f'<label style="display:block;margin:.6rem 0;">'
+          f'<input type="checkbox" name="skip_clean_spectrograms" {skip_clean}> '
+          'Skip storing a spectrogram for CLEAN tracks (saves CPU/DB space; audio isn\'t '
+          'retained after analysis, so a skipped spectrogram can\'t be rendered later)</label>'
         '<button type="submit" class="btn btn-primary" style="margin-top:1rem;">Save</button>'
         '</form>')
     return render_page(body, title='Spectrum Analyzer Settings')

@@ -524,5 +524,27 @@ class TestBitDepthHistogram(unittest.TestCase):
         self.assertGreater(d['bit_depth']['predominant_bit_depth'], 16)
 
 
+class TestSkipSpectrogramForClean(unittest.TestCase):
+
+    def test_default_off_always_renders(self):
+        r = dsp.analyze_file(os.path.join(FIXTURES, 'genuine_cd_1644.flac'),
+                             suffix='flac', bitrate_kbps=900)
+        self.assertEqual(r['verdict'], 'CLEAN')
+        self.assertTrue(len(r['spectrogram_b64']) > 1000)
+
+    def test_skips_only_when_clean(self):
+        r_clean = dsp.analyze_file(os.path.join(FIXTURES, 'genuine_cd_1644.flac'),
+                                   suffix='flac', bitrate_kbps=900,
+                                   skip_spectrogram_for_clean=True)
+        self.assertEqual(r_clean['verdict'], 'CLEAN')
+        self.assertIsNone(r_clean['spectrogram_b64'])
+
+        r_suspect = dsp.analyze_file(os.path.join(FIXTURES, 'fake_lossless_128.flac'),
+                                     suffix='flac', bitrate_kbps=500,
+                                     skip_spectrogram_for_clean=True)
+        self.assertEqual(r_suspect['verdict'], 'FAKE_SUSPECT')
+        self.assertTrue(len(r_suspect['spectrogram_b64']) > 1000)
+
+
 if __name__ == '__main__':
     unittest.main()

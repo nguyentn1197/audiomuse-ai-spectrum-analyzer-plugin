@@ -183,6 +183,7 @@ def _settings():
         'drop_db': int(get_setting('drop_db', 40)),
         'img_w': int(get_setting('img_w', 800)),
         'img_h': int(get_setting('img_h', 280)),
+        'skip_clean_spectrograms': bool(get_setting('skip_clean_spectrograms', False)),
     }
 
 
@@ -407,6 +408,7 @@ def _analyze_download(track, info, meta_fp, settings, existing, mode, deep=False
             path, suffix=info.get('suffix'), bitrate_kbps=info.get('bitrate'),
             segment_seconds=settings['segment_seconds'], drop_db=settings['drop_db'],
             img_w=settings['img_w'], img_h=settings['img_h'], deep=deep,
+            skip_spectrogram_for_clean=settings['skip_clean_spectrograms'],
         )
         _upsert(item_id, info, result, meta_fp, md5)
         return 'analyzed'
@@ -837,6 +839,7 @@ def on_song_analyzed(song):
             path, suffix=info['suffix'], bitrate_kbps=None,
             segment_seconds=settings['segment_seconds'], drop_db=settings['drop_db'],
             img_w=settings['img_w'], img_h=settings['img_h'],
+            skip_spectrogram_for_clean=settings['skip_clean_spectrograms'],
         )
         # (if the payload had no media_item — e.g. an older core — meta_fp is
         # NULL and the next 'changed' scan downloads once, notices the MD5

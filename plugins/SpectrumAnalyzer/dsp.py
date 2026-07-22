@@ -873,7 +873,9 @@ def _render_spectrogram(S_db, sr, seg_offset, seg_len_s, cutoff_hz,
     fig.tight_layout(pad=0.4)
 
     buf = io.BytesIO()
-    fig.savefig(buf, format='png', pil_kwargs={'compress_level': 9})
+    # compress_level 9 buys a small size delta over 6 for a large CPU cost;
+    # not worth it for a PNG that's already max-pooled down to img_w columns
+    fig.savefig(buf, format='png', pil_kwargs={'compress_level': 6})
     plt.close(fig)
     return base64.b64encode(buf.getvalue()).decode('ascii')
 
@@ -948,13 +950,19 @@ def _unsupported_format_result(suffix, bitrate_kbps, deep, drop_db, segment_seco
 
 
 def analyze_file(path, suffix=None, bitrate_kbps=None, segment_seconds=90,
-                 drop_db=40, img_w=800, img_h=280, deep=False):
+                 drop_db=40, img_w=800, img_h=280, deep=False,
+                 skip_spectrogram_for_clean=False):
     """Full pipeline. Returns a dict ready to be stored.
 
     deep=True analyzes the entire file (chunked) instead of one segment and
     tracks the spectral edge over time: a resampler/encoder wall sits at a
     constant frequency for the whole file, while a genuine dark master's edge
     moves with the music.
+
+    skip_spectrogram_for_clean=True skips PNG rendering when the verdict
+    comes out CLEAN (spectrogram_b64 is None in the result). Audio isn't
+    retained after analysis, so a spectrogram not rendered here can never be
+    rendered later -- this is a settings-gated tradeoff, not a default.
     """
     if suffix is None:
         suffix = os.path.splitext(path)[1].lstrip('.')
@@ -1109,7 +1117,10 @@ def analyze_file(path, suffix=None, bitrate_kbps=None, segment_seconds=90,
             f'{container_bits}-bit container ({lower_bit_activity_fraction * 100:.2f}% '
             f'of samples show real content below 16 bits) -- not flagged as padded')
 
-    png_b64 = _render_spectrogram(S_db, sr, offset, seg_len, cutoff_hz, img_w, img_h)
+    if skip_spectrogram_for_clean and verdict == 'CLEAN':
+        png_b64 = None
+    else:
+        png_b64 = _render_spectrogram(S_db, sr, offset, seg_len, cutoff_hz, img_w, img_h)
 
     if not deep:
         integrity = {'status': 'sampled_decode_ok', 'coverage': 'sampled'}

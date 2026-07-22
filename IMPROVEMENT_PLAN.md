@@ -463,12 +463,28 @@ have is deferred.
       rows re-analyze on the next non-force scan and pick up the corrected
       0.9.
 
-- [ ] **Cheap render/IO wins.**
+- [x] **Cheap render/IO wins.**
       Drop PNG `compress_level` 9 → 6 (large CPU saving, small size delta);
       add a settings toggle "skip spectrogram for CLEAN tracks" (default off;
       full removal is a UX regression — audio isn't retained after analysis,
       so a spectrogram not rendered at scan time can never be rendered).
       *Cost: negative (saves CPU).*
+
+      **Shipped:** `_render_spectrogram` now saves at `compress_level=6`. A
+      new `analyze_file(..., skip_spectrogram_for_clean=False)` param skips
+      the render call entirely (`spectrogram_b64=None`) when the verdict
+      comes out CLEAN, checked right at the render call site after `verdict`
+      is final — no other logic touched. Wired through a new
+      `skip_clean_spectrograms` setting (default off, checkbox on the
+      settings page next to the existing hook toggle), read in
+      `jobs._settings()` and passed at both `dsp.analyze_file` call sites
+      (`_analyze_download`, `on_song_analyzed`). Deliberately excluded from
+      `analysis_rev` — like `img_w`/`img_h`, it's a rendering choice, not
+      verdict-relevant, so it doesn't force re-analysis on toggle (and per
+      the note above, toggling it back off can't retroactively backfill
+      spectrograms skipped while it was on — audio isn't retained). New
+      `TestSkipSpectrogramForClean` class covers both the default-off
+      behavior and that only CLEAN verdicts skip rendering.
 
 - [ ] **Minimum adversarial fixtures — same PR as the features they test.**
       Phase 1 changes verdict behavior, so the fixture set must grow with

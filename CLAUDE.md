@@ -35,7 +35,7 @@ An AudioMuse-AI plugin for audio spectrum analysis that detects fake lossless fi
   - `_deep_spectrum()` (deep=True on `analyze_file`, from the per-track Deep analyze button): chunked whole-file scan (120 s chunks, 30 min cap) producing a global max-hold profile, a 1-column/second spectrogram, and a per-second spectral-edge series. Measured calibration: encoder wall ±198 Hz, content-varying upsample ±1035 Hz, genuine dark master ±7236 Hz → edge variance ≥ 2000 Hz downgrades UPSAMPLED/FAKE_SUSPECT → LOWPASSED "likely genuine dark master"; ≤ 300 Hz (constant wall) raises confidence; a pinned edge (≥50% of seconds within 4% of a standard Nyquist, ≤5% above it) confirms a resampler wall regardless of variance. Quiet seconds (window ref < chunk ref − 25 dB) are skipped.
   - `verified` column (0.5.0): manual per-track flag toggled from the album page; excluded from all suspect counts/filters in `__init__.py` (`bad_expr`), preserved across re-analysis (not in the upsert column list).
   - `deep_pending` column (0.5.1): set by the `deep_rescan` route at queue time, cleared in `analyze_track_job`'s finally block (survives job failure). Shown as a "deep scan queued" badge on the song card and aggregated into per-album overview tags (deep scan ×N / verified ×N).
-  - `_render_spectrogram()` matplotlib-based PNG (spek-style color map, red line at detected cutoff), base64 encoded, tunable in settings.
+  - `_render_spectrogram()` matplotlib-based PNG (spek-style color map, red line at detected cutoff), base64 encoded, tunable in settings, saved at `compress_level=6` (0.6.0, down from 9 — large CPU saving for a small size delta on an already time-pooled image). `analyze_file(..., skip_spectrogram_for_clean=False)` (0.6.0) skips the render call entirely for a CLEAN verdict when the `skip_clean_spectrograms` setting is on (default off); excluded from `analysis_rev` like `img_w`/`img_h` since it's a rendering choice, not verdict-relevant — toggling it doesn't force re-analysis and can't retroactively backfill spectrograms skipped while it was on (audio isn't retained after analysis).
 
 ### Database
 
@@ -53,7 +53,7 @@ Results table with foreign key to core's `score(item_id)`, declared `ON UPDATE C
 
 ### Plugin integration points
 
-- Settings page for segment length, cutoff threshold, spectrogram dimensions, and optional on_song_analyzed hook toggle.
+- Settings page for segment length, cutoff threshold, spectrogram dimensions, optional on_song_analyzed hook toggle, and optional skip-spectrogram-for-CLEAN toggle.
 - Optional cron task (`plugin.spectrum_analyzer.scan_changed`, seeded disabled, Sunday 04:00).
 - Manual re-analyze button per track (enqueued to the `high` queue).
 
