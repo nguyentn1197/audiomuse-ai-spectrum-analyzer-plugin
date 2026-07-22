@@ -263,19 +263,19 @@ class TestCodecGating(unittest.TestCase):
                          edge_db_khz=10.0, shelf_db=-40.0, is_lossless=False)
 
     def test_uncalibrated_codec_does_not_flip_verdict(self):
-        verdict, est, conf, notes = dsp._verdict(
+        verdict, est, conf, notes, alias = dsp._verdict(
             suffix='m4a', codec='aac', **self._GATED_KWARGS)
         self.assertEqual(verdict, 'CONSISTENT_LOSSY')
         self.assertTrue(any('no calibrated' in n for n in notes), notes)
 
     def test_unknown_codec_gate_disabled(self):
-        verdict, est, conf, notes = dsp._verdict(
+        verdict, est, conf, notes, alias = dsp._verdict(
             suffix='m4a', codec=None, **self._GATED_KWARGS)
         self.assertEqual(verdict, 'CONSISTENT_LOSSY')
         self.assertTrue(any('no calibrated' in n for n in notes), notes)
 
     def test_mp3_codec_flips_verdict(self):
-        verdict, est, conf, notes = dsp._verdict(
+        verdict, est, conf, notes, alias = dsp._verdict(
             suffix='mp3', codec='mp3', **self._GATED_KWARGS)
         self.assertEqual(verdict, 'TRANSCODED_LOSSY')
         self.assertTrue(any('low-passed first-generation' in n for n in notes), notes)
@@ -373,13 +373,90 @@ class TestDistributedSampling(unittest.TestCase):
             with self.subTest(fixture=name):
                 r = _analyze(name, suffix, kbps)
                 d = json.loads(r['details'])
-                self.assertGreater(len(d['windows']), 1)
-                for w in d['windows']:
+                self.assertGreater(len(d['windows']['samples']), 1)
+                for w in d['windows']['samples']:
                     self.assertIn('offset', w)
                     self.assertIn('seconds', w)
                     self.assertIn('cutoff_hz', w)
                     self.assertIn('silent', w)
-                self.assertIn(d['windows_agree'], (True, False))
+                self.assertIn(d['windows']['agree'], (True, False))
+
+
+class TestStructuredEvidence(unittest.TestCase):
+    """Structured evidence flags: every fact gets one namespaced home in
+    `details`, and the newly-added flags are nullable (None = not
+    evaluated, True/False = tested). Verdict logic itself is untouched --
+    these tests check only the reported shape and nullability."""
+
+    def test_edge_sharpness_none_near_nyquist(self):
+        # cutoff within 500 Hz of Nyquist -- structurally not enough band
+        # above the cutoff to measure a slope; must report None, not a
+        # misleading 0.0 that would read as "measured and gradual"
+        freqs = np.linspace(0, 22050, 2049)
+        profile = np.where(freqs <= 21900, 0.0, -60.0)
+        self.assertIsNone(dsp._edge_sharpness(freqs, profile, 21900))
+
+    def test_edge_sharpness_measures_when_band_available(self):
+        freqs = np.linspace(0, 22050, 2049)
+        profile = np.where(freqs <= 15000, 0.0, -60.0)
+        edge = dsp._edge_sharpness(freqs, profile, 15000)
+        self.assertIsNotNone(edge)
+        self.assertGreater(edge, 25.0)  # near-vertical wall
+
+    def test_verdict_alias_none_outside_upsampled_branch(self):
+        # a plain 44.1 kHz lossy case never reaches the alias-correlation
+        # branch (that's gated behind nyquist > 24000) -- must report None
+        # ("not evaluated"), not a False that implies absence was tested
+        verdict, est, conf, notes, alias = dsp._verdict(
+            sr=44100, suffix='mp3', bitrate_kbps=320, cutoff_hz=19000,
+            edge_db_khz=5.0, shelf_db=-40.0, is_lossless=False)
+        self.assertEqual(verdict, 'CONSISTENT_LOSSY')
+        self.assertIsNone(alias)
+
+    def test_verdict_alias_evaluated_in_upsampled_branch(self):
+        # a real upsampled fixture reaches the alias-correlation branch
+        # (hi-res container, cutoff aligned with a lower standard Nyquist)
+        # -- alias_image_detected must come back as a real True/False, not None
+        r = _analyze('fake_hires_44to96.flac', 'flac', 1400)
+        self.assertEqual(r['verdict'], 'UPSAMPLED')
+        d = json.loads(r['details'])
+        self.assertIn(d['evidence']['alias_image_detected'], (True, False))
+
+    def test_details_shape_end_to_end(self):
+        r = _analyze('genuine_cd_1644.flac', 'flac', 900)
+        d = json.loads(r['details'])
+
+        self.assertEqual(set(d['evidence']), {
+            'edge_machine_like', 'shelf_digitally_silent',
+            'alias_image_detected', 'narrow_high_frequency_tone_present',
+        })
+        for key in ('edge_machine_like', 'shelf_digitally_silent',
+                    'narrow_high_frequency_tone_present'):
+            self.assertIn(d['evidence'][key], (True, False, None))
+        # 44.1 kHz file never reaches the alias branch -- must be None
+        self.assertIsNone(d['evidence']['alias_image_detected'])
+
+        self.assertEqual(d['bit_depth'],
+                         {'container_bits': r['container_bits'],
+                          'effective_bits': r['effective_bits']})
+
+        self.assertEqual(set(d['windows']), {'samples', 'agree'})
+
+        self.assertEqual(d['analysis_rev'], dsp.analysis_rev(40, 90))
+
+        # moved, not duplicated -- no leftover flat keys at the top level
+        for stale_key in ('narrow_high_frequency_tone_present', 'windows_agree',
+                          'container_bits', 'effective_bits'):
+            self.assertNotIn(stale_key, d)
+
+    def test_error_paths_carry_analysis_rev(self):
+        import tempfile
+        with tempfile.NamedTemporaryFile(suffix='.flac') as f:
+            f.write(b'not actually audio' * 100)
+            f.flush()
+            r = dsp.analyze_file(f.name, suffix='flac', bitrate_kbps=900)
+        d = json.loads(r['details'])
+        self.assertEqual(d['analysis_rev'], dsp.analysis_rev(40, 90))
 
 
 if __name__ == '__main__':

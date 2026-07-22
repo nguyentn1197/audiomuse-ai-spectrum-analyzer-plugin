@@ -428,16 +428,17 @@ def _edge_sharpness(freqs, profile, cutoff_hz):
     is a near-vertical wall; a natural rolloff is gradual. Near Nyquist the
     upper band is truncated and every rolloff looks like a wall, so the
     measurement needs at least ~500 Hz of band above the cutoff to mean
-    anything."""
+    anything -- returns None (not measured) rather than a misleading 0.0
+    when it can't, mirroring _shelf_level's contract."""
     nyquist = float(freqs[-1])
     hi_top = min(cutoff_hz + 1500, nyquist)
     span_khz = (hi_top - cutoff_hz) / 1000.0
     if span_khz < 0.5:
-        return 0.0
+        return None
     lo = profile[(freqs >= cutoff_hz - 1000) & (freqs < cutoff_hz)]
     hi = profile[(freqs > cutoff_hz) & (freqs <= hi_top)]
     if lo.size == 0 or hi.size == 0:
-        return 0.0
+        return None
     return float((np.mean(lo) - np.mean(hi)) / (0.5 + span_khz / 2.0))
 
 
@@ -693,10 +694,15 @@ def _verdict(sr, suffix, bitrate_kbps, cutoff_hz, edge_db_khz, shelf_db,
     # the Nyquist wall looks sharp, so content reaching ~93% of Nyquist
     # (capped at 20.5 kHz for high-rate files) counts as full bandwidth.
     full_threshold = min(0.93 * nyquist, 20500.0)
-    sharp = edge_db_khz >= 25.0
+    sharp = edge_db_khz is not None and edge_db_khz >= 25.0
     silent_shelf = shelf_db is None or shelf_db <= SILENT_SHELF_DB
     margin = max(0.0, min(1.0, (full_threshold - cutoff_hz) / full_threshold))
     notes = []
+    # alias_image_detected stays None ("not evaluated") outside the
+    # UPSAMPLED-candidate branch below -- the alias-image correlation is
+    # never run for the other verdicts, so reporting False there would be a
+    # false claim of absent evidence rather than untested evidence.
+    alias_image_detected = None
 
     if cutoff_hz >= full_threshold:
         # hi-res container: content stopping at a lower standard rate's
@@ -709,6 +715,7 @@ def _verdict(sr, suffix, bitrate_kbps, cutoff_hz, edge_db_khz, shelf_db,
                 corr, corr_rate = ((None, None) if freqs is None or profile is None
                                    else _best_alias_match(freqs, profile, nyquist))
                 aliased = corr is not None and corr >= 0.6
+                alias_image_detected = aliased
                 if aliased and corr_rate:
                     src_rate = corr_rate  # images name the true source rate
                 if silent_shelf or aliased or sharp:
@@ -729,14 +736,15 @@ def _verdict(sr, suffix, bitrate_kbps, cutoff_hz, edge_db_khz, shelf_db,
                     elif not silent_shelf:
                         notes.append('some content above the cutoff: '
                                      'could be a genuine but dark master')
-                    return 'UPSAMPLED', est, conf, notes
+                    return 'UPSAMPLED', est, conf, notes, alias_image_detected
                 # soft edge + audible noise + no aliasing: a genuine dark
                 # master fading out, not a resampler wall
                 notes.append('bandwidth is limited but the edge is gradual with '
                              'audible noise above and no aliasing images: likely '
                              'a genuine dark master')
-                return 'CLEAN', 'limited bandwidth (dark master?)', 0.6, notes
-        return 'CLEAN', 'full bandwidth', 0.9, notes
+                return ('CLEAN', 'limited bandwidth (dark master?)', 0.6, notes,
+                        alias_image_detected)
+        return 'CLEAN', 'full bandwidth', 0.9, notes, alias_image_detected
 
     if nyquist > 24000.0 and cutoff_hz < 23000.0:
         notes.append('content ends below 23 kHz despite high sample rate: possible upsample')
@@ -747,13 +755,13 @@ def _verdict(sr, suffix, bitrate_kbps, cutoff_hz, edge_db_khz, shelf_db,
     if lossless:
         if sharp and silent_shelf:
             conf = min(0.95, 0.6 + 0.5 * margin + min(0.15, (edge_db_khz - 25.0) / 200.0))
-            return 'FAKE_SUSPECT', est, conf, notes
+            return 'FAKE_SUSPECT', est, conf, notes, alias_image_detected
         if sharp:
             notes.append('sharp edge but audible noise floor above the cutoff: '
                          'more likely a low-passed master than an encoder wall')
-            return 'LOWPASSED', est, 0.5 + 0.3 * margin, notes
+            return 'LOWPASSED', est, 0.5 + 0.3 * margin, notes, alias_image_detected
         notes.append('gradual rolloff: could be a genuine low-passed master, not a transcode')
-        return 'LOWPASSED', est, 0.45 + 0.3 * margin, notes
+        return 'LOWPASSED', est, 0.45 + 0.3 * margin, notes, alias_image_detected
 
     # lossy container
     expected = _expected_cutoff_for_bitrate(bitrate_kbps)
@@ -765,13 +773,14 @@ def _verdict(sr, suffix, bitrate_kbps, cutoff_hz, edge_db_khz, shelf_db,
                 f'{codec} encode at the declared bitrate'
             )
             conf = min(0.9, 0.55 + 0.5 * margin) - _TRANSCODE_GATE_CONFIDENCE_PENALTY
-            return 'TRANSCODED_LOSSY', est, max(0.5, conf), notes
+            return ('TRANSCODED_LOSSY', est, max(0.5, conf), notes,
+                    alias_image_detected)
         notes.append(
             f'bandwidth lower than expected for declared ~{bitrate_kbps} kbps '
             f'({codec or "unknown"} codec); no calibrated bitrate-to-bandwidth '
             f'mapping for this codec, verdict not changed on this evidence alone'
         )
-    return 'CONSISTENT_LOSSY', est, 0.7, notes
+    return 'CONSISTENT_LOSSY', est, 0.7, notes, alias_image_detected
 
 
 def _render_spectrogram(S_db, sr, seg_offset, seg_len_s, cutoff_hz,
@@ -836,6 +845,7 @@ def _inconclusive_result(suffix, bitrate_kbps, deep, drop_db, segment_seconds, e
             'deep': deep,
             'drop_db': drop_db,
             'integrity': {'status': 'decode_failed', 'coverage': None},
+            'analysis_rev': analysis_rev(drop_db, segment_seconds),
             'notes': [f'decode failed: {exc}'],
         }),
         'spectrogram_b64': None,
@@ -869,6 +879,7 @@ def _unsupported_format_result(suffix, bitrate_kbps, deep, drop_db, segment_seco
             'deep': deep,
             'drop_db': drop_db,
             'integrity': {'status': 'unsupported', 'coverage': None},
+            'analysis_rev': analysis_rev(drop_db, segment_seconds),
             'notes': [f'{fmt.upper()} recognized by magic bytes: DSD content is '
                       f'not analyzed by the PCM spectrum heuristics'],
         }),
@@ -980,9 +991,10 @@ def analyze_file(path, suffix=None, bitrate_kbps=None, segment_seconds=90,
         cutoff_hz, ref, narrow_tone = _find_cutoff(freqs, profile, drop_db)
     edge = _edge_sharpness(freqs, profile, cutoff_hz)
     shelf = _shelf_level(freqs, profile, cutoff_hz, ref)
-    verdict, est, conf, notes = _verdict(sr, suffix, bitrate_kbps, cutoff_hz, edge, shelf,
-                                         freqs=freqs, profile=profile,
-                                         is_lossless=detected_lossless, codec=gate_codec)
+    verdict, est, conf, notes, alias_image_detected = _verdict(
+        sr, suffix, bitrate_kbps, cutoff_hz, edge, shelf,
+        freqs=freqs, profile=profile,
+        is_lossless=detected_lossless, codec=gate_codec)
 
     if deep:
         if edge_var is None:
@@ -1048,7 +1060,7 @@ def analyze_file(path, suffix=None, bitrate_kbps=None, segment_seconds=90,
         'seg_offset': round(offset, 2),
         'seg_seconds': round(seg_len, 2),
         'cutoff_hz': round(cutoff_hz, 1),
-        'edge_db_khz': round(edge, 2),
+        'edge_db_khz': round(edge, 2) if edge is not None else None,
         'shelf_db': round(shelf, 2) if shelf is not None else None,
         'verdict': verdict,
         'est_source': est,
@@ -1062,8 +1074,7 @@ def analyze_file(path, suffix=None, bitrate_kbps=None, segment_seconds=90,
             'nyquist_hz': sr / 2.0,
             'full_bandwidth_threshold_hz': round(min(0.93 * sr / 2.0, 20500.0), 1),
             'shelf_db': round(shelf, 2) if shelf is not None else None,
-            'container_bits': container_bits,
-            'effective_bits': effective_bits,
+            'bit_depth': {'container_bits': container_bits, 'effective_bits': effective_bits},
             'declared_bitrate_kbps': bitrate_kbps,
             'suffix': suffix,
             'deep': deep,
@@ -1071,9 +1082,15 @@ def analyze_file(path, suffix=None, bitrate_kbps=None, segment_seconds=90,
             'edge_median_hz': round(edge_med, 1) if edge_med is not None else None,
             'integrity': integrity,
             'delivery': delivery,
-            'narrow_high_frequency_tone_present': narrow_tone,
-            'windows': windows_detail,
-            'windows_agree': windows_agree,
+            'evidence': {
+                'edge_machine_like': None if edge is None else (edge >= 25.0),
+                'shelf_digitally_silent': None if shelf is None else (shelf <= SILENT_SHELF_DB),
+                'alias_image_detected': alias_image_detected,
+                'narrow_high_frequency_tone_present': narrow_tone,
+            },
+            'windows': ({'samples': windows_detail, 'agree': windows_agree}
+                       if windows_detail is not None else None),
+            'analysis_rev': analysis_rev(drop_db, segment_seconds),
             'notes': notes,
         }),
         'spectrogram_b64': png_b64,

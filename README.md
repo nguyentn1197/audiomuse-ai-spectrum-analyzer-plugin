@@ -57,6 +57,63 @@ A 90 s segment from the middle of the track is loaded at native sample rate, STF
 
 These are heuristics — treat `FAKE_SUSPECT` as "look at the spectrogram," not a conviction. Thresholds are calibrated against real ground-truth fixtures (see `tests/`): LAME 320 kbps transcodes (cutoff ~20.1 kHz, dither-only shelf) are caught, but very-high-bitrate transcodes whose cutoff reaches ≥ 20.5 kHz (e.g. AAC 256) still read as CLEAN — spectrally indistinguishable from a genuine master, and false accusations are worse.
 
+### Reading the raw metrics (the "details" JSON)
+
+Every track page has a collapsible **raw metrics** panel — the full evidence behind the verdict, as JSON. It's grouped into sections; each fact lives in exactly one section, and a value of `null` always means "not checked for this track" (as opposed to `false`, which means "checked, and no").
+
+**Top level** — numbers that describe the analyzed segment itself:
+
+| Field | Meaning |
+|---|---|
+| `nyquist_hz` | Half the sample rate — the highest frequency the file could possibly contain. |
+| `full_bandwidth_threshold_hz` | The cutoff frequency above which a track counts as "full bandwidth" (near `nyquist_hz`, capped at 20.5 kHz). |
+| `ref_level_db` / `shelf_db` | How loud the 1–8 kHz "reference" band is, and how loud the band *above* the cutoff is relative to it. A very quiet shelf (`shelf_db` far below zero) means near-silence above the cutoff — see `shelf_digitally_silent` below. |
+| `drop_db` | The threshold used to find the cutoff: the point where content falls this many dB below the reference level. |
+| `declared_bitrate_kbps` / `suffix` | What the file claimed to be (from its metadata/extension), used to sanity-check the measured cutoff. |
+| `deep` | Whether this was a full-file "Deep analyze" (`true`) or a normal multi-window sample (`false`). |
+| `edge_var_hz` / `edge_median_hz` | Deep-scan only: how much the cutoff frequency wanders second-to-second. A constant edge means a machine-made wall; a wandering edge means it's just following the music. |
+| `analysis_rev` | Internal version stamp — which revision of the detection logic produced this row. |
+| `notes` | Plain-English explanations for the verdict (e.g. "sharp edge but audible noise above the cutoff"). |
+
+**`bit_depth`** — is the file's declared bit depth real?
+
+| Field | Meaning |
+|---|---|
+| `container_bits` | The bit depth the file claims (e.g. 24-bit). |
+| `effective_bits` | The bit depth actually being used (e.g. only 16 real bits, the rest padded with zeros). A mismatch here is what triggers `UPSCALED`. |
+
+**`integrity`** — how much of the file was actually decoded:
+
+| Field | Meaning |
+|---|---|
+| `status` | `sampled_decode_ok` (normal scan, a few windows read), `full_decode_ok` (deep scan, whole file read), `decode_failed` (file couldn't be opened), or `unsupported` (DSD — deliberately not analyzed). |
+| `coverage` | How much of the file that status is based on: `sampled`, `partial`, `capped` (deep scan hit its time limit), or `full`. |
+
+**`delivery`** — what codec is actually inside the file (`null` if there's nothing to report — suffix and content agree and no codec was probed):
+
+| Field | Meaning |
+|---|---|
+| `codec` | The actual codec detected (e.g. `mp3`, `alac`) when it differs from a simple guess-by-extension. |
+| `codec_mismatch` | Set when the file extension lies about the format (e.g. a `.m4a` file that's actually lossless ALAC, or vice versa). |
+
+**`windows`** — multi-window sampling detail (`null` in deep-scan mode, which doesn't use windows):
+
+| Field | Meaning |
+|---|---|
+| `samples` | One entry per sampled window (spread through the track): its offset/length, the cutoff frequency found there, and whether it was too quiet to trust (`silent`). The *worst* (lowest-cutoff) window is what drives the verdict — one bad passage can't be averaged away. |
+| `agree` | `true` if all the windows found roughly the same cutoff, `false` if they disagree (worth a manual look / deep scan), `null` if there weren't enough usable windows to compare. |
+
+**`evidence`** — specific clues checked while forming the verdict (see the table below; all nullable — `null` means that check didn't run for this file):
+
+| Field | Plain-English question | What it means |
+|---|---|---|
+| `edge_machine_like` | Does the sound cut off like a wall, or fade out naturally? | `true` = sharp, encoder-style cutoff; `false` = gradual, natural rolloff; `null` = not enough spectrum above the cutoff to tell. |
+| `shelf_digitally_silent` | Is there true silence above the cutoff, or just quiet noise? | `true` = digital silence (a transcode/fake signature); `false` = real noise floor present (points to a genuine recording); `null` = nothing measurable above the cutoff. |
+| `alias_image_detected` | Does the noise above the cutoff mirror the sound below it? | `true` = yes, a resampler artifact (strong upsampling proof); `false` = checked, no mirroring found; `null` = this check only runs when a track is already a hi-res-upsample candidate, so most tracks never reach it. |
+| `narrow_high_frequency_tone_present` | Is there one odd narrow spike high in the spectrum? | `true` = an isolated tone was found and excluded from the cutoff measurement (so it can't fake extra bandwidth); `false` = none found; `null` = not evaluated. |
+
+None of these fields change what verdict a track gets by themselves — they're the paper trail for the verdict the detection logic already reached.
+
 ## Install (local repository, per the official docs)
 
 1. Run `./build.sh [version]` — it packages the plugin code into `dist/spectrum_analyzer-<version>.zip` and points the matching `plugin.json` entry's `sourceUrl` at it. Without an argument the version is taken from the newest zip in `dist/` (or `plugin.json` on a fresh checkout).

@@ -375,7 +375,7 @@ have is deferred.
       track" docstring lie. *Cost: neutral or lower (~50–60 s decoded vs
       90 s).*
 
-- [ ] **Structured evidence flags — nullable, additive.**
+- [x] **Structured evidence flags — nullable, additive.**
       The details JSON already exists — **add** namespaced keys
       (`analysis_rev`, `integrity`, `evidence`, `windows`) next to the
       existing ones rather than restructuring the whole payload; old rows
@@ -393,6 +393,27 @@ have is deferred.
       tri-state for free, no per-flag status-enum objects needed. Makes
       every verdict auditable from the UI with no schema migration (details
       is already a JSON column). *Cost: negligible.*
+      **Shipped:** `evidence` namespace with all three new flags nullable —
+      `edge_machine_like` fixes a real latent bug (`_edge_sharpness` used to
+      return `0.0`, not `None`, when there wasn't enough band above the
+      cutoff to measure, so "not evaluated" silently read as "measured and
+      gradual"; it now returns `None`, mirroring `_shelf_level`'s existing
+      contract, and the verdict-driving `sharp` boolean is unchanged —
+      `edge_db_khz is not None and edge_db_khz >= 25.0` collapses to the
+      same decision as before, only the audit-facing flag is now honest);
+      `alias_image_detected` newly exposes a fact `_verdict` always computed
+      internally (the `aliased` local) but never reported — `None` outside
+      the UPSAMPLED-candidate branch where the alias-image correlation
+      never runs, a real `True`/`False` inside it; `narrow_high_frequency_tone_present`
+      moved (not duplicated) from the top level. `windows`/`windows_agree`
+      merged into `windows: {samples, agree}` (`None` in deep mode, where
+      no windowing happens). `container_bits`/`effective_bits` regrouped
+      into `bit_depth.*` (padding-scope field itself deferred to the next
+      checkbox). `analysis_rev` mirrored into all three `details` shapes
+      (normal result + both error paths) so a raw-dump reader doesn't need
+      to cross-reference the DB column. No verdict or confidence value
+      changed on any fixture (full suite green, byte-for-byte) — this is a
+      `details`-shape-only change, so `ANALYSIS_REV` is **not** bumped.
 
 - [ ] **Bit-depth histogram alongside — not instead of — the minimum.**
       Compute the trailing-zero *distribution*, but keep the two kinds of
