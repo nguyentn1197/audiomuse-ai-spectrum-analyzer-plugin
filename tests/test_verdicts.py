@@ -436,9 +436,15 @@ class TestStructuredEvidence(unittest.TestCase):
         # 44.1 kHz file never reaches the alias branch -- must be None
         self.assertIsNone(d['evidence']['alias_image_detected'])
 
-        self.assertEqual(d['bit_depth'],
-                         {'container_bits': r['container_bits'],
-                          'effective_bits': r['effective_bits']})
+        self.assertEqual(d['bit_depth'], {
+            'container_bits': r['container_bits'],
+            'effective_bits': r['effective_bits'],
+            # genuine_cd_1644.flac is a 16-bit container -- nothing to fake,
+            # so the histogram is never computed (not evaluated == None)
+            'predominant_bit_depth': None,
+            'lower_bit_activity_fraction': None,
+            'coverage': None,
+        })
 
         self.assertEqual(set(d['windows']), {'samples', 'agree'})
 
@@ -457,6 +463,65 @@ class TestStructuredEvidence(unittest.TestCase):
             r = dsp.analyze_file(f.name, suffix='flac', bitrate_kbps=900)
         d = json.loads(r['details'])
         self.assertEqual(d['analysis_rev'], dsp.analysis_rev(40, 90))
+
+
+class TestBitDepthHistogram(unittest.TestCase):
+    """Bit-depth histogram alongside -- not instead of -- the exact minimum.
+    The exact trailing-zero test (dsp.py's original behavior) stays the
+    only UPSCALED trigger; the histogram adds informational
+    predominant_bit_depth/lower_bit_activity_fraction fields and lets the
+    exact test's confidence reflect how much of the file was actually
+    checked (sampled window vs. deep mode's full-file scan)."""
+
+    def test_window_stats_odd_multiplier_gives_consistent_bitpos(self):
+        # 1000 samples padded to 16-bit-equivalent (low 16 bits zero: an
+        # odd multiplier of 2^16 keeps bit 16 as the lowest set bit
+        # regardless of the multiplier's own factors) plus 5 samples with
+        # genuine content down at bit 7 (odd multiplier of 2^7)
+        padded = ((2 * np.arange(1, 1001) + 1) * 65536).astype(np.int64)
+        deep = ((2 * np.arange(1, 6) + 1) * 128).astype(np.int64)
+        x = np.concatenate([padded, deep]).astype(np.int32).reshape(-1, 1)
+
+        min_bitpos, hist = dsp._bit_depth_window_stats(x, 24)
+        total = int(hist.sum())
+        self.assertEqual(total, 1005)
+        self.assertEqual(int(np.argmax(hist)), 16)  # predominant depth
+        self.assertAlmostEqual(float(hist[17:].sum()) / total, 5 / 1005, places=4)
+        self.assertEqual(min(24, int(32 - min_bitpos)), 24)  # NOT exact padding
+
+    def test_window_stats_all_silent_chunk(self):
+        x = np.zeros((100, 1), dtype=np.int32)
+        min_bitpos, hist = dsp._bit_depth_window_stats(x, 24)
+        self.assertIsNone(min_bitpos)
+        self.assertEqual(int(hist.sum()), 0)
+
+    def test_sampled_vs_full_confidence_and_coverage(self):
+        # fake_24bit_96k.flac is a straightforward 16-bit-source-in-24-bit
+        # container conversion (no dither), so the padding is consistent
+        # across the whole file -- exact in both a sampled window and a
+        # full-file scan, but confidence should reflect the coverage
+        r_seg = _analyze('fake_24bit_96k.flac', 'flac', 1000, deep=False)
+        self.assertEqual(r_seg['verdict'], 'UPSCALED')
+        self.assertAlmostEqual(r_seg['confidence'], 0.9)
+        d_seg = json.loads(r_seg['details'])
+        self.assertEqual(d_seg['bit_depth']['coverage'], 'sampled')
+
+        r_deep = _analyze('fake_24bit_96k.flac', 'flac', 1000, deep=True)
+        self.assertEqual(r_deep['verdict'], 'UPSCALED')
+        self.assertAlmostEqual(r_deep['confidence'], 0.95)
+        d_deep = json.loads(r_deep['details'])
+        self.assertEqual(d_deep['bit_depth']['coverage'], 'full')
+
+    def test_genuine_file_reports_no_padding_evidence(self):
+        r = _analyze('genuine_dsd_2496.flac', 'flac', 2800)
+        d = json.loads(r['details'])
+        self.assertEqual(d['bit_depth']['container_bits'], 24)
+        self.assertEqual(d['bit_depth']['effective_bits'], 24)
+        self.assertEqual(d['bit_depth']['coverage'], 'sampled')
+        # not exact-padded, and the modal depth is above 16 -- no
+        # statistical note either, both fields describe real content
+        self.assertIsNotNone(d['bit_depth']['predominant_bit_depth'])
+        self.assertGreater(d['bit_depth']['predominant_bit_depth'], 16)
 
 
 if __name__ == '__main__':

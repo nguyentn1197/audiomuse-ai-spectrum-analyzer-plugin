@@ -29,7 +29,7 @@ N_FFT = 4096
 
 # Bump when verdict logic changes so stored results re-analyze on the next
 # non-force scan (the skip paths in jobs.py require a rev match).
-ANALYSIS_REV = 4
+ANALYSIS_REV = 5
 
 
 def analysis_rev(drop_db, segment_seconds):
@@ -499,39 +499,98 @@ SILENT_SHELF_DB = -68.0
 _STD_NYQUISTS = (22050.0, 24000.0, 44100.0, 48000.0)
 
 
-def _bit_depth_probe(path, max_seconds=30.0):
-    """(container_bits, effective_bits) from the PCM samples themselves.
+def _bit_depth_window_stats(data, bits):
+    """Per-sample trailing-zero stats for one PCM chunk: (min_bitpos,
+    hist) where hist[d] counts nonzero samples whose effective depth
+    (capped at `bits`) is d, for d in 0..32. (None, zeros) when the chunk
+    has no nonzero samples."""
+    x = np.asarray(data).ravel().astype(np.int64)  # int64: -x of INT32_MIN overflows
+    x = x[x != 0]
+    hist = np.zeros(33, dtype=np.int64)
+    if x.size < 1:
+        return None, hist
+    lowest_set_bit = (x & -x).astype(np.float64)
+    bitpos = np.log2(lowest_set_bit)
+    per_sample = np.minimum(bits, 32 - bitpos).astype(np.int64)
+    hist += np.bincount(per_sample, minlength=33)[:33]
+    return float(np.min(bitpos)), hist
+
+
+def _bit_depth_probe(path, max_seconds=30.0, full=False):
+    """(container_bits, effective_bits, predominant_bit_depth,
+    lower_bit_activity_fraction, coverage) from the PCM samples themselves.
 
     A 16-bit master padded into a 24-bit container leaves the low 8 bits of
     every sample zero; libsndfile left-justifies samples into int32, so the
-    effective depth is 32 minus the fewest trailing zero bits seen. Returns
-    (None, None) when the container has no fixed bit depth or can't be read
-    (lossy formats, ALAC-in-m4a, float WAV...).
+    effective depth is 32 minus the fewest trailing zero bits seen anywhere
+    in the window -- an exact test, since even one sample with real content
+    below the padding line rules out deterministic padding.
+
+    Alongside that exact minimum, `predominant_bit_depth` (the modal
+    per-sample depth) and `lower_bit_activity_fraction` (the fraction of
+    samples with real content below 16 bits) describe the *distribution* --
+    informational only, never a verdict trigger by themselves. They exist
+    for files that are mostly but not exactly padded: dither, gain changes,
+    SRC, or edits can all leave a few genuinely deeper samples that make the
+    exact test fail even though the file is still substantively an upscale.
+
+    full=True scans the whole file in bounded chunks (deep mode's
+    already-paid-for full pass, capped like _deep_spectrum at
+    DEEP_MAX_SECONDS) for a stronger "every sample, not just a sampled
+    window" confirmation; otherwise reads ~max_seconds from the middle, as
+    before. `coverage` is 'sampled', 'full', or 'capped' (full scan hit the
+    time budget), or None when nothing was read (container has no fixed bit
+    depth). Returns all-None when the container has no fixed bit depth or
+    can't be read (lossy formats, ALAC-in-m4a, float WAV...).
     """
     try:
         import soundfile as sf
         info = sf.info(path)
     except Exception:
-        return None, None
+        return None, None, None, None, None
     digits = ''.join(ch for ch in (info.subtype or '') if ch.isdigit())
     bits = int(digits) if digits else None
     if not bits or bits <= 16:
-        return bits, bits  # nothing to fake in a 16-bit container
+        return bits, bits, None, None, None  # nothing to fake in a 16-bit container
+
+    min_bitpos = None
+    hist = np.zeros(33, dtype=np.int64)
+    capped = False
     try:
         with sf.SoundFile(path) as f:
-            frames = int(max_seconds * f.samplerate)
-            if f.seekable() and f.frames > frames * 2:
-                f.seek((f.frames - frames) // 2)
-            data = f.read(frames, dtype='int32', always_2d=True)
+            if full:
+                chunk_frames = int(_DEEP_CHUNK_SECONDS * f.samplerate)
+                read_seconds = 0.0
+                while read_seconds < DEEP_MAX_SECONDS:
+                    data = f.read(chunk_frames, dtype='int32', always_2d=True)
+                    if data.shape[0] == 0:
+                        break
+                    read_seconds += data.shape[0] / float(f.samplerate)
+                    mn, chunk_hist = _bit_depth_window_stats(data, bits)
+                    if mn is not None:
+                        min_bitpos = mn if min_bitpos is None else min(min_bitpos, mn)
+                        hist += chunk_hist
+                    if data.shape[0] < chunk_frames:
+                        break  # ran off the end of the file
+                else:
+                    capped = True  # loop condition went false without an early break
+            else:
+                frames = int(max_seconds * f.samplerate)
+                if f.seekable() and f.frames > frames * 2:
+                    f.seek((f.frames - frames) // 2)
+                data = f.read(frames, dtype='int32', always_2d=True)
+                min_bitpos, hist = _bit_depth_window_stats(data, bits)
     except Exception:
-        return bits, None
-    x = np.asarray(data).ravel().astype(np.int64)  # int64: -x of INT32_MIN overflows
-    x = x[x != 0]
-    if x.size < 1000:
-        return bits, None  # too quiet to judge
-    lowest_set_bit = (x & -x).astype(np.float64)
-    effective = int(32 - np.min(np.log2(lowest_set_bit)))
-    return bits, min(bits, effective)
+        return bits, None, None, None, None
+
+    total = int(hist.sum())
+    if min_bitpos is None or total < 1000:
+        return bits, None, None, None, None  # too quiet to judge
+    effective = min(bits, int(32 - min_bitpos))
+    predominant = int(np.argmax(hist))
+    lower_activity = round(float(hist[17:].sum()) / total, 4)
+    coverage = ('capped' if capped else 'full') if full else 'sampled'
+    return bits, effective, predominant, lower_activity, coverage
 
 
 # Formats libsndfile reports for containers it can read natively (verified
@@ -1026,15 +1085,29 @@ def analyze_file(path, suffix=None, bitrate_kbps=None, segment_seconds=90,
             else:
                 notes.append(f'deep scan: edge variability ±{edge_var:.0f} Hz: inconclusive')
 
-    container_bits, effective_bits = _bit_depth_probe(path)
+    (container_bits, effective_bits, predominant_bit_depth,
+     lower_bit_activity_fraction, bit_depth_coverage) = _bit_depth_probe(path, full=deep)
     if (container_bits or 0) > 16 and effective_bits and effective_bits <= 16:
+        # exact test: every tested nonzero sample was padded -- the only
+        # trigger for UPSCALED. Confidence reflects how much of the file was
+        # actually tested: a sampled window vs. deep mode's full-file scan.
+        bit_depth_conf = 0.95 if bit_depth_coverage in ('full', 'capped') else 0.9
         if verdict == 'CLEAN':
             verdict = 'UPSCALED'
             est = f'{effective_bits}-bit source in a {container_bits}-bit container'
-            conf = 0.95  # zero-padded low bits are a deterministic signature
+            conf = bit_depth_conf
         else:
             notes.append(f'bit depth: only {effective_bits} effective bits in a '
-                         f'{container_bits}-bit container (padded)')
+                         f'{container_bits}-bit container (padded, {bit_depth_coverage})')
+    elif ((container_bits or 0) > 16 and predominant_bit_depth is not None
+            and predominant_bit_depth <= 16):
+        # statistical evidence only: mostly padded but not every tested
+        # sample -- informational, never a verdict trigger (dither, gain
+        # changes, SRC, or edits can all leave a few genuinely deeper samples)
+        notes.append(
+            f'bit depth: predominantly {predominant_bit_depth}-bit content in a '
+            f'{container_bits}-bit container ({lower_bit_activity_fraction * 100:.2f}% '
+            f'of samples show real content below 16 bits) -- not flagged as padded')
 
     png_b64 = _render_spectrogram(S_db, sr, offset, seg_len, cutoff_hz, img_w, img_h)
 
@@ -1074,7 +1147,10 @@ def analyze_file(path, suffix=None, bitrate_kbps=None, segment_seconds=90,
             'nyquist_hz': sr / 2.0,
             'full_bandwidth_threshold_hz': round(min(0.93 * sr / 2.0, 20500.0), 1),
             'shelf_db': round(shelf, 2) if shelf is not None else None,
-            'bit_depth': {'container_bits': container_bits, 'effective_bits': effective_bits},
+            'bit_depth': {'container_bits': container_bits, 'effective_bits': effective_bits,
+                         'predominant_bit_depth': predominant_bit_depth,
+                         'lower_bit_activity_fraction': lower_bit_activity_fraction,
+                         'coverage': bit_depth_coverage},
             'declared_bitrate_kbps': bitrate_kbps,
             'suffix': suffix,
             'deep': deep,

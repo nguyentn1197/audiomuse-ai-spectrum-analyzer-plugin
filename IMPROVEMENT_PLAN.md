@@ -415,7 +415,7 @@ have is deferred.
       changed on any fixture (full suite green, byte-for-byte) — this is a
       `details`-shape-only change, so `ANALYSIS_REV` is **not** bumped.
 
-- [ ] **Bit-depth histogram alongside — not instead of — the minimum.**
+- [x] **Bit-depth histogram alongside — not instead of — the minimum.**
       Compute the trailing-zero *distribution*, but keep the two kinds of
       evidence strictly separate: the exact test (every tested nonzero
       sample padded) is the **only** trigger for the UPSCALED verdict —
@@ -437,6 +437,31 @@ have is deferred.
       deterministic padding. Column meanings (`container_bits`/
       `effective_bits`) stay unchanged. *Cost: negligible — same samples,
       one histogram.*
+      **Shipped:** `_bit_depth_probe` now takes `full=` (deep mode passes
+      `full=deep`) and always builds a 33-bucket histogram of per-sample
+      effective bit depth (`_bit_depth_window_stats`, extracted so the math
+      is directly unit-testable) alongside the pre-existing exact minimum —
+      the exact test itself is unchanged (still "every tested nonzero
+      sample padded", still the only UPSCALED trigger). Segment mode reads
+      the same ~30 s middle window as before (`coverage: 'sampled'`,
+      confidence **0.9** when exact); deep mode chunks through the whole
+      file bounded at `DEEP_MAX_SECONDS` like `_deep_spectrum`
+      (`coverage: 'full'`, confidence **0.95** when exact, or `'capped'` —
+      still 0.95 — if the bound was hit first). When the exact test fails
+      but the histogram's mode (`predominant_bit_depth`) is still ≤ 16, a
+      note reports it plus `lower_bit_activity_fraction` (the fraction of
+      samples with real content below 16 bits) — informational only, never
+      a verdict change, exactly as scoped. `details.bit_depth` gains
+      `predominant_bit_depth`/`lower_bit_activity_fraction`/`coverage`
+      alongside the existing `container_bits`/`effective_bits`; both DB
+      columns keep their existing meaning, no migration needed. No verdict
+      changed on any fixture; the only confidence change is the previously
+      hardcoded `0.95` for exact UPSCALED, which is now `0.9` for a sampled
+      window and `0.95` only when deep mode confirms it across the whole
+      file — a real, intentional confidence correction, not drift, so
+      `ANALYSIS_REV` **is** bumped (4 → 5): existing sampled-mode UPSCALED
+      rows re-analyze on the next non-force scan and pick up the corrected
+      0.9.
 
 - [ ] **Cheap render/IO wins.**
       Drop PNG `compress_level` 9 → 6 (large CPU saving, small size delta);

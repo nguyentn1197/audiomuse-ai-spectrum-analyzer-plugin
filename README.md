@@ -48,7 +48,7 @@ A 90 s segment from the middle of the track is loaded at native sample rate, STF
 
 - cutoff ≥ ~93 % of Nyquist (capped at 20.5 kHz) → `CLEAN` — genuine 44.1 kHz masters legitimately roll off at 20–21 kHz (anti-alias filters, mastering chains), and edge sharpness measured against the Nyquist wall means nothing
 - **except** in a hi-res container (> 48 kHz): a cutoff aligning with a standard lower rate's Nyquist (22.05 / 24 / 44.1 / 48 kHz ± 5 %) — or sitting below 23 kHz at all — means a resampled source → `UPSAMPLED` (fake hi-res). Confidence 0.5 base, +0.25 for a sharp edge, +0.15 for digital silence above the cutoff. When there *is* content above the cutoff, it's checked for **aliasing images**: if it mirrors the band below the cutoff (correlation ≥ 0.6), it's a resampler artifact and confidence jumps to 0.9; otherwise it gets a "could be a genuine but dark master" note
-- **bit-depth check** (independent of the spectrum): PCM samples are probed for zero-padded low bits. A > 16-bit container carrying ≤ 16 effective bits is fake 24-bit → `UPSCALED` (0.95 — the signature is deterministic) when the spectrum is otherwise clean, or a note on the existing verdict otherwise. Effective/container bits are stored per track and shown on the album page (e.g. "16→24 bit" in red)
+- **bit-depth check** (independent of the spectrum): PCM samples are probed for zero-padded low bits. A > 16-bit container where *every* tested sample is padded down to ≤ 16 effective bits is fake 24-bit → `UPSCALED` (0.9 for a normal scan's sampled window, 0.95 when a deep scan confirms it across the whole file — the signature itself is deterministic, the confidence just reflects how much was checked) when the spectrum is otherwise clean, or a note on the existing verdict otherwise. A file that's *mostly* but not exactly padded (a few genuinely deeper samples — dither, gain changes, edits) never triggers `UPSCALED`; it gets an informational note instead. Effective/container bits are stored per track and shown on the album page (e.g. "16→24 bit" in red)
 - lossless container + low cutoff + sharp edge + **silent shelf** above the cutoff → `FAKE_SUSPECT` (estimated source class, e.g. "~128 kbps")
 - lossless container + sharp edge but audible noise above the cutoff → `LOWPASSED` (an encoder wall leaves digital silence; noise points at a genuine low-passed master)
 - lossless container + gradual rolloff → `LOWPASSED` (lower confidence)
@@ -80,7 +80,10 @@ Every track page has a collapsible **raw metrics** panel — the full evidence b
 | Field | Meaning |
 |---|---|
 | `container_bits` | The bit depth the file claims (e.g. 24-bit). |
-| `effective_bits` | The bit depth actually being used (e.g. only 16 real bits, the rest padded with zeros). A mismatch here is what triggers `UPSCALED`. |
+| `effective_bits` | The bit depth actually being used, taken from the *least*-padded sample tested (e.g. only 16 real bits, the rest padded with zeros). A mismatch here — every tested sample padded — is what triggers `UPSCALED`. |
+| `predominant_bit_depth` | The most common per-sample bit depth across the tested audio. Informational: on its own it never triggers `UPSCALED`, even when it matches `effective_bits`. |
+| `lower_bit_activity_fraction` | The fraction of samples that show real content below 16 bits. A low but nonzero value (a mostly-padded file with a few genuinely deeper samples — dither, gain changes, edits) shows up as a note, not a verdict change. |
+| `coverage` | How much of the file the bit-depth check actually read: `sampled` (~30 s window, normal scan), `full` (deep scan, whole file), or `capped` (deep scan hit its time limit). An exact `UPSCALED` hit is more confident (0.95) when confirmed by `full`/`capped` than by `sampled` (0.9). |
 
 **`integrity`** — how much of the file was actually decoded:
 
