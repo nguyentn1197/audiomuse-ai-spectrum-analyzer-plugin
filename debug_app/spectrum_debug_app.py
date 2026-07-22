@@ -120,6 +120,8 @@ class DebugApp:
         ttk.Button(toolbar, text='Add folder…', command=self._add_folder_dialog).pack(side='left', padx=4)
         ttk.Button(toolbar, text='Scan all pending (segment)',
                    command=self._scan_all_pending).pack(side='left', padx=4)
+        ttk.Button(toolbar, text='Deep scan all',
+                           command=self._deep_scan_all).pack(side='left', padx=4)
         ttk.Button(toolbar, text='Clear list', command=self._clear_list).pack(side='left', padx=4)
         self.drop_hint = ttk.Label(
             toolbar, foreground='#6b7280',
@@ -246,6 +248,14 @@ class DebugApp:
                 self.tree.set(path, 'status', 'scanning…')
                 suffix = os.path.splitext(path)[1].lstrip('.').lower()
                 fut = self.pool.submit(_scan_worker, path, suffix, entry['kbps'], False)
+                fut.add_done_callback(lambda f, p=path: self.done_queue.put((p, f)))
+
+    def _deep_scan_all(self):
+            for path, entry in self.files.items():
+                entry.update(status='scanning', mode='deep', error=None)
+                self.tree.set(path, 'status', 'scanning…')
+                suffix = os.path.splitext(path)[1].lstrip('.').lower()
+                fut = self.pool.submit(_scan_worker, path, suffix, entry['kbps'], True)
                 fut.add_done_callback(lambda f, p=path: self.done_queue.put((p, f)))
 
     def _poll_done(self):
