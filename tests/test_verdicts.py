@@ -33,6 +33,8 @@ SEGMENT_CASES = [
     ('transcoded_128as320.mp3', 'mp3', 320, 'TRANSCODED_LOSSY'),
     ('consistent_320.mp3', 'mp3', 320, 'CONSISTENT_LOSSY'),
     ('dark_master_96k.flac', 'flac', 2000, 'CLEAN'),
+    ('lossy_opus_128.ogg', 'ogg', 128, 'CONSISTENT_LOSSY'),
+    ('lossy_vorbis_q6.ogg', 'ogg', 192, 'CLEAN'),
 ]
 
 # deep (whole-file) analysis — the dark-master discriminator must never
@@ -544,6 +546,120 @@ class TestSkipSpectrogramForClean(unittest.TestCase):
                                      skip_spectrogram_for_clean=True)
         self.assertEqual(r_suspect['verdict'], 'FAKE_SUSPECT')
         self.assertTrue(len(r_suspect['spectrogram_b64']) > 1000)
+
+
+class TestAdversarialFixtures(unittest.TestCase):
+    """Minimum adversarial fixtures, scoped to Phase 1's own features (not
+    the full Phase-3 corpus) -- see tests/generate_adversarial_fixtures.py
+    and tests/README.md for how each was built."""
+
+    def test_pilot_tone_does_not_drag_up_cutoff(self):
+        # a narrow, loud 19kHz tone riding on a true 15kHz brick wall must
+        # not be mistaken for real bandwidth (robust cutoff detection); it
+        # should surface as its own nullable evidence flag instead
+        r = _analyze('pilot_tone_lowpass.flac', 'flac', 900)
+        self.assertAlmostEqual(r['cutoff_hz'], 15062.5, delta=200)
+        d = json.loads(r['details'])
+        self.assertTrue(d['evidence']['narrow_high_frequency_tone_present'])
+
+    def test_honest_lowpassed_mp3_gate_fires_at_reduced_confidence(self):
+        # a legitimately low-passed first-generation MP3 at the declared
+        # bitrate is indistinguishable from a transcode by bandwidth alone --
+        # the calibrated gate can't rule it out, so it must still flag
+        # TRANSCODED_LOSSY but never at the pre-penalty confidence, with the
+        # alternative explanation named in the notes (codec-aware gating)
+        r = _analyze('honest_lowpassed_320.mp3', 'mp3', 320)
+        self.assertEqual(r['verdict'], 'TRANSCODED_LOSSY')
+        d = json.loads(r['details'])
+        self.assertTrue(any('low-passed first-generation' in n for n in d['notes']),
+                        d['notes'])
+        full_threshold = min(0.93 * (r['sample_rate'] / 2.0), 20500.0)
+        margin = max(0.0, min(1.0, (full_threshold - r['cutoff_hz']) / full_threshold))
+        pre_penalty_conf = min(0.9, 0.55 + 0.5 * margin)
+        self.assertLess(r['confidence'], pre_penalty_conf)
+
+    def test_dithered_upscale_not_flagged_exact_but_noted_statistically(self):
+        # ~3% of samples carry genuine sub-16-bit content (simulating a
+        # 32-bit float DSP pass before a 24-bit export) -- the exact
+        # trailing-zero test must NOT fire (unlike a deterministic zero-pad),
+        # but the histogram should still surface it as an informational note
+        r = _analyze('dithered_1624.flac', 'flac', 1000)
+        self.assertEqual(r['verdict'], 'CLEAN')
+        d = json.loads(r['details'])
+        self.assertEqual(d['bit_depth']['effective_bits'], 24)  # exact test: not padded
+        self.assertEqual(d['bit_depth']['predominant_bit_depth'], 16)
+        self.assertGreater(d['bit_depth']['lower_bit_activity_fraction'], 0.0)
+        self.assertLess(d['bit_depth']['lower_bit_activity_fraction'], 0.1)
+        self.assertTrue(any('not flagged as padded' in n for n in d['notes']), d['notes'])
+
+    def test_truncated_flac_partial_windows_vs_deep_decode_failure(self):
+        # round-5 correction: expectations are per mode. Segment mode's
+        # sampled windows that happen to fall before the truncation point
+        # still decode fine -> sampled_decode_ok/sampled, NOT a detection
+        # miss. Deep mode's single large sequential read hits the corruption
+        # immediately -> decode_failed/None (INCONCLUSIVE).
+        r_seg = _analyze('truncated.flac', 'flac', 900)
+        d_seg = json.loads(r_seg['details'])
+        self.assertEqual(d_seg['integrity']['status'], 'sampled_decode_ok')
+        self.assertNotEqual(d_seg['integrity']['status'], 'full_decode_ok')
+
+        r_deep = _analyze('truncated.flac', 'flac', 900, deep=True)
+        self.assertEqual(r_deep['verdict'], 'INCONCLUSIVE')
+        self.assertFalse(r_deep['deep_eligible'])
+        d_deep = json.loads(r_deep['details'])
+        self.assertEqual(d_deep['integrity'], {'status': 'decode_failed', 'coverage': None})
+
+    def test_truncated_mp3_decodes_short_without_raising(self):
+        # documented, deliberate non-goal: an MP3 backend that returns a
+        # clean short read at EOF instead of raising is indistinguishable
+        # here from a genuinely complete file -- both modes report a normal
+        # decode-ok status even though the file is half its declared length
+        r_seg = _analyze('truncated.mp3', 'mp3', 320)
+        self.assertEqual(json.loads(r_seg['details'])['integrity']['status'],
+                         'sampled_decode_ok')
+        r_deep = _analyze('truncated.mp3', 'mp3', 320, deep=True)
+        self.assertEqual(json.loads(r_deep['details'])['integrity'],
+                         {'status': 'full_decode_ok', 'coverage': 'full'})
+
+    def test_ogg_opus_and_vorbis_codec_identified_without_ffmpeg(self):
+        # OGG/Opus and OGG/Vorbis are soundfile-native (tier 2) -- codec
+        # probe/gating must resolve them correctly with no ffmpeg involved
+        r_opus = _analyze('lossy_opus_128.ogg', 'ogg', 128)
+        self.assertEqual(json.loads(r_opus['details'])['delivery'], {'codec': 'opus'})
+        r_vorbis = _analyze('lossy_vorbis_q6.ogg', 'ogg', 192)
+        self.assertEqual(json.loads(r_vorbis['details'])['delivery'], {'codec': 'vorbis'})
+
+    def test_m4a_without_ffmpeg_degrades_to_inconclusive(self):
+        # libsndfile can't open MP4 boxes at all (tier 2 no-op) and without a
+        # real ffmpeg on PATH neither the tier-3 probe nor the ffmpeg window
+        # tier can decode it either -- must degrade gracefully to a storable
+        # INCONCLUSIVE result, never raise (this holds regardless of whether
+        # the test host happens to have ffmpeg -- the codec-probe/decode
+        # calls always invoke the literal 'ffmpeg'/'ffprobe' names, so a
+        # PATH without them exercises this path for real here)
+        import shutil
+        if shutil.which('ffmpeg'):
+            self.skipTest('ffmpeg is on PATH; see test_m4a_with_real_ffmpeg')
+        r = _analyze('lossy_aac_256.m4a', 'm4a', 256)
+        self.assertEqual(r['verdict'], 'INCONCLUSIVE')
+        self.assertFalse(r['deep_eligible'])
+
+    @unittest.skipUnless(__import__('shutil').which('ffmpeg'), 'requires ffmpeg on PATH')
+    def test_m4a_with_real_ffmpeg_resolves_codec_and_lossless_override(self):
+        # AAC: suffix and probed codec agree (lossy m4a) -> CLEAN at 256kbps,
+        # no mismatch. ALAC: suffix says lossy (.m4a) but the probed codec is
+        # genuinely lossless -> codec_mismatch flagged and is_lossless
+        # overridden to True (this is what actually fixes ALAC-in-.m4a).
+        r_aac = _analyze('lossy_aac_256.m4a', 'm4a', 256)
+        d_aac = json.loads(r_aac['details'])
+        self.assertEqual(d_aac['delivery']['codec'], 'aac')
+        self.assertNotIn('codec_mismatch', d_aac['delivery'])
+
+        r_alac = _analyze('lossless_alac.m4a', 'm4a', 900)
+        self.assertEqual(r_alac['verdict'], 'CLEAN')
+        d_alac = json.loads(r_alac['details'])
+        self.assertEqual(d_alac['delivery']['codec'], 'alac')
+        self.assertIn('codec_mismatch', d_alac['delivery'])
 
 
 if __name__ == '__main__':

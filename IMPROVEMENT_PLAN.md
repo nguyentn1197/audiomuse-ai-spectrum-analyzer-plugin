@@ -486,7 +486,7 @@ have is deferred.
       `TestSkipSpectrogramForClean` class covers both the default-off
       behavior and that only CLEAN verdicts skip rendering.
 
-- [ ] **Minimum adversarial fixtures — same PR as the features they test.**
+- [x] **Minimum adversarial fixtures — same PR as the features they test.**
       Phase 1 changes verdict behavior, so the fixture set must grow with
       it — scoped to what Phase 1 actually builds, not the full Phase-3
       corpus: a narrow ultrasonic pilot tone (robust-cutoff test), AAC and
@@ -508,6 +508,53 @@ have is deferred.
       expected verdict is never changed just to make a new threshold pass**
       — only when the old expectation is shown to be wrong.
       *Cost: development-time only.*
+
+      **Shipped:** nine new fixtures, all built from the already-committed
+      `genuine_cd_1644.flac` (no external source needed) via the new
+      `tests/generate_adversarial_fixtures.py` (numpy/soundfile only for
+      6 of the 9; the MP3/AAC/ALAC/Opus/Vorbis ones additionally need a
+      real ffmpeg, skipped gracefully with a printed note when absent).
+      `pilot_tone_lowpass.flac`: a true brick-wall 15 kHz lowpass plus a
+      narrow, loud 19 kHz tone — confirms `_find_cutoff` reports the wall,
+      not the tone, and trips `evidence.narrow_high_frequency_tone_present`
+      (tone amplitude turned out to need careful tuning — a Hann-windowed
+      STFT spreads even a stationary pure tone well past its "true" width
+      via sidelobe leakage, before the 100 Hz smoothing widens it further).
+      `honest_lowpassed_320.mp3`: single-generation 320k MP3 of the same
+      15 kHz-walled content — confirms the calibrated MP3 transcode gate
+      still fires (can't actually rule this out) but at reduced confidence
+      (~0.58, not the ~0.9 ceiling) with the low-passed-first-gen
+      alternative named, i.e. evidence not proof, as designed.
+      `lossy_opus_128.ogg`/`lossy_vorbis_q6.ogg`: soundfile-native, work
+      without ffmpeg at analysis time, confirm codec probe/gating for both.
+      `lossy_aac_256.m4a`/`lossless_alac.m4a`: need a real ffmpeg to decode
+      at all (libsndfile can't open MP4 boxes); the ALAC one is what
+      exercises the actual `codec_mismatch`/`is_lossless`-override path.
+      Since this repo's own dev/CI has no ffmpeg, the test class asserts
+      *both* sides of that fork — `shutil.which('ffmpeg')` gates which of
+      the two tests runs, so the suite is green either way and each fork
+      is exercised for real somewhere. `truncated.flac`/`truncated.mp3`:
+      byte-level half-truncation of existing fixtures surfaced two
+      different real backend behaviors worth pinning down — FLAC's decoder
+      raises ("lost sync") once a read reaches the truncation point (segment
+      mode's earlier windows still succeed → `sampled_decode_ok`; deep
+      mode's one large sequential read fails immediately →
+      `decode_failed`/INCONCLUSIVE, confirming the round-5 per-mode
+      correction above), while MP3's frame-based decoder just returns a
+      clean short read with no error at all in either mode — the
+      documented, deliberate EOF-vs-error non-goal from the container/codec
+      probe item, now shown on a real file instead of just described.
+      `dithered_1624.flac`: ~3% of samples given genuine sub-16-bit content
+      (simulating a 32-bit float DSP pass before a 24-bit export, not a
+      plain zero-pad) — confirms the exact padding test correctly stays
+      silent while the histogram's `predominant_bit_depth`/
+      `lower_bit_activity_fraction` note still surfaces it, exactly the "a
+      few genuinely deeper samples" case that mechanism was built for.
+      `TestAdversarialFixtures` in `tests/test_verdicts.py` covers all nine;
+      `tests/README.md` documents each one's calibration story. Not
+      addressed by this item (deliberately, per its own scope note above):
+      `windows_agree` calibration and the m4a 3-vs-5-window performance spot
+      check both still need a real library, not a 45s fixture.
 
 ## Phase 2 — deeper analysis in deep mode (after Phase 1 stabilizes)
 
