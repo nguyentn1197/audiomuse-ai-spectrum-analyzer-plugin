@@ -627,7 +627,7 @@ segment mode itself. All six items are logic changes on data already
 computed: no extra decode, no new subprocess, no schema change. Items 1–5
 batch into one `ANALYSIS_REV` bump (5 → 6).
 
-- [ ] **Window-consensus corroboration in the UPSAMPLED-candidate
+- [x] **Window-consensus corroboration in the UPSAMPLED-candidate
       branch.** Pass `windows_agree` and the per-window cutoff list into
       `_verdict`. In the hi-res candidate branch: ≥ 3 valid windows
       agreeing within tolerance **and** a `_resample_match` hit = a
@@ -638,8 +638,25 @@ batch into one `ANALYSIS_REV` bump (5 → 6).
       2-04/2-15 agree too, but at 28.7/28.8 kHz they never enter the
       candidate branch. This closes the 2-14 false-CLEAN at zero added
       cost. *Cost: none (evidence already computed).*
+      **Shipped, with one fixture-arbitrated correction to this item's own
+      design:** pinning is **corroboration only** (+0.15 confidence, cap
+      0.9, plus the constant-wall note), never an independent verdict
+      trigger — measurement showed `dark_master_96k` (genuine, must stay
+      CLEAN) *also* pins a constant edge (spread 727 Hz) at a
+      resample-matched 23.1 kHz; a fixed mastering low-pass pins exactly
+      like a resampler wall, and what separates them is the shelf. The
+      2-14 false-CLEAN is closed by the program-level shelf reference
+      (next item) — with it, 2-14 verdicts UPSAMPLED at 0.80 (silent
+      shelf trigger + pinned boost) with the constant-wall note. Also
+      field-calibrated `_WINDOW_AGREEMENT_TOLERANCE_HZ = 1500` for real
+      this time (walls/genuine spread 108–727 Hz, content-varying
+      2156–7617 Hz — closing the "not yet fixture-calibrated" caveat from
+      the distributed-sampling item), with one important asymmetry
+      documented in the code: a fake can still *disagree* (image leakage
+      pushed `fake_hires_44to96`'s spread to 2320 Hz), so agreement
+      corroborates a wall but disagreement proves nothing on its own.*
 
-- [ ] **Program-level shelf reference.** Measure the shelf against the
+- [x] **Program-level shelf reference.** Measure the shelf against the
       **max (or median) per-window ref** across non-silent windows
       instead of the primary window's own ref — the min-cutoff selection
       makes the primary systematically quiet, which inflates every shelf
@@ -648,8 +665,18 @@ batch into one `ANALYSIS_REV` bump (5 → 6).
       `SILENT_SHELF_DB = -68` still splits the fixture populations and
       update `tests/README.md` constants in the same PR (cross-cutting
       rule). *Cost: none.*
+      **Shipped:** max per-window ref, exposed as `details.shelf_ref_db`
+      next to the unchanged `ref_level_db` (which keeps describing the
+      reported window). This alone flips 2-14 to UPSAMPLED: its shelf
+      moves −61.9 → −77.5 dB (the max-window ref is 22.8 dB vs the quiet
+      primary's 7.2). `SILENT_SHELF_DB = -68` re-verified under the new
+      reference: fixture fakes −73…−108, dark master −56.4, genuine DSD
+      −45.6 — still cleanly split. Deep mode unchanged (one global ref).
+      The fixture suite's verdicts are unchanged; the mechanism is pinned
+      by `upsampled_quiet_intro_44to96.flac` (fixtures item below), whose
+      own-ref shelf (−51.5) would have escaped the gate.*
 
-- [ ] **Window-disagreement guard for hi-res lossless containers.** When
+- [x] **Window-disagreement guard for hi-res lossless containers.** When
       windows disagree beyond tolerance **and** the max window reaches
       the full-bandwidth threshold **and** the min window shows no
       machine signature (not sharp, shelf not silent, no alias): CLEAN
@@ -659,15 +686,45 @@ batch into one `ANALYSIS_REV` bump (5 → 6).
       keep the suspect verdict — that is the splice case the min rule
       exists for, unchanged. Fixes the 2-05 false flag without touching
       the splice detector. *Cost: none.*
+      **Shipped, with one measurement-forced correction to the
+      machine-signature list:** "shelf not silent" cannot be a guard
+      condition — under the program-level reference a genuinely quiet
+      passage's shelf *also* reads silent (2-05's measured −71.7 ≤ −68),
+      which would have blocked the guard on the exact file it exists for.
+      The measured populations are separable one level deeper: a dark
+      passage keeps an acoustic floor (−71.7) while a resampler leaves
+      *deep* digital silence (−103…−108 on the upsampled fixtures) — so
+      the guard's shelf condition is `shelf > _DEEP_SILENCE_SHELF_DB =
+      -85` (new documented constant) instead of `shelf >
+      SILENT_SHELF_DB`. Sharp stays the other signature; alias is
+      unevaluated in this branch (reported `null`, per the evidence-flag
+      contract). 2-05 now verdicts CLEAN 0.6 'variable bandwidth
+      (content-dependent)' with the disagreement note; pinned by
+      `variable_bandwidth_96k.flac` below.*
 
-- [ ] **Source-rate label from the window upper envelope.** Choose the
+- [x] **Source-rate label from the window upper envelope.** Choose the
       largest standard Nyquist matched by *any* window within the
       asymmetric `_resample_match` window, subject to no window exceeding
       it by more than the leakage margin — instead of first-match against
       the minimum window. Fixes 2-06's "44.1 kHz" → "48 kHz". *Cost:
       none.*
+      **Shipped as `_consensus_source_rate`, gated on window agreement —
+      a fixture-arbitrated narrowing of this item's own promise:** on
+      *disagreeing* windows the upper envelope is contaminated by image
+      leakage (`fake_hires_44to96`'s loud windows read ~24 kHz through
+      leakage above the true 22.05 kHz wall — the ungated envelope would
+      mislabel a 44.1 k fake as 48 k), so the envelope names the rate
+      only when the windows agree. Net effect: `fake_hires_48to96`'s
+      label is corrected ("44.1" → "48 kHz", pinned in `TestPhase1b`),
+      2-14 stays correctly 44.1 k — but 2-06 itself keeps its wrong
+      44.1 k label, because its windows disagree (spread 2156 Hz). That
+      residual is deliberate: 2-06's `agree=false` already marks it as a
+      deep-scan candidate, and deep mode's pinned-edge check is the tool
+      that names a disagreeing file's rate from whole-file evidence.
+      Alias-image rate identification still overrides the envelope when
+      it fires (images name the true rate).*
 
-- [ ] **Bandwidth wording for lossless containers.** `_estimate_source`'s
+- [x] **Bandwidth wording for lossless containers.** `_estimate_source`'s
       "~320 kbps / high-quality lossy" on a 96 k/24 FLAC (2-05's stored
       result) misleads an operator triaging thousands of rows. On the
       LOWPASSED path for a lossless container, word the estimate as
@@ -675,8 +732,13 @@ batch into one `ANALYSIS_REV` bump (5 → 6).
       for lossy containers where it means something. One branch
       condition — consistent with the standing rejection of per-codec
       wording *tables*. *Cost: none.*
+      **Shipped** exactly as scoped: both LOWPASSED returns in the
+      lossless branch use `content ends ~X kHz`; FAKE_SUSPECT keeps the
+      bitrate-class wording (there the verdict *is* claiming a lossy
+      source, so the class label is the meaningful estimate). Pinned by a
+      direct `_verdict` call in `TestPhase1b`.*
 
-- [ ] **Upsample + quiet-intro regression fixtures.** Extend
+- [x] **Upsample + quiet-intro regression fixtures.** Extend
       `tests/generate_adversarial_fixtures.py` (from the committed
       `genuine_cd_1644.flac`, ffmpeg-gated like the existing lossy ones):
       (a) 44.1 k→96 k and 48 k→96 k SRC upsamples with ffmpeg's default
@@ -686,6 +748,34 @@ batch into one `ANALYSIS_REV` bump (5 → 6).
       (c) assert the committed genuine hi-res fixtures stay CLEAN under
       items 1–3. Measured constants documented in `tests/README.md`.
       *Cost: development-time only.*
+      **Shipped as two pure-numpy fixtures (no ffmpeg needed after all —
+      an FFT-domain taper reproduces the moderate-slope wall exactly, and
+      plain (a) duplicates the committed `fake_hires_*` pair, so only the
+      novel shapes were added):** `upsampled_quiet_intro_44to96.flac` —
+      44.1→96k FFT upsample, −30 dB wall taper over ~750 Hz (edge
+      14 dB/kHz, under the 25 sharp gate by design), first 18 s (= the
+      first sampled window) 25 dB quieter with an HF tilt so the *quiet*
+      window drives the verdict, plus a seeded noise floor calibrated so
+      the shelf escapes against the quiet window's own ref (−51.5) but is
+      silent against the program ref (−73.1) — the full 2-14 mechanism in
+      one deterministic file; reverting the program-ref change flips its
+      `SEGMENT_CASES` expectation. `variable_bandwidth_96k.flac` — from
+      `genuine_dsd_2496.flac`: one 18 s dark passage (gradual rolloff,
+      window cutoff ~19.5 kHz) against otherwise full-bandwidth windows,
+      with an acoustic-floor noise keeping its shelf at −79.6 (above the
+      −85 deep-silence floor; the first calibration attempt measured
+      −84.7, a 0.3 dB margin, and was retuned — the kind of thing the
+      documented-constants discipline exists to record) — pins the
+      disagreement guard. Both in `SEGMENT_CASES` plus `TestPhase1b`
+      mechanism assertions (ref-gap arithmetic, old-ref escape, guard
+      preconditions, dark-master pinning stays CLEAN, 48 k envelope
+      label). (c) holds: every pre-existing fixture verdict unchanged,
+      full suite green. Two environment fixes landed alongside so the
+      suite is honest on a dev machine that *has* ffmpeg (skip the
+      ffmpeg-absent fallback test like the existing m4a pattern; the DSD
+      magic-bytes test now closes its tempfile before analyzing — on
+      Windows the open handle made it silently test the decode-failure
+      path instead).*
 
 Deliberately **not** adopted from the field validation, per the standing
 scope decisions: stereo coherence above the cutoff (the third party's

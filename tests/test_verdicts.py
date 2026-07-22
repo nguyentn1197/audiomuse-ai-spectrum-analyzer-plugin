@@ -35,6 +35,8 @@ SEGMENT_CASES = [
     ('dark_master_96k.flac', 'flac', 2000, 'CLEAN'),
     ('lossy_opus_128.ogg', 'ogg', 128, 'CONSISTENT_LOSSY'),
     ('lossy_vorbis_q6.ogg', 'ogg', 192, 'CLEAN'),
+    ('upsampled_quiet_intro_44to96.flac', 'flac', 2000, 'UPSAMPLED'),
+    ('variable_bandwidth_96k.flac', 'flac', 2000, 'CLEAN'),
 ]
 
 # deep (whole-file) analysis — the dark-master discriminator must never
@@ -112,10 +114,16 @@ class TestSegmentVerdicts(unittest.TestCase):
         ]
         for fmt, header in cases:
             with self.subTest(fmt=fmt):
-                with tempfile.NamedTemporaryFile(suffix=f'.{fmt}') as f:
+                # delete=False + close before analyzing: on Windows an open
+                # NamedTemporaryFile can't be reopened by _sniff_dsd, which
+                # would silently turn this into a decode-failure test
+                f = tempfile.NamedTemporaryFile(suffix=f'.{fmt}', delete=False)
+                try:
                     f.write(header)
-                    f.flush()
+                    f.close()
                     r = dsp.analyze_file(f.name, suffix=fmt, bitrate_kbps=2800)
+                finally:
+                    os.unlink(f.name)
                 self.assertEqual(r['verdict'], 'INCONCLUSIVE')
                 self.assertFalse(r['deep_eligible'])
                 d = json.loads(r['details'])
@@ -356,6 +364,8 @@ class TestDistributedSampling(unittest.TestCase):
         self.assertIsNotNone(y)
         self.assertEqual(y.size, 4410)
 
+    @unittest.skipIf(__import__('shutil').which('ffmpeg'),
+                     'ffmpeg on PATH: the windows decode for real here')
     def test_load_windows_falls_back_when_ffmpeg_absent(self):
         # duration known (simulated), but ffmpeg itself is absent -- every
         # window decode fails, so _load_windows must fall back to the single
@@ -660,6 +670,85 @@ class TestAdversarialFixtures(unittest.TestCase):
         d_alac = json.loads(r_alac['details'])
         self.assertEqual(d_alac['delivery']['codec'], 'alac')
         self.assertIn('codec_mismatch', d_alac['delivery'])
+
+
+class TestPhase1b(unittest.TestCase):
+    """Segment-mode verdict wiring (IMPROVEMENT_PLAN.md Phase 1b): the
+    program-level shelf reference, window-consensus corroboration, the
+    variable-bandwidth disagreement guard, and the envelope source-rate
+    label -- each pinned by the fixture built to reproduce the
+    field-validated failure it fixes."""
+
+    def test_quiet_intro_upscale_caught_via_program_ref(self):
+        # the field-validated false CLEAN: the verdict window is a quiet
+        # passage, and against ITS ref the shelf reads audible ("dark
+        # master?") -- against the program-level ref it is digitally silent
+        r = _analyze('upsampled_quiet_intro_44to96.flac', 'flac', 2000)
+        self.assertEqual(r['verdict'], 'UPSAMPLED')
+        d = json.loads(r['details'])
+        # the regression mechanism, not just the outcome: the program ref
+        # differs from the quiet verdict window's own ref by ~20+ dB, and
+        # under the old (own-ref) measurement the shelf would have escaped
+        # the silent-shelf gate entirely
+        self.assertGreater(d['shelf_ref_db'] - d['ref_level_db'], 15.0)
+        shelf_own_ref = r['shelf_db'] + (d['shelf_ref_db'] - d['ref_level_db'])
+        self.assertGreater(shelf_own_ref, dsp.SILENT_SHELF_DB)
+        self.assertLessEqual(r['shelf_db'], dsp.SILENT_SHELF_DB)
+        # window-consensus corroboration: all windows pin the same wall
+        self.assertIs(d['windows']['agree'], True)
+        self.assertTrue(any('constant wall' in n for n in d['notes']), d['notes'])
+        self.assertGreaterEqual(r['confidence'], 0.75)
+        self.assertIn('44.1', r['est_source'])
+
+    def test_variable_bandwidth_guard_rescues_dark_passage(self):
+        # the field-validated false LOWPASSED: one genuinely dark window
+        # drags the minimum cutoff below the full-bandwidth threshold while
+        # the other windows reach full bandwidth -- content variation, not
+        # a wall, so the guard must return CLEAN with the note (and the
+        # est must not claim a lossy bitrate class for a lossless file)
+        r = _analyze('variable_bandwidth_96k.flac', 'flac', 2000)
+        self.assertEqual(r['verdict'], 'CLEAN')
+        self.assertEqual(r['est_source'], 'variable bandwidth (content-dependent)')
+        d = json.loads(r['details'])
+        self.assertIs(d['windows']['agree'], False)
+        self.assertTrue(any('bandwidth follows the content' in n for n in d['notes']),
+                        d['notes'])
+        # the guard only fired because the min window really is below the
+        # threshold (otherwise this test pins nothing)
+        cutoffs = [w['cutoff_hz'] for w in d['windows']['samples'] if not w['silent']]
+        self.assertLess(min(cutoffs), d['full_bandwidth_threshold_hz'])
+        self.assertGreaterEqual(max(cutoffs), d['full_bandwidth_threshold_hz'])
+        # no machine signature in the verdict window: gradual edge, shelf
+        # above the deep-silence floor (a resampler's floor sits below it)
+        self.assertGreater(r['shelf_db'], dsp._DEEP_SILENCE_SHELF_DB)
+
+    def test_envelope_names_48k_for_agreeing_windows(self):
+        # 48->96 upsample: the minimum window (~23.3 kHz) first-matches the
+        # 22.05 kHz Nyquist, but the agreeing windows' upper envelope
+        # correctly names the 24 kHz (48 kHz source) wall
+        r = _analyze('fake_hires_48to96.flac', 'flac', 1400)
+        self.assertEqual(r['verdict'], 'UPSAMPLED')
+        self.assertIn('48', r['est_source'])
+
+    def test_pinned_wall_never_flips_a_dark_master(self):
+        # dark_master_96k pins too (constant mastering low-pass at a
+        # resample-matched frequency, windows agree) -- consensus must stay
+        # corroboration-only, never a verdict trigger, or every genuine
+        # dark master with a fixed mastering chain becomes UPSAMPLED
+        r = _analyze('dark_master_96k.flac', 'flac', 2000)
+        self.assertEqual(r['verdict'], 'CLEAN')
+        d = json.loads(r['details'])
+        self.assertIs(d['windows']['agree'], True)
+
+    def test_lossless_lowpassed_wording_is_bandwidth_not_bitrate(self):
+        # a lossless container on the LOWPASSED path must describe measured
+        # bandwidth, not a lossy bitrate class that contradicts the verdict
+        verdict, est, conf, notes, alias = dsp._verdict(
+            sr=44100, suffix='flac', bitrate_kbps=900, cutoff_hz=19000,
+            edge_db_khz=5.0, shelf_db=-40.0)
+        self.assertEqual(verdict, 'LOWPASSED')
+        self.assertIn('19.0 kHz', est)
+        self.assertNotIn('kbps', est)
 
 
 if __name__ == '__main__':

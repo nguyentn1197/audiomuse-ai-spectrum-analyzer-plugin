@@ -29,7 +29,7 @@ N_FFT = 4096
 
 # Bump when verdict logic changes so stored results re-analyze on the next
 # non-force scan (the skip paths in jobs.py require a rev match).
-ANALYSIS_REV = 5
+ANALYSIS_REV = 6
 
 
 def analysis_rev(drop_db, segment_seconds):
@@ -101,8 +101,14 @@ _WINDOW_MIN_SECONDS = 5.0  # viability floor, mirrors _load_segment's own bar
 _WINDOW_NEAR_SILENT_REF_DB = -85.0
 # Windows "agree" when their cutoffs fall within this spread; mirrors the
 # scale of the existing transcode-detection margin (_verdict's `expected -
-# 1500`). Not yet fixture-calibrated -- no committed fixture varies
-# bandwidth mid-track (see tests/README.md).
+# 1500`). Field-calibrated (2026-07, five real 96k tracks + fixtures):
+# constant walls and genuine full-bandwidth masters spread 108-727 Hz,
+# content-varying bandwidth spreads 2156-7617 Hz -- 1500 sits comfortably
+# between the two populations. Note agreement is asymmetric evidence: a
+# constant wall always agrees, but a fake can still *disagree* (resampler
+# image leakage pushes some windows' detected cutoffs above the wall, e.g.
+# fake_hires_44to96 spreads 2320 Hz), so agreement corroborates a wall while
+# disagreement proves nothing about genuineness on its own.
 _WINDOW_AGREEMENT_TOLERANCE_HZ = 1500.0
 
 
@@ -493,7 +499,22 @@ def _expected_cutoff_for_bitrate(bitrate_kbps):
 # refilled by 16-bit dither at re-encode, so a float-era -120 dB threshold
 # never fires). Genuine masters keep analog/tape noise well above that
 # (~-45..-65 dB relative). -68 splits the two populations.
+# The shelf is measured against the *program-level* reference (the loudest
+# sampled window's 1-8 kHz median), not the verdict window's own reference:
+# the minimum-cutoff window that drives the verdict is systematically a
+# quiet one (quiet passages carry less HF content), and a quiet window's
+# own reference inflates the shelf by the ref deficit. Field-measured on a
+# confirmed 96k upscale: shelf -61.9 dB against its quiet window's 7.2 dB
+# ref (sails past the gate) vs -77.5 dB against the 22.8 dB program ref.
 SILENT_SHELF_DB = -68.0
+
+# A quiet-but-genuine passage's shelf also reads "silent" against the
+# program-level reference (field-measured -71.7 on a real hi-res track's
+# quietest window), but a resampler leaves *deep* digital silence (measured
+# -103..-108 on the upsampled fixtures). The variable-bandwidth guard uses
+# this floor to tell the two apart: quieter than this is machine silence,
+# not just a dark passage.
+_DEEP_SILENCE_SHELF_DB = -85.0
 
 # Nyquist frequencies of the standard rates a hi-res file may be upsampled from.
 _STD_NYQUISTS = (22050.0, 24000.0, 44100.0, 48000.0)
@@ -731,6 +752,27 @@ def _resample_match(nyquist, cutoff_hz):
     return None
 
 
+def _consensus_source_rate(nyquist, window_cutoffs):
+    """Source rate named by the *upper envelope* of agreeing window cutoffs.
+    The verdict keys on the minimum window, but a wall caps the maximum:
+    when a 48 kHz-derived file's quietest window reads 23.3 kHz, the min
+    window alone first-matches 22.05 kHz while the envelope (23.5-24 kHz)
+    correctly names the 24 kHz Nyquist. Largest standard Nyquist matched by
+    any window, with no window past its leakage margin. Only meaningful
+    when the windows agree (a constant wall) -- with disagreeing windows
+    the envelope is contaminated by resampler image leakage (a 44.1->96
+    fixture's loud windows read ~24 kHz through leakage above the true
+    22.05 kHz wall), so the caller must gate this on agreement."""
+    best = None
+    for q in _STD_NYQUISTS:
+        if q > 0.75 * nyquist:
+            continue
+        if (any(-0.03 * q <= (c - q) <= 0.07 * q for c in window_cutoffs)
+                and max(window_cutoffs) <= 1.07 * q):
+            best = int(q * 2)
+    return best
+
+
 def _best_alias_match(freqs, profile, nyquist):
     """(correlation, source_rate) of the standard Nyquist whose mirrored
     bands correlate best — images mirror around the source's Nyquist, not
@@ -745,7 +787,8 @@ def _best_alias_match(freqs, profile, nyquist):
 
 
 def _verdict(sr, suffix, bitrate_kbps, cutoff_hz, edge_db_khz, shelf_db,
-             freqs=None, profile=None, is_lossless=None, codec=None):
+             freqs=None, profile=None, is_lossless=None, codec=None,
+             window_cutoffs=None, windows_agree=None):
     nyquist = sr / 2.0
     suffix = (suffix or '').lower().lstrip('.')
     # Genuine 44.1 kHz masters legitimately roll off at 20-21 kHz (ADC
@@ -775,6 +818,19 @@ def _verdict(sr, suffix, bitrate_kbps, cutoff_hz, edge_db_khz, shelf_db,
                                    else _best_alias_match(freqs, profile, nyquist))
                 aliased = corr is not None and corr >= 0.6
                 alias_image_detected = aliased
+                # a constant wall: >=3 distributed windows agreeing on the
+                # cutoff -- the segment-mode analog of deep mode's pinned
+                # edge. Corroboration (confidence + note) only, never a
+                # verdict trigger on its own: a genuine dark master with a
+                # fixed mastering low-pass pins too (dark_master_96k does,
+                # at a resample-matched frequency); what separates it from
+                # a resample is the shelf, which stays the trigger.
+                pinned = (windows_agree is True and window_cutoffs
+                          and len(window_cutoffs) >= 3)
+                if pinned:
+                    env_rate = _consensus_source_rate(nyquist, window_cutoffs)
+                    if env_rate:
+                        src_rate = env_rate  # the envelope names the wall
                 if aliased and corr_rate:
                     src_rate = corr_rate  # images name the true source rate
                 if silent_shelf or aliased or sharp:
@@ -792,7 +848,15 @@ def _verdict(sr, suffix, bitrate_kbps, cutoff_hz, edge_db_khz, shelf_db,
                                      f'below (correlation {corr:.2f}): resampler '
                                      f'aliasing images')
                         conf = max(conf, 0.9)
-                    elif not silent_shelf:
+                    if pinned:
+                        spread = max(window_cutoffs) - min(window_cutoffs)
+                        notes.append(
+                            f'the cutoff sits at the same frequency in all '
+                            f'{len(window_cutoffs)} sampled windows (spread '
+                            f'{spread:.0f} Hz): a constant wall, not content '
+                            f'that fades with the music')
+                        conf = min(0.9, conf + 0.15)
+                    if not (aliased or pinned or silent_shelf):
                         notes.append('some content above the cutoff: '
                                      'could be a genuine but dark master')
                     return 'UPSAMPLED', est, conf, notes, alias_image_detected
@@ -815,10 +879,33 @@ def _verdict(sr, suffix, bitrate_kbps, cutoff_hz, edge_db_khz, shelf_db,
         if sharp and silent_shelf:
             conf = min(0.95, 0.6 + 0.5 * margin + min(0.15, (edge_db_khz - 25.0) / 200.0))
             return 'FAKE_SUSPECT', est, conf, notes, alias_image_detected
+        # LOWPASSED on a lossless container says "not a transcode", so a
+        # lossy-bitrate-class label would contradict the verdict it rides
+        # on -- word it as what was actually measured.
+        est = f'content ends ~{cutoff_hz / 1000.0:.1f} kHz'
         if sharp:
             notes.append('sharp edge but audible noise floor above the cutoff: '
                          'more likely a low-passed master than an encoder wall')
             return 'LOWPASSED', est, 0.5 + 0.3 * margin, notes, alias_image_detected
+        # hi-res container whose sampled windows *disagree* while the widest
+        # reaches full bandwidth: the minimum window is a quiet passage with
+        # naturally less HF content, not a wall (a wall is constant across
+        # windows). Requires no machine signature in the verdict window --
+        # not sharp (checked above) and not *deep* digital silence above the
+        # cutoff (a quiet-but-genuine passage reads "silent" against the
+        # program-level reference too, ~-72 dB field-measured, but a
+        # resampler's floor sits far deeper, -103..-108 on the fixtures).
+        if (nyquist > 24000.0 and windows_agree is False and window_cutoffs
+                and max(window_cutoffs) >= full_threshold
+                and (shelf_db is None or shelf_db > _DEEP_SILENCE_SHELF_DB)):
+            notes.append(
+                f'sampled windows disagree (cutoffs '
+                f'{min(window_cutoffs) / 1000.0:.1f}-'
+                f'{max(window_cutoffs) / 1000.0:.1f} kHz) and the widest '
+                f'reaches full bandwidth: bandwidth follows the content, '
+                f'not a constant wall')
+            return ('CLEAN', 'variable bandwidth (content-dependent)', 0.6,
+                    notes, alias_image_detected)
         notes.append('gradual rolloff: could be a genuine low-passed master, not a transcode')
         return 'LOWPASSED', est, 0.45 + 0.3 * margin, notes, alias_image_detected
 
@@ -1002,6 +1089,8 @@ def analyze_file(path, suffix=None, bitrate_kbps=None, segment_seconds=90,
     capped = chunk_error = False
     windows_detail = None
     windows_agree = None
+    window_cutoffs = None
+    program_ref = None
     try:
         if deep:
             (S_db, profile, freqs, sr, seg_len, edge_series,
@@ -1025,6 +1114,11 @@ def analyze_file(path, suffix=None, bitrate_kbps=None, segment_seconds=90,
             valid = [w for w in scored if not w['silent']] or scored
             primary = min(valid, key=lambda w: w['cutoff_hz'])
             cutoffs = [w['cutoff_hz'] for w in valid]
+            window_cutoffs = cutoffs
+            # program-level reference for the shelf: the loudest window's
+            # 1-8 kHz median (see the SILENT_SHELF_DB comment for why the
+            # primary window's own ref is systematically biased quiet)
+            program_ref = max(w['ref'] for w in valid)
             windows_agree = ((max(cutoffs) - min(cutoffs) <= _WINDOW_AGREEMENT_TOLERANCE_HZ)
                              if len(cutoffs) > 1 else None)
             windows_detail = [{'offset': round(w['offset'], 2),
@@ -1056,12 +1150,14 @@ def analyze_file(path, suffix=None, bitrate_kbps=None, segment_seconds=90,
 
     if deep:
         cutoff_hz, ref, narrow_tone = _find_cutoff(freqs, profile, drop_db)
+    shelf_ref = ref if program_ref is None else program_ref
     edge = _edge_sharpness(freqs, profile, cutoff_hz)
-    shelf = _shelf_level(freqs, profile, cutoff_hz, ref)
+    shelf = _shelf_level(freqs, profile, cutoff_hz, shelf_ref)
     verdict, est, conf, notes, alias_image_detected = _verdict(
         sr, suffix, bitrate_kbps, cutoff_hz, edge, shelf,
         freqs=freqs, profile=profile,
-        is_lossless=detected_lossless, codec=gate_codec)
+        is_lossless=detected_lossless, codec=gate_codec,
+        window_cutoffs=window_cutoffs, windows_agree=windows_agree)
 
     if deep:
         if edge_var is None:
@@ -1154,6 +1250,7 @@ def analyze_file(path, suffix=None, bitrate_kbps=None, segment_seconds=90,
         'deep_eligible': True,
         'details': json.dumps({
             'ref_level_db': round(ref, 2),
+            'shelf_ref_db': round(shelf_ref, 2),
             'drop_db': drop_db,
             'nyquist_hz': sr / 2.0,
             'full_bandwidth_threshold_hz': round(min(0.93 * sr / 2.0, 20500.0), 1),
