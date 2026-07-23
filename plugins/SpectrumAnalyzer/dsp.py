@@ -27,15 +27,50 @@ LOSSY_SUFFIXES = {'mp3', 'ogg', 'opus', 'aac', 'm4a', 'mp4', 'wma', 'mpc'}
 
 N_FFT = 4096
 
+# Bump when verdict logic changes so stored results re-analyze on the next
+# non-force scan (the skip paths in jobs.py require a rev match).
+ANALYSIS_REV = 6
+
+
+def analysis_rev(drop_db, segment_seconds):
+    """Revision stamp stored with each result: the analyzer constant folded
+    with the verdict-relevant settings (rendering settings excluded)."""
+    return f'r{ANALYSIS_REV}-d{drop_db}-s{segment_seconds}'
+
 # Deep scan: analyze the whole file in chunks (bounded so a mislabelled
 # 10-hour stream can't eat the worker).
 DEEP_MAX_SECONDS = 1800
 _DEEP_CHUNK_SECONDS = 120
 
 
+def _sniff_dsd(path):
+    """Recognize DSF/DFF by magic bytes, before any decode is attempted.
+
+    librosa's audioread/ffmpeg fallback will happily decode DSD to PCM, but
+    the noise-shaped 1-bit modulator content reads as full-bandwidth audio to
+    the spectrum heuristics (a lossy-sourced fake DSD would pass as CLEAN).
+    Returns 'dsf', 'dff', or None; suffix-independent since a mislabeled file
+    would otherwise slip past a suffix-based check."""
+    try:
+        with open(path, 'rb') as f:
+            head = f.read(16)
+    except OSError:
+        return None
+    if head[:4] == b'DSD ':
+        return 'dsf'
+    if head[:4] == b'FRM8' and head[12:16] == b'DSD ':
+        return 'dff'
+    return None
+
+
 def _load_segment(path, segment_seconds):
-    """Load a mono segment at native sample rate. Prefer the middle of the
-    track (skip intros/fades); fall back to the start for short files."""
+    """Load a single mono segment at native sample rate via librosa. This is
+    now only the last-resort fallback for distributed segment sampling
+    (_load_windows) -- used when a track's duration can't be determined at
+    all, is too short to distribute across several windows, or every
+    windowed decode attempt failed (e.g. ffmpeg missing for a non-seekable
+    container). Not "the middle of the track": offset 30s, falling back to
+    0s for short files."""
     import librosa
 
     for offset in (30.0, 0.0):
@@ -49,6 +84,145 @@ def _load_segment(path, segment_seconds):
     if y is not None and sr and y.size > 0:
         return y, int(sr), 0.0
     raise ValueError('could not decode audio (empty signal)')
+
+
+# Distributed segment sampling: several shorter windows spread through the
+# track instead of one fixed-offset segment, so a single low-bandwidth
+# passage can't be missed by sampling bad luck. Natively seekable containers
+# (FLAC/WAV/AIFF/MP3/OGG via SoundFile) cost nothing extra per window, so get
+# 5; everything else needs an ffmpeg subprocess per window, so starts at 3
+# (round-5 decision -- a real-library perf spot check decides whether to
+# raise it, see IMPROVEMENT_PLAN.md).
+_NATIVE_WINDOW_POSITIONS = (0.10, 0.30, 0.50, 0.70, 0.85)
+_FFMPEG_WINDOW_POSITIONS = (0.20, 0.50, 0.80)
+_WINDOW_MIN_SECONDS = 5.0  # viability floor, mirrors _load_segment's own bar
+# Conservative on purpose: only true silence/dropouts should be skipped, not
+# quiet-but-real content (a quiet classical passage is diagnostically valid).
+_WINDOW_NEAR_SILENT_REF_DB = -85.0
+# Windows "agree" when their cutoffs fall within this spread; mirrors the
+# scale of the existing transcode-detection margin (_verdict's `expected -
+# 1500`). Field-calibrated (2026-07, five real 96k tracks + fixtures):
+# constant walls and genuine full-bandwidth masters spread 108-727 Hz,
+# content-varying bandwidth spreads 2156-7617 Hz -- 1500 sits comfortably
+# between the two populations. Note agreement is asymmetric evidence: a
+# constant wall always agrees, but a fake can still *disagree* (resampler
+# image leakage pushes some windows' detected cutoffs above the wall, e.g.
+# fake_hires_44to96 spreads 2320 Hz), so agreement corroborates a wall while
+# disagreement proves nothing about genuineness on its own.
+_WINDOW_AGREEMENT_TOLERANCE_HZ = 1500.0
+
+
+def _soundfile_duration(path):
+    """Track duration in seconds via a SoundFile header read (no decode), or
+    None if soundfile can't open the file at all."""
+    try:
+        import soundfile as sf
+        info = sf.info(path)
+        if info.frames and info.samplerate:
+            return info.frames / float(info.samplerate)
+    except Exception:
+        pass
+    return None
+
+
+def _read_window_soundfile(path, offset_s, duration_s):
+    """One window via SoundFile seek-and-read (cheap, no subprocess). Returns
+    (mono float32 array, sample_rate) or (None, None) on any failure."""
+    import soundfile as sf
+    try:
+        info = sf.info(path)
+        start = int(offset_s * info.samplerate)
+        frames = int(duration_s * info.samplerate)
+        y, sr = sf.read(path, start=start, frames=frames, dtype='float32',
+                        always_2d=True)
+    except Exception:
+        return None, None
+    if y is None or y.size == 0:
+        return None, None
+    return np.ascontiguousarray(y.mean(axis=1), dtype=np.float32), int(sr)
+
+
+def _read_window_ffmpeg(path, offset_s, duration_s, sr, timeout=30.0):
+    """One window via ffmpeg input-seeking (-ss before -i: seeks, doesn't
+    decode from the start), for containers SoundFile can't open at all
+    (m4a/mp4/ogg-opus/wma/mpc). `sr` is the source's own sample rate (from
+    _probe_ffprobe) -- requested explicitly so the raw f32le output can be
+    reshaped without guessing. Returns a mono float32 array, or None on any
+    failure: missing binary, timeout, non-zero exit, empty output."""
+    import subprocess
+    try:
+        proc = subprocess.run(
+            ['ffmpeg', '-v', 'error', '-ss', f'{offset_s:.3f}',
+             '-t', f'{duration_s:.3f}', '-i', path,
+             '-f', 'f32le', '-ac', '1', '-ar', str(sr), 'pipe:1'],
+            capture_output=True, timeout=timeout,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0 or not proc.stdout:
+        return None
+    y = np.frombuffer(proc.stdout, dtype='<f4')
+    return y if y.size else None
+
+
+def _window_offsets(duration, positions, window_seconds):
+    """Start offset for each relative position, clipped into a valid range
+    and deduplicated (short files: distinct positions can collapse onto
+    nearly the same audio -- keep only one when offsets land within 1s of
+    each other)."""
+    max_offset = max(0.0, duration - window_seconds)
+    offsets = []
+    for p in positions:
+        off = min(max_offset, max(0.0, p * duration - window_seconds / 2.0))
+        if not offsets or off - offsets[-1] > 1.0:
+            offsets.append(off)
+    return offsets
+
+
+def _is_near_silent(profile, freqs):
+    """True if a window is near-total silence (dropout, encoder-padded gap),
+    not merely quiet content. Same 1-8kHz reference-band convention as
+    _shelf_level/_deep_spectrum."""
+    band = profile[(freqs >= 1000) & (freqs <= 8000)]
+    ref = float(np.median(band)) if band.size else float(np.max(profile))
+    return ref <= _WINDOW_NEAR_SILENT_REF_DB, ref
+
+
+def _load_windows(path, segment_seconds, native_seekable, ffprobe_info):
+    """Distributed multi-window sampling. Returns a list of (y, sr, offset)
+    triples -- one or more. Falls back to the single _load_segment window
+    when duration can't be determined, the track is too short to distribute
+    meaningfully, or every window in the chosen tier fails to decode (e.g.
+    ffmpeg missing) -- 'fall back to fewer/earlier windows' taken to its
+    simplest honest limit: the one proven single-window path. Never raises
+    except through that same final _load_segment call."""
+    if native_seekable:
+        duration = _soundfile_duration(path)
+    else:
+        duration = ffprobe_info.get('duration') if ffprobe_info else None
+
+    if not duration or duration < _WINDOW_MIN_SECONDS * 2:
+        y, sr, off = _load_segment(path, segment_seconds)
+        return [(y, sr, off)]
+
+    positions = _NATIVE_WINDOW_POSITIONS if native_seekable else _FFMPEG_WINDOW_POSITIONS
+    window_seconds = max(_WINDOW_MIN_SECONDS, segment_seconds / len(positions))
+    offsets = _window_offsets(duration, positions, window_seconds)
+
+    windows = []
+    for off in offsets:
+        if native_seekable:
+            y, sr = _read_window_soundfile(path, off, window_seconds)
+        else:
+            sr = ffprobe_info.get('sample_rate') if ffprobe_info else None
+            y = _read_window_ffmpeg(path, off, window_seconds, sr) if sr else None
+        if y is not None and sr and y.size >= sr * _WINDOW_MIN_SECONDS:
+            windows.append((y, int(sr), off))
+
+    if windows:
+        return windows
+    y, sr, off = _load_segment(path, segment_seconds)
+    return [(y, sr, off)]
 
 
 def _spectrum(y, sr):
@@ -78,12 +252,14 @@ def _deep_spectrum(path, drop_db):
     sr = None
     total = 0.0
     t = 0.0
+    chunk_error = False
 
     while total < DEEP_MAX_SECONDS:
         try:
             y, y_sr = librosa.load(path, sr=None, mono=True, offset=t,
                                    duration=_DEEP_CHUNK_SECONDS)
         except Exception:
+            chunk_error = True  # decode error, not a clean end-of-file signal
             break
         if y is None or not y_sr or y.size < y_sr:  # under 1 s left
             break
@@ -105,7 +281,7 @@ def _deep_spectrum(path, drop_db):
             wband = win[(freqs >= 1000) & (freqs <= 8000)]
             if not wband.size or float(np.median(wband)) < chunk_ref - 25.0:
                 continue  # quiet second: the edge position is meaningless
-            c, _ = _find_cutoff(freqs, win, drop_db)
+            c, _, _ = _find_cutoff(freqs, win, drop_db)
             edge_cutoffs.append(c)
         # ~1 column per second, max-pooled so peaks survive
         display.append(np.maximum.reduceat(S_db, starts, axis=1))
@@ -119,22 +295,138 @@ def _deep_spectrum(path, drop_db):
     if profile is None or sr is None or total < 5.0:
         raise ValueError('could not decode audio for deep analysis')
     freqs = np.linspace(0, sr / 2.0, profile.shape[0])
-    return np.concatenate(display, axis=1), profile, freqs, sr, total, edge_cutoffs
+    capped = total >= DEEP_MAX_SECONDS
+    return (np.concatenate(display, axis=1), profile, freqs, sr, total,
+            edge_cutoffs, capped, chunk_error)
+
+
+# Cutoff-detection widths, all specified in hertz and converted to bins from
+# each file's actual bin resolution (sr/N_FFT) -- a fixed bin count would
+# mean ~160 Hz at 44.1 kHz but ~1.2 kHz at 96 kHz. Initial values picked
+# during fixture calibration, recalibrated together since they interact
+# (smoothing changes what "sharp" means for _edge_sharpness too).
+_CUTOFF_SMOOTH_HZ = 100.0
+_CUTOFF_MIN_WIDTH_HZ = 250.0
+_CUTOFF_MAX_GAP_HZ = 120.0
+_CUTOFF_OCCUPANCY_FRAC = 0.75
+# Narrower than a real sustained band: an isolated run this short is a pilot
+# tone or numerical spike, not bandwidth -- excluded before gap-closing so it
+# can't get bridged into a genuine band and drag the reported cutoff up.
+_CUTOFF_TONE_MAX_WIDTH_HZ = 80.0
+
+
+def _hz_to_bins(width_hz, bin_hz):
+    return max(1, int(round(width_hz / bin_hz))) if bin_hz > 0 else 1
+
+
+def _smooth_profile(profile, bin_hz, smooth_hz=_CUTOFF_SMOOTH_HZ):
+    """Light moving-average smoothing so a single noisy bin can't flip the
+    threshold mask; edge-replicated padding keeps the array length and
+    avoids pulling boundary bins toward zero."""
+    w = _hz_to_bins(smooth_hz, bin_hz)
+    if w <= 1 or profile.size < 2:
+        return profile
+    kernel = np.ones(w) / w
+    padded = np.pad(profile, (w // 2, w - 1 - w // 2), mode='edge')
+    return np.convolve(padded, kernel, mode='valid')
+
+
+def _exclude_narrow_tones(mask, freqs, tone_max_bins):
+    """Zero out isolated True-runs shorter than `tone_max_bins` -- too narrow
+    to be real sustained bandwidth. Flags (but excludes regardless of
+    location) only when the run sits at/above 8 kHz, matching the reference
+    band's upper edge: that's the region where a pilot tone or spike could
+    otherwise be mistaken for cutoff-extending content."""
+    out = mask.copy()
+    tone_present = False
+    n = mask.size
+    i = 0
+    while i < n:
+        if out[i]:
+            j = i
+            while j < n and out[j]:
+                j += 1
+            if j - i < tone_max_bins:
+                out[i:j] = False
+                if freqs[i] >= 8000.0:
+                    tone_present = True
+            i = j
+        else:
+            i += 1
+    return out, tone_present
+
+
+def _close_gaps(mask, max_gap_bins):
+    """Bridge interior False-runs of at most `max_gap_bins` (harmonic gaps
+    and notches are normal in real spectra); leading/trailing gaps -- no True
+    bin on one side -- are left alone."""
+    if max_gap_bins <= 0:
+        return mask
+    out = mask.copy()
+    n = mask.size
+    i = 0
+    while i < n:
+        if not out[i]:
+            j = i
+            while j < n and not out[j]:
+                j += 1
+            if 0 < i and j < n and (j - i) <= max_gap_bins:
+                out[i:j] = True
+            i = j
+        else:
+            i += 1
+    return out
+
+
+def _sliding_occupancy(mask, w):
+    """Fraction of True bins in a trailing window of width `w` ending at each
+    index (via a cumulative sum -- windows near index 0 are shorter)."""
+    n = mask.size
+    if w <= 1:
+        return mask.astype(np.float64)
+    cum = np.concatenate(([0.0], np.cumsum(mask.astype(np.float64))))
+    idx = np.arange(n)
+    start = np.maximum(0, idx - w + 1)
+    counts = cum[idx + 1] - cum[start]
+    lengths = (idx - start + 1).astype(np.float64)
+    return counts / lengths
 
 
 def _find_cutoff(freqs, profile, drop_db):
     """Highest frequency whose level stays within `drop_db` of the reference
-    (median level of the 1-8 kHz band), sustained over 3 consecutive bins."""
+    (median level of the 1-8 kHz band), over a band at least
+    `_CUTOFF_MIN_WIDTH_HZ` wide where `_CUTOFF_OCCUPANCY_FRAC` of bins are
+    above threshold (gaps up to `_CUTOFF_MAX_GAP_HZ` bridged first) -- real
+    spectra have harmonic gaps/notches, so an unbroken run is too strict, but
+    a lone narrow tone must not count as bandwidth either.
+
+    Returns (cutoff_hz, ref_db, narrow_tone_present).
+    """
     band = profile[(freqs >= 1000) & (freqs <= 8000)]
     ref = float(np.median(band)) if band.size else float(np.max(profile))
-    above = profile >= (ref - drop_db)
-    if above.size < 3:
-        return float(freqs[-1]), ref
-    runs = above[:-2] & above[1:-1] & above[2:]
-    idx = np.where(runs)[0]
-    if idx.size == 0:
-        return float(freqs[int(np.argmax(profile))]), ref
-    return float(freqs[int(idx[-1]) + 2]), ref
+    n = profile.size
+    if n < 3:
+        return float(freqs[-1]), ref, False
+
+    bin_hz = float(freqs[1] - freqs[0])
+    smoothed = _smooth_profile(profile, bin_hz)
+    above = smoothed >= (ref - drop_db)
+
+    tone_max_bins = _hz_to_bins(_CUTOFF_TONE_MAX_WIDTH_HZ, bin_hz)
+    above, tone_present = _exclude_narrow_tones(above, freqs, tone_max_bins)
+
+    max_gap_bins = _hz_to_bins(_CUTOFF_MAX_GAP_HZ, bin_hz)
+    closed = _close_gaps(above, max_gap_bins)
+
+    min_width_bins = min(_hz_to_bins(_CUTOFF_MIN_WIDTH_HZ, bin_hz), n)
+    occ = _sliding_occupancy(closed, min_width_bins)
+    passing = np.where(occ >= _CUTOFF_OCCUPANCY_FRAC)[0]
+    if passing.size == 0:
+        idx = np.where(closed)[0]
+        if idx.size == 0:
+            return float(freqs[int(np.argmax(profile))]), ref, tone_present
+        return float(freqs[int(idx[-1])]), ref, tone_present
+    return float(freqs[int(passing[-1])]), ref, tone_present
 
 
 def _edge_sharpness(freqs, profile, cutoff_hz):
@@ -142,16 +434,17 @@ def _edge_sharpness(freqs, profile, cutoff_hz):
     is a near-vertical wall; a natural rolloff is gradual. Near Nyquist the
     upper band is truncated and every rolloff looks like a wall, so the
     measurement needs at least ~500 Hz of band above the cutoff to mean
-    anything."""
+    anything -- returns None (not measured) rather than a misleading 0.0
+    when it can't, mirroring _shelf_level's contract."""
     nyquist = float(freqs[-1])
     hi_top = min(cutoff_hz + 1500, nyquist)
     span_khz = (hi_top - cutoff_hz) / 1000.0
     if span_khz < 0.5:
-        return 0.0
+        return None
     lo = profile[(freqs >= cutoff_hz - 1000) & (freqs < cutoff_hz)]
     hi = profile[(freqs > cutoff_hz) & (freqs <= hi_top)]
     if lo.size == 0 or hi.size == 0:
-        return 0.0
+        return None
     return float((np.mean(lo) - np.mean(hi)) / (0.5 + span_khz / 2.0))
 
 
@@ -181,7 +474,10 @@ def _estimate_source(cutoff_hz):
 
 def _expected_cutoff_for_bitrate(bitrate_kbps):
     """Rough lower bound of the cutoff a *first-generation* lossy file of this
-    bitrate should reach. Used to flag lossy->lossy transcodes."""
+    bitrate should reach. Used to flag lossy->lossy transcodes. Calibrated on
+    MP3/LAME fixtures only -- gating this table's verdict-changing effect to
+    _CALIBRATED_TRANSCODE_CODECS is the caller's job (_verdict), not this
+    function's."""
     if not bitrate_kbps:
         return None
     if bitrate_kbps >= 300:
@@ -203,45 +499,223 @@ def _expected_cutoff_for_bitrate(bitrate_kbps):
 # refilled by 16-bit dither at re-encode, so a float-era -120 dB threshold
 # never fires). Genuine masters keep analog/tape noise well above that
 # (~-45..-65 dB relative). -68 splits the two populations.
+# The shelf is measured against the *program-level* reference (the loudest
+# sampled window's 1-8 kHz median), not the verdict window's own reference:
+# the minimum-cutoff window that drives the verdict is systematically a
+# quiet one (quiet passages carry less HF content), and a quiet window's
+# own reference inflates the shelf by the ref deficit. Field-measured on a
+# confirmed 96k upscale: shelf -61.9 dB against its quiet window's 7.2 dB
+# ref (sails past the gate) vs -77.5 dB against the 22.8 dB program ref.
 SILENT_SHELF_DB = -68.0
+
+# A quiet-but-genuine passage's shelf also reads "silent" against the
+# program-level reference (field-measured -71.7 on a real hi-res track's
+# quietest window), but a resampler leaves *deep* digital silence (measured
+# -103..-108 on the upsampled fixtures). The variable-bandwidth guard uses
+# this floor to tell the two apart: quieter than this is machine silence,
+# not just a dark passage.
+_DEEP_SILENCE_SHELF_DB = -85.0
 
 # Nyquist frequencies of the standard rates a hi-res file may be upsampled from.
 _STD_NYQUISTS = (22050.0, 24000.0, 44100.0, 48000.0)
 
 
-def _bit_depth_probe(path, max_seconds=30.0):
-    """(container_bits, effective_bits) from the PCM samples themselves.
+def _bit_depth_window_stats(data, bits):
+    """Per-sample trailing-zero stats for one PCM chunk: (min_bitpos,
+    hist) where hist[d] counts nonzero samples whose effective depth
+    (capped at `bits`) is d, for d in 0..32. (None, zeros) when the chunk
+    has no nonzero samples."""
+    x = np.asarray(data).ravel().astype(np.int64)  # int64: -x of INT32_MIN overflows
+    x = x[x != 0]
+    hist = np.zeros(33, dtype=np.int64)
+    if x.size < 1:
+        return None, hist
+    lowest_set_bit = (x & -x).astype(np.float64)
+    bitpos = np.log2(lowest_set_bit)
+    per_sample = np.minimum(bits, 32 - bitpos).astype(np.int64)
+    hist += np.bincount(per_sample, minlength=33)[:33]
+    return float(np.min(bitpos)), hist
+
+
+def _bit_depth_probe(path, max_seconds=30.0, full=False):
+    """(container_bits, effective_bits, predominant_bit_depth,
+    lower_bit_activity_fraction, coverage) from the PCM samples themselves.
 
     A 16-bit master padded into a 24-bit container leaves the low 8 bits of
     every sample zero; libsndfile left-justifies samples into int32, so the
-    effective depth is 32 minus the fewest trailing zero bits seen. Returns
-    (None, None) when the container has no fixed bit depth or can't be read
-    (lossy formats, ALAC-in-m4a, float WAV...).
+    effective depth is 32 minus the fewest trailing zero bits seen anywhere
+    in the window -- an exact test, since even one sample with real content
+    below the padding line rules out deterministic padding.
+
+    Alongside that exact minimum, `predominant_bit_depth` (the modal
+    per-sample depth) and `lower_bit_activity_fraction` (the fraction of
+    samples with real content below 16 bits) describe the *distribution* --
+    informational only, never a verdict trigger by themselves. They exist
+    for files that are mostly but not exactly padded: dither, gain changes,
+    SRC, or edits can all leave a few genuinely deeper samples that make the
+    exact test fail even though the file is still substantively an upscale.
+
+    full=True scans the whole file in bounded chunks (deep mode's
+    already-paid-for full pass, capped like _deep_spectrum at
+    DEEP_MAX_SECONDS) for a stronger "every sample, not just a sampled
+    window" confirmation; otherwise reads ~max_seconds from the middle, as
+    before. `coverage` is 'sampled', 'full', or 'capped' (full scan hit the
+    time budget), or None when nothing was read (container has no fixed bit
+    depth). Returns all-None when the container has no fixed bit depth or
+    can't be read (lossy formats, ALAC-in-m4a, float WAV...).
     """
     try:
         import soundfile as sf
         info = sf.info(path)
     except Exception:
-        return None, None
+        return None, None, None, None, None
     digits = ''.join(ch for ch in (info.subtype or '') if ch.isdigit())
     bits = int(digits) if digits else None
     if not bits or bits <= 16:
-        return bits, bits  # nothing to fake in a 16-bit container
+        return bits, bits, None, None, None  # nothing to fake in a 16-bit container
+
+    min_bitpos = None
+    hist = np.zeros(33, dtype=np.int64)
+    capped = False
     try:
         with sf.SoundFile(path) as f:
-            frames = int(max_seconds * f.samplerate)
-            if f.seekable() and f.frames > frames * 2:
-                f.seek((f.frames - frames) // 2)
-            data = f.read(frames, dtype='int32', always_2d=True)
+            if full:
+                chunk_frames = int(_DEEP_CHUNK_SECONDS * f.samplerate)
+                read_seconds = 0.0
+                while read_seconds < DEEP_MAX_SECONDS:
+                    data = f.read(chunk_frames, dtype='int32', always_2d=True)
+                    if data.shape[0] == 0:
+                        break
+                    read_seconds += data.shape[0] / float(f.samplerate)
+                    mn, chunk_hist = _bit_depth_window_stats(data, bits)
+                    if mn is not None:
+                        min_bitpos = mn if min_bitpos is None else min(min_bitpos, mn)
+                        hist += chunk_hist
+                    if data.shape[0] < chunk_frames:
+                        break  # ran off the end of the file
+                else:
+                    capped = True  # loop condition went false without an early break
+            else:
+                frames = int(max_seconds * f.samplerate)
+                if f.seekable() and f.frames > frames * 2:
+                    f.seek((f.frames - frames) // 2)
+                data = f.read(frames, dtype='int32', always_2d=True)
+                min_bitpos, hist = _bit_depth_window_stats(data, bits)
     except Exception:
-        return bits, None
-    x = np.asarray(data).ravel().astype(np.int64)  # int64: -x of INT32_MIN overflows
-    x = x[x != 0]
-    if x.size < 1000:
-        return bits, None  # too quiet to judge
-    lowest_set_bit = (x & -x).astype(np.float64)
-    effective = int(32 - np.min(np.log2(lowest_set_bit)))
-    return bits, min(bits, effective)
+        return bits, None, None, None, None
+
+    total = int(hist.sum())
+    if min_bitpos is None or total < 1000:
+        return bits, None, None, None, None  # too quiet to judge
+    effective = min(bits, int(32 - min_bitpos))
+    predominant = int(np.argmax(hist))
+    lower_activity = round(float(hist[17:].sum()) / total, 4)
+    coverage = ('capped' if capped else 'full') if full else 'sampled'
+    return bits, effective, predominant, lower_activity, coverage
+
+
+# Formats libsndfile reports for containers it can read natively (verified
+# against this repo's fixtures: libsndfile 1.2.2 reports 'FLAC' and 'MP3'
+# distinctly, so this is a real signal, not a guess).
+_SNDFILE_LOSSLESS_FORMATS = {'FLAC', 'WAV', 'WAVEX', 'AIFF', 'W64', 'CAF', 'RF64'}
+_SNDFILE_LOSSY_FORMATS = {'MP3', 'OGG'}
+
+# soundfile.info().subtype for the lossy formats above names the actual
+# codec for free (verified: 'MPEG_LAYER_III' for this repo's MP3 fixtures) -
+# no subprocess needed for the common case.
+_SNDFILE_SUBTYPE_CODEC = {'MPEG_LAYER_III': 'mp3', 'MPEG_LAYER_II': 'mp2',
+                          'VORBIS': 'vorbis', 'OPUS': 'opus'}
+
+
+def _probe_container(path):
+    """Tier 2 of the codec probe: identify the actual container/codec for
+    formats libsndfile can read natively, independent of a (possibly wrong)
+    file extension. Returns (detected_format, is_lossless, codec), or
+    (None, None, None) when soundfile can't open the file at all
+    (m4a/opus/wma/mpc - tier 3, _probe_ffprobe)."""
+    try:
+        import soundfile as sf
+        info = sf.info(path)
+    except Exception:
+        return None, None, None
+    fmt = (info.format or '').upper()
+    if fmt in _SNDFILE_LOSSLESS_FORMATS:
+        return fmt, True, None  # codec identity irrelevant for the gate here
+    if fmt in _SNDFILE_LOSSY_FORMATS:
+        codec = _SNDFILE_SUBTYPE_CODEC.get((info.subtype or '').upper())
+        return fmt, False, codec
+    return fmt or None, None, None  # readable but unclassified: don't override suffix
+
+
+# ffmpeg codec_name values relevant to a music library (not exhaustive -
+# extend as real fixtures surface gaps). Used only to classify a tier-3
+# ffprobe result as lossy/lossless when tier 2 couldn't open the file at all
+# (m4a/mp4 - this is what actually resolves ALAC-in-.m4a, which libsndfile
+# can't read).
+_FFPROBE_LOSSLESS_CODECS = {'alac', 'flac', 'wavpack', 'ape', 'tta', 'shorten',
+                            'pcm_s16le', 'pcm_s16be', 'pcm_s24le', 'pcm_s24be',
+                            'pcm_s32le', 'pcm_s32be', 'pcm_f32le', 'wmalossless'}
+_FFPROBE_LOSSY_CODECS = {'aac', 'mp3', 'mp2', 'vorbis', 'opus', 'wmav1', 'wmav2',
+                         'wmapro', 'musepack'}
+
+
+def _probe_ffprobe(path, timeout=10.0):
+    """Tier 3 of the codec probe, and the duration/sample-rate lookup for the
+    ffmpeg window-seeking tier of distributed segment sampling: one ffprobe
+    call for containers soundfile can't open (m4a/mp4/ogg-opus/wma/mpc).
+    Returns {'codec', 'sample_rate', 'duration'}, each independently None on
+    failure -- missing binary, timeout, non-zero exit, no audio stream,
+    malformed output. Callers must treat every field as optional and never
+    guess."""
+    import subprocess
+    empty = {'codec': None, 'sample_rate': None, 'duration': None}
+    try:
+        proc = subprocess.run(
+            ['ffprobe', '-v', 'error', '-print_format', 'json',
+             '-show_entries', 'format=duration:stream=codec_name,sample_rate',
+             '-select_streams', 'a:0', path],
+            capture_output=True, timeout=timeout,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return empty
+    if proc.returncode != 0:
+        return empty
+    try:
+        data = json.loads(proc.stdout)
+        stream = (data.get('streams') or [{}])[0]
+        fmt = data.get('format') or {}
+        codec = (stream.get('codec_name') or '').lower() or None
+        sample_rate = int(stream['sample_rate']) if stream.get('sample_rate') else None
+        duration = float(fmt['duration']) if fmt.get('duration') else None
+        return {'codec': codec, 'sample_rate': sample_rate, 'duration': duration}
+    except (ValueError, AttributeError, IndexError, TypeError, KeyError):
+        return empty
+
+
+# The one codec _expected_cutoff_for_bitrate's table is actually calibrated
+# against (LAME/MP3 fixtures) -- the TRANSCODED_LOSSY-changing gate below
+# applies only here; every other lossy codec gets a note, not a verdict
+# change (a native ffmpeg AAC/WMA encode legitimately cuts lower than MP3 at
+# the same declared bitrate).
+_CALIBRATED_TRANSCODE_CODECS = {'mp3'}
+# Even the calibrated MP3 gate is evidence, not proof -- an intentionally
+# low-passed first-generation MP3 at the declared bitrate is a legitimate
+# alternative explanation, so the gate never claims full confidence.
+_TRANSCODE_GATE_CONFIDENCE_PENALTY = 0.10
+
+
+def _resolve_lossy_codec(suffix, probed_codec):
+    """Codec name used by the transcode gate. Prefers the probed value
+    (tier-2 subtype or tier-3 ffprobe); falls back to the suffix only for
+    mp3 -- the one calibrated codec, and the shipped, fixture-validated
+    TRANSCODED_LOSSY detector must keep firing on it even when neither probe
+    tier resolves anything (e.g. no ffprobe on PATH). Every other suffix
+    without a probed codec returns None: "unknown codec, gate disabled"."""
+    if probed_codec:
+        return probed_codec
+    if suffix == 'mp3':
+        return 'mp3'
+    return None
 
 
 def _alias_image_corr(freqs, profile, mirror_hz, width_hz=4000.0):
@@ -278,6 +752,27 @@ def _resample_match(nyquist, cutoff_hz):
     return None
 
 
+def _consensus_source_rate(nyquist, window_cutoffs):
+    """Source rate named by the *upper envelope* of agreeing window cutoffs.
+    The verdict keys on the minimum window, but a wall caps the maximum:
+    when a 48 kHz-derived file's quietest window reads 23.3 kHz, the min
+    window alone first-matches 22.05 kHz while the envelope (23.5-24 kHz)
+    correctly names the 24 kHz Nyquist. Largest standard Nyquist matched by
+    any window, with no window past its leakage margin. Only meaningful
+    when the windows agree (a constant wall) -- with disagreeing windows
+    the envelope is contaminated by resampler image leakage (a 44.1->96
+    fixture's loud windows read ~24 kHz through leakage above the true
+    22.05 kHz wall), so the caller must gate this on agreement."""
+    best = None
+    for q in _STD_NYQUISTS:
+        if q > 0.75 * nyquist:
+            continue
+        if (any(-0.03 * q <= (c - q) <= 0.07 * q for c in window_cutoffs)
+                and max(window_cutoffs) <= 1.07 * q):
+            best = int(q * 2)
+    return best
+
+
 def _best_alias_match(freqs, profile, nyquist):
     """(correlation, source_rate) of the standard Nyquist whose mirrored
     bands correlate best — images mirror around the source's Nyquist, not
@@ -292,7 +787,8 @@ def _best_alias_match(freqs, profile, nyquist):
 
 
 def _verdict(sr, suffix, bitrate_kbps, cutoff_hz, edge_db_khz, shelf_db,
-             freqs=None, profile=None):
+             freqs=None, profile=None, is_lossless=None, codec=None,
+             window_cutoffs=None, windows_agree=None):
     nyquist = sr / 2.0
     suffix = (suffix or '').lower().lstrip('.')
     # Genuine 44.1 kHz masters legitimately roll off at 20-21 kHz (ADC
@@ -300,10 +796,15 @@ def _verdict(sr, suffix, bitrate_kbps, cutoff_hz, edge_db_khz, shelf_db,
     # the Nyquist wall looks sharp, so content reaching ~93% of Nyquist
     # (capped at 20.5 kHz for high-rate files) counts as full bandwidth.
     full_threshold = min(0.93 * nyquist, 20500.0)
-    sharp = edge_db_khz >= 25.0
+    sharp = edge_db_khz is not None and edge_db_khz >= 25.0
     silent_shelf = shelf_db is None or shelf_db <= SILENT_SHELF_DB
     margin = max(0.0, min(1.0, (full_threshold - cutoff_hz) / full_threshold))
     notes = []
+    # alias_image_detected stays None ("not evaluated") outside the
+    # UPSAMPLED-candidate branch below -- the alias-image correlation is
+    # never run for the other verdicts, so reporting False there would be a
+    # false claim of absent evidence rather than untested evidence.
+    alias_image_detected = None
 
     if cutoff_hz >= full_threshold:
         # hi-res container: content stopping at a lower standard rate's
@@ -316,6 +817,20 @@ def _verdict(sr, suffix, bitrate_kbps, cutoff_hz, edge_db_khz, shelf_db,
                 corr, corr_rate = ((None, None) if freqs is None or profile is None
                                    else _best_alias_match(freqs, profile, nyquist))
                 aliased = corr is not None and corr >= 0.6
+                alias_image_detected = aliased
+                # a constant wall: >=3 distributed windows agreeing on the
+                # cutoff -- the segment-mode analog of deep mode's pinned
+                # edge. Corroboration (confidence + note) only, never a
+                # verdict trigger on its own: a genuine dark master with a
+                # fixed mastering low-pass pins too (dark_master_96k does,
+                # at a resample-matched frequency); what separates it from
+                # a resample is the shelf, which stays the trigger.
+                pinned = (windows_agree is True and window_cutoffs
+                          and len(window_cutoffs) >= 3)
+                if pinned:
+                    env_rate = _consensus_source_rate(nyquist, window_cutoffs)
+                    if env_rate:
+                        src_rate = env_rate  # the envelope names the wall
                 if aliased and corr_rate:
                     src_rate = corr_rate  # images name the true source rate
                 if silent_shelf or aliased or sharp:
@@ -333,42 +848,85 @@ def _verdict(sr, suffix, bitrate_kbps, cutoff_hz, edge_db_khz, shelf_db,
                                      f'below (correlation {corr:.2f}): resampler '
                                      f'aliasing images')
                         conf = max(conf, 0.9)
-                    elif not silent_shelf:
+                    if pinned:
+                        spread = max(window_cutoffs) - min(window_cutoffs)
+                        notes.append(
+                            f'the cutoff sits at the same frequency in all '
+                            f'{len(window_cutoffs)} sampled windows (spread '
+                            f'{spread:.0f} Hz): a constant wall, not content '
+                            f'that fades with the music')
+                        conf = min(0.9, conf + 0.15)
+                    if not (aliased or pinned or silent_shelf):
                         notes.append('some content above the cutoff: '
                                      'could be a genuine but dark master')
-                    return 'UPSAMPLED', est, conf, notes
+                    return 'UPSAMPLED', est, conf, notes, alias_image_detected
                 # soft edge + audible noise + no aliasing: a genuine dark
                 # master fading out, not a resampler wall
                 notes.append('bandwidth is limited but the edge is gradual with '
                              'audible noise above and no aliasing images: likely '
                              'a genuine dark master')
-                return 'CLEAN', 'limited bandwidth (dark master?)', 0.6, notes
-        return 'CLEAN', 'full bandwidth', 0.9, notes
+                return ('CLEAN', 'limited bandwidth (dark master?)', 0.6, notes,
+                        alias_image_detected)
+        return 'CLEAN', 'full bandwidth', 0.9, notes, alias_image_detected
 
     if nyquist > 24000.0 and cutoff_hz < 23000.0:
         notes.append('content ends below 23 kHz despite high sample rate: possible upsample')
 
     est = _estimate_source(cutoff_hz)
 
-    if suffix in LOSSLESS_SUFFIXES:
+    lossless = suffix in LOSSLESS_SUFFIXES if is_lossless is None else is_lossless
+    if lossless:
         if sharp and silent_shelf:
             conf = min(0.95, 0.6 + 0.5 * margin + min(0.15, (edge_db_khz - 25.0) / 200.0))
-            return 'FAKE_SUSPECT', est, conf, notes
+            return 'FAKE_SUSPECT', est, conf, notes, alias_image_detected
+        # LOWPASSED on a lossless container says "not a transcode", so a
+        # lossy-bitrate-class label would contradict the verdict it rides
+        # on -- word it as what was actually measured.
+        est = f'content ends ~{cutoff_hz / 1000.0:.1f} kHz'
         if sharp:
             notes.append('sharp edge but audible noise floor above the cutoff: '
                          'more likely a low-passed master than an encoder wall')
-            return 'LOWPASSED', est, 0.5 + 0.3 * margin, notes
+            return 'LOWPASSED', est, 0.5 + 0.3 * margin, notes, alias_image_detected
+        # hi-res container whose sampled windows *disagree* while the widest
+        # reaches full bandwidth: the minimum window is a quiet passage with
+        # naturally less HF content, not a wall (a wall is constant across
+        # windows). Requires no machine signature in the verdict window --
+        # not sharp (checked above) and not *deep* digital silence above the
+        # cutoff (a quiet-but-genuine passage reads "silent" against the
+        # program-level reference too, ~-72 dB field-measured, but a
+        # resampler's floor sits far deeper, -103..-108 on the fixtures).
+        if (nyquist > 24000.0 and windows_agree is False and window_cutoffs
+                and max(window_cutoffs) >= full_threshold
+                and (shelf_db is None or shelf_db > _DEEP_SILENCE_SHELF_DB)):
+            notes.append(
+                f'sampled windows disagree (cutoffs '
+                f'{min(window_cutoffs) / 1000.0:.1f}-'
+                f'{max(window_cutoffs) / 1000.0:.1f} kHz) and the widest '
+                f'reaches full bandwidth: bandwidth follows the content, '
+                f'not a constant wall')
+            return ('CLEAN', 'variable bandwidth (content-dependent)', 0.6,
+                    notes, alias_image_detected)
         notes.append('gradual rolloff: could be a genuine low-passed master, not a transcode')
-        return 'LOWPASSED', est, 0.45 + 0.3 * margin, notes
+        return 'LOWPASSED', est, 0.45 + 0.3 * margin, notes, alias_image_detected
 
     # lossy container
     expected = _expected_cutoff_for_bitrate(bitrate_kbps)
     if expected and cutoff_hz < expected - 1500:
+        if codec in _CALIBRATED_TRANSCODE_CODECS:
+            notes.append(
+                f'declared ~{bitrate_kbps} kbps but bandwidth matches a lower-bitrate '
+                f'source; could also be an intentionally low-passed first-generation '
+                f'{codec} encode at the declared bitrate'
+            )
+            conf = min(0.9, 0.55 + 0.5 * margin) - _TRANSCODE_GATE_CONFIDENCE_PENALTY
+            return ('TRANSCODED_LOSSY', est, max(0.5, conf), notes,
+                    alias_image_detected)
         notes.append(
-            f'declared ~{bitrate_kbps} kbps but bandwidth matches a lower-bitrate source'
+            f'bandwidth lower than expected for declared ~{bitrate_kbps} kbps '
+            f'({codec or "unknown"} codec); no calibrated bitrate-to-bandwidth '
+            f'mapping for this codec, verdict not changed on this evidence alone'
         )
-        return 'TRANSCODED_LOSSY', est, min(0.9, 0.55 + 0.5 * margin), notes
-    return 'CONSISTENT_LOSSY', est, 0.7, notes
+    return 'CONSISTENT_LOSSY', est, 0.7, notes, alias_image_detected
 
 
 def _render_spectrogram(S_db, sr, seg_offset, seg_len_s, cutoff_hz,
@@ -402,28 +960,180 @@ def _render_spectrogram(S_db, sr, seg_offset, seg_len_s, cutoff_hz,
     fig.tight_layout(pad=0.4)
 
     buf = io.BytesIO()
-    fig.savefig(buf, format='png', pil_kwargs={'compress_level': 9})
+    # compress_level 9 buys a small size delta over 6 for a large CPU cost;
+    # not worth it for a PNG that's already max-pooled down to img_w columns
+    fig.savefig(buf, format='png', pil_kwargs={'compress_level': 6})
     plt.close(fig)
     return base64.b64encode(buf.getvalue()).decode('ascii')
 
 
+def _inconclusive_result(suffix, bitrate_kbps, deep, drop_db, segment_seconds, exc):
+    """Result dict for a file that could not be decoded at all: a stored,
+    visible INCONCLUSIVE row instead of a silently dropped analysis.
+    deep_eligible=False — if the file couldn't be decoded once, a repeat
+    attempt (segment or deep) won't fare better. Same key shape as a normal
+    result so callers (_upsert, on_song_analyzed) need no special-casing."""
+    return {
+        'sample_rate': None,
+        'seg_offset': 0.0,
+        'seg_seconds': None,
+        'cutoff_hz': None,
+        'edge_db_khz': None,
+        'shelf_db': None,
+        'verdict': 'INCONCLUSIVE',
+        'est_source': 'could not decode audio',
+        'confidence': 0.0,
+        'container_bits': None,
+        'effective_bits': None,
+        'deep_eligible': False,
+        'details': json.dumps({
+            'decode_error': str(exc),
+            'declared_bitrate_kbps': bitrate_kbps,
+            'suffix': suffix,
+            'deep': deep,
+            'drop_db': drop_db,
+            'integrity': {'status': 'decode_failed', 'coverage': None},
+            'analysis_rev': analysis_rev(drop_db, segment_seconds),
+            'notes': [f'decode failed: {exc}'],
+        }),
+        'spectrogram_b64': None,
+        'analysis_rev': analysis_rev(drop_db, segment_seconds),
+    }
+
+
+def _unsupported_format_result(suffix, bitrate_kbps, deep, drop_db, segment_seconds, fmt):
+    """Result dict for a format we recognize but deliberately don't analyze
+    (DSD): an honest 'not evaluated' instead of running PCM heuristics on
+    decoded DSD noise shaping, which silently reads as full-bandwidth content
+    (see _sniff_dsd). Same shape as _inconclusive_result: deep_eligible=False,
+    since nothing about a retry would change the outcome."""
+    return {
+        'sample_rate': None,
+        'seg_offset': 0.0,
+        'seg_seconds': None,
+        'cutoff_hz': None,
+        'edge_db_khz': None,
+        'shelf_db': None,
+        'verdict': 'INCONCLUSIVE',
+        'est_source': f'{fmt.upper()} (DSD): not analyzed, unsupported format',
+        'confidence': 0.0,
+        'container_bits': None,
+        'effective_bits': None,
+        'deep_eligible': False,
+        'details': json.dumps({
+            'detected_format': fmt,
+            'declared_bitrate_kbps': bitrate_kbps,
+            'suffix': suffix,
+            'deep': deep,
+            'drop_db': drop_db,
+            'integrity': {'status': 'unsupported', 'coverage': None},
+            'analysis_rev': analysis_rev(drop_db, segment_seconds),
+            'notes': [f'{fmt.upper()} recognized by magic bytes: DSD content is '
+                      f'not analyzed by the PCM spectrum heuristics'],
+        }),
+        'spectrogram_b64': None,
+        'analysis_rev': analysis_rev(drop_db, segment_seconds),
+    }
+
+
 def analyze_file(path, suffix=None, bitrate_kbps=None, segment_seconds=90,
-                 drop_db=40, img_w=800, img_h=280, deep=False):
+                 drop_db=40, img_w=800, img_h=280, deep=False,
+                 skip_spectrogram_for_clean=False):
     """Full pipeline. Returns a dict ready to be stored.
 
     deep=True analyzes the entire file (chunked) instead of one segment and
     tracks the spectral edge over time: a resampler/encoder wall sits at a
     constant frequency for the whole file, while a genuine dark master's edge
     moves with the music.
+
+    skip_spectrogram_for_clean=True skips PNG rendering when the verdict
+    comes out CLEAN (spectrogram_b64 is None in the result). Audio isn't
+    retained after analysis, so a spectrogram not rendered here can never be
+    rendered later -- this is a settings-gated tradeoff, not a default.
     """
     if suffix is None:
         suffix = os.path.splitext(path)[1].lstrip('.')
 
+    dsd_fmt = _sniff_dsd(path)
+    if dsd_fmt:
+        return _unsupported_format_result(suffix, bitrate_kbps, deep, drop_db,
+                                          segment_seconds, dsd_fmt)
+
+    detected_fmt, detected_lossless, codec_name = _probe_container(path)
+    native_seekable = detected_fmt is not None
+
+    ffprobe_info = None
+    if suffix in LOSSY_SUFFIXES and codec_name is None:
+        ffprobe_info = _probe_ffprobe(path)
+        ffprobe_codec = ffprobe_info['codec']
+        if ffprobe_codec:
+            codec_name = ffprobe_codec
+            if detected_lossless is None:  # tier 2 couldn't open it at all
+                if ffprobe_codec in _FFPROBE_LOSSLESS_CODECS:
+                    detected_lossless = True
+                    detected_fmt = ffprobe_codec.upper()
+                elif ffprobe_codec in _FFPROBE_LOSSY_CODECS:
+                    detected_lossless = False
+                    detected_fmt = ffprobe_codec.upper()
+
+    codec_mismatch = None
+    if detected_lossless is True and suffix in LOSSY_SUFFIXES:
+        codec_mismatch = f'suffix .{suffix} suggests lossy, container is {detected_fmt} (lossless)'
+    elif detected_lossless is False and suffix in LOSSLESS_SUFFIXES:
+        codec_mismatch = f'suffix .{suffix} suggests lossless, container is {detected_fmt} (lossy)'
+
+    gate_codec = _resolve_lossy_codec(suffix, codec_name)
+
     edge_var = edge_med = None
     pinned_q = None
+    capped = chunk_error = False
+    windows_detail = None
+    windows_agree = None
+    window_cutoffs = None
+    program_ref = None
+    try:
+        if deep:
+            (S_db, profile, freqs, sr, seg_len, edge_series,
+             capped, chunk_error) = _deep_spectrum(path, drop_db)
+            offset = 0.0
+        else:
+            if not native_seekable and ffprobe_info is None:
+                ffprobe_info = _probe_ffprobe(path)
+            windows = _load_windows(path, segment_seconds, native_seekable, ffprobe_info)
+            scored = []
+            for y, sr_w, off in windows:
+                seg_len_w = y.size / float(sr_w)
+                S_db_w, profile_w, freqs_w = _spectrum(y, sr_w)
+                silent, _ = _is_near_silent(profile_w, freqs_w)
+                cutoff_w, ref_w, narrow_w = _find_cutoff(freqs_w, profile_w, drop_db)
+                scored.append({'sr': sr_w, 'offset': off, 'seg_len': seg_len_w,
+                               'S_db': S_db_w, 'profile': profile_w, 'freqs': freqs_w,
+                               'cutoff_hz': cutoff_w, 'ref': ref_w,
+                               'narrow_tone': narrow_w, 'silent': silent})
+
+            valid = [w for w in scored if not w['silent']] or scored
+            primary = min(valid, key=lambda w: w['cutoff_hz'])
+            cutoffs = [w['cutoff_hz'] for w in valid]
+            window_cutoffs = cutoffs
+            # program-level reference for the shelf: the loudest window's
+            # 1-8 kHz median (see the SILENT_SHELF_DB comment for why the
+            # primary window's own ref is systematically biased quiet)
+            program_ref = max(w['ref'] for w in valid)
+            windows_agree = ((max(cutoffs) - min(cutoffs) <= _WINDOW_AGREEMENT_TOLERANCE_HZ)
+                             if len(cutoffs) > 1 else None)
+            windows_detail = [{'offset': round(w['offset'], 2),
+                               'seconds': round(w['seg_len'], 2),
+                               'cutoff_hz': round(w['cutoff_hz'], 1),
+                               'silent': w['silent']} for w in scored]
+
+            sr, offset, seg_len = primary['sr'], primary['offset'], primary['seg_len']
+            S_db, profile, freqs = primary['S_db'], primary['profile'], primary['freqs']
+            cutoff_hz, ref, narrow_tone = primary['cutoff_hz'], primary['ref'], primary['narrow_tone']
+    except ValueError as exc:
+        return _inconclusive_result(suffix, bitrate_kbps, deep, drop_db,
+                                    segment_seconds, exc)
+
     if deep:
-        S_db, profile, freqs, sr, seg_len, edge_series = _deep_spectrum(path, drop_db)
-        offset = 0.0
         if len(edge_series) >= 10:
             arr = np.asarray(edge_series)
             edge_var = float(np.std(arr))
@@ -437,16 +1147,17 @@ def analyze_file(path, suffix=None, bitrate_kbps=None, segment_seconds=90,
                         and float(np.mean(arr > 1.06 * q)) <= 0.05):
                     pinned_q = q
                     break
-    else:
-        y, sr, offset = _load_segment(path, segment_seconds)
-        seg_len = y.size / float(sr)
-        S_db, profile, freqs = _spectrum(y, sr)
 
-    cutoff_hz, ref = _find_cutoff(freqs, profile, drop_db)
+    if deep:
+        cutoff_hz, ref, narrow_tone = _find_cutoff(freqs, profile, drop_db)
+    shelf_ref = ref if program_ref is None else program_ref
     edge = _edge_sharpness(freqs, profile, cutoff_hz)
-    shelf = _shelf_level(freqs, profile, cutoff_hz, ref)
-    verdict, est, conf, notes = _verdict(sr, suffix, bitrate_kbps, cutoff_hz, edge, shelf,
-                                         freqs=freqs, profile=profile)
+    shelf = _shelf_level(freqs, profile, cutoff_hz, shelf_ref)
+    verdict, est, conf, notes, alias_image_detected = _verdict(
+        sr, suffix, bitrate_kbps, cutoff_hz, edge, shelf,
+        freqs=freqs, profile=profile,
+        is_lossless=detected_lossless, codec=gate_codec,
+        window_cutoffs=window_cutoffs, windows_agree=windows_agree)
 
     if deep:
         if edge_var is None:
@@ -478,44 +1189,94 @@ def analyze_file(path, suffix=None, bitrate_kbps=None, segment_seconds=90,
             else:
                 notes.append(f'deep scan: edge variability ±{edge_var:.0f} Hz: inconclusive')
 
-    container_bits, effective_bits = _bit_depth_probe(path)
+    (container_bits, effective_bits, predominant_bit_depth,
+     lower_bit_activity_fraction, bit_depth_coverage) = _bit_depth_probe(path, full=deep)
     if (container_bits or 0) > 16 and effective_bits and effective_bits <= 16:
+        # exact test: every tested nonzero sample was padded -- the only
+        # trigger for UPSCALED. Confidence reflects how much of the file was
+        # actually tested: a sampled window vs. deep mode's full-file scan.
+        bit_depth_conf = 0.95 if bit_depth_coverage in ('full', 'capped') else 0.9
         if verdict == 'CLEAN':
             verdict = 'UPSCALED'
             est = f'{effective_bits}-bit source in a {container_bits}-bit container'
-            conf = 0.95  # zero-padded low bits are a deterministic signature
+            conf = bit_depth_conf
         else:
             notes.append(f'bit depth: only {effective_bits} effective bits in a '
-                         f'{container_bits}-bit container (padded)')
+                         f'{container_bits}-bit container (padded, {bit_depth_coverage})')
+    elif ((container_bits or 0) > 16 and predominant_bit_depth is not None
+            and predominant_bit_depth <= 16):
+        # statistical evidence only: mostly padded but not every tested
+        # sample -- informational, never a verdict trigger (dither, gain
+        # changes, SRC, or edits can all leave a few genuinely deeper samples)
+        notes.append(
+            f'bit depth: predominantly {predominant_bit_depth}-bit content in a '
+            f'{container_bits}-bit container ({lower_bit_activity_fraction * 100:.2f}% '
+            f'of samples show real content below 16 bits) -- not flagged as padded')
 
-    png_b64 = _render_spectrogram(S_db, sr, offset, seg_len, cutoff_hz, img_w, img_h)
+    if skip_spectrogram_for_clean and verdict == 'CLEAN':
+        png_b64 = None
+    else:
+        png_b64 = _render_spectrogram(S_db, sr, offset, seg_len, cutoff_hz, img_w, img_h)
+
+    if not deep:
+        integrity = {'status': 'sampled_decode_ok', 'coverage': 'sampled'}
+    elif chunk_error:
+        # a chunk load raised before reaching either the natural end of the
+        # file or the time budget - some usable data, but cut short
+        integrity = {'status': 'sampled_decode_ok', 'coverage': 'partial'}
+    elif capped:
+        integrity = {'status': 'sampled_decode_ok', 'coverage': 'capped'}
+    else:
+        integrity = {'status': 'full_decode_ok', 'coverage': 'full'}
+    delivery = {}
+    if codec_mismatch:
+        delivery['codec_mismatch'] = codec_mismatch
+    if codec_name:
+        delivery['codec'] = codec_name
+    delivery = delivery or None
 
     return {
         'sample_rate': sr,
         'seg_offset': round(offset, 2),
         'seg_seconds': round(seg_len, 2),
         'cutoff_hz': round(cutoff_hz, 1),
-        'edge_db_khz': round(edge, 2),
+        'edge_db_khz': round(edge, 2) if edge is not None else None,
         'shelf_db': round(shelf, 2) if shelf is not None else None,
         'verdict': verdict,
         'est_source': est,
         'confidence': round(conf, 2),
         'container_bits': container_bits,
         'effective_bits': effective_bits,
+        'deep_eligible': True,
         'details': json.dumps({
             'ref_level_db': round(ref, 2),
+            'shelf_ref_db': round(shelf_ref, 2),
             'drop_db': drop_db,
             'nyquist_hz': sr / 2.0,
             'full_bandwidth_threshold_hz': round(min(0.93 * sr / 2.0, 20500.0), 1),
             'shelf_db': round(shelf, 2) if shelf is not None else None,
-            'container_bits': container_bits,
-            'effective_bits': effective_bits,
+            'bit_depth': {'container_bits': container_bits, 'effective_bits': effective_bits,
+                         'predominant_bit_depth': predominant_bit_depth,
+                         'lower_bit_activity_fraction': lower_bit_activity_fraction,
+                         'coverage': bit_depth_coverage},
             'declared_bitrate_kbps': bitrate_kbps,
             'suffix': suffix,
             'deep': deep,
             'edge_var_hz': round(edge_var, 1) if edge_var is not None else None,
             'edge_median_hz': round(edge_med, 1) if edge_med is not None else None,
+            'integrity': integrity,
+            'delivery': delivery,
+            'evidence': {
+                'edge_machine_like': None if edge is None else (edge >= 25.0),
+                'shelf_digitally_silent': None if shelf is None else (shelf <= SILENT_SHELF_DB),
+                'alias_image_detected': alias_image_detected,
+                'narrow_high_frequency_tone_present': narrow_tone,
+            },
+            'windows': ({'samples': windows_detail, 'agree': windows_agree}
+                       if windows_detail is not None else None),
+            'analysis_rev': analysis_rev(drop_db, segment_seconds),
             'notes': notes,
         }),
         'spectrogram_b64': png_b64,
+        'analysis_rev': analysis_rev(drop_db, segment_seconds),
     }

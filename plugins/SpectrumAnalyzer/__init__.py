@@ -44,6 +44,7 @@ VERDICT_STYLE = {
     'UPSCALED':         ('#7c3aed', 'Fake 24-bit: zero-padded 16-bit source'),
     'TRANSCODED_LOSSY': ('#dc2626', 'Lossy re-encoded from lower bitrate'),
     'FAKE_SUSPECT':     ('#dc2626', 'Suspect fake lossless (transcode)'),
+    'INCONCLUSIVE':     ('#6b7280', 'Could not be analyzed (decode failure or unsupported format)'),
 }
 SUSPECT_VERDICTS = ('FAKE_SUSPECT', 'TRANSCODED_LOSSY', 'UPSAMPLED', 'UPSCALED')
 
@@ -69,17 +70,26 @@ def migrate(db):
         ' verdict TEXT, est_source TEXT, confidence REAL, details TEXT,'
         ' container_bits INTEGER, effective_bits INTEGER,'
         ' spectrogram_b64 TEXT,'
+        ' analysis_rev TEXT,'
         ' analyzed_at TIMESTAMP DEFAULT now())'
     )
-    # 0.4.0: bit-depth columns for installs upgrading from older schemas
+    # Prerelease - 0.4.0: bit-depth columns for installs upgrading from older schemas
     cur.execute('ALTER TABLE ' + tbl + ' ADD COLUMN IF NOT EXISTS container_bits INTEGER')
     cur.execute('ALTER TABLE ' + tbl + ' ADD COLUMN IF NOT EXISTS effective_bits INTEGER')
-    # 0.5.0: manual verification flag (verified tracks don't count as suspect)
+    # Prerelease - 0.5.0: manual verification flag (verified tracks don't count as suspect)
     cur.execute('ALTER TABLE ' + tbl +
                 ' ADD COLUMN IF NOT EXISTS verified BOOLEAN NOT NULL DEFAULT FALSE')
-    # 0.5.1: set while a deep scan is queued/running, cleared when it finishes
+    # Prerelease - 0.5.1: set while a deep scan is queued/running, cleared when it finishes
     cur.execute('ALTER TABLE ' + tbl +
                 ' ADD COLUMN IF NOT EXISTS deep_pending BOOLEAN NOT NULL DEFAULT FALSE')
+    # 0.4.0: analysis-revision stamp; NULL on old rows = stale, re-analyzed on
+    # the next changed/verify scan (skip paths require a rev match)
+    cur.execute('ALTER TABLE ' + tbl + ' ADD COLUMN IF NOT EXISTS analysis_rev TEXT')
+    # 0.4.0: deep-scan eligibility, independent of the primary verdict (a
+    # decode failure sets it False; old rows default True, preserving today's
+    # "deep scan any non-CLEAN track" behavior)
+    cur.execute('ALTER TABLE ' + tbl +
+                ' ADD COLUMN IF NOT EXISTS deep_eligible BOOLEAN NOT NULL DEFAULT TRUE')
     _migrate_v3_ids(db, cur, tbl)
     cur.execute('CREATE INDEX IF NOT EXISTS ' + tbl + '_album_idx ON ' + tbl + ' (album)')
     # optional weekly incremental scan, shipped disabled (admin enables it)
@@ -200,14 +210,16 @@ def home():
     # manually verified tracks never count as suspect or lowpassed
     bad_expr = 'COUNT(*) FILTER (WHERE verdict IN %s AND NOT verified)'
     low_expr = "COUNT(*) FILTER (WHERE verdict = 'LOWPASSED' AND NOT verified)"
+    inconclusive_expr = ("COUNT(*) FILTER (WHERE verdict = 'INCONCLUSIVE'"
+                         ' AND NOT verified)')
 
     db = get_db()
     cur = db.cursor()
     cur.execute(
-        'SELECT COUNT(*), ' + bad_expr + ', ' + low_expr + ','
+        'SELECT COUNT(*), ' + bad_expr + ', ' + low_expr + ', ' + inconclusive_expr + ','
         ' COUNT(*) FILTER (WHERE verified),'
         ' COUNT(DISTINCT album) FROM ' + tbl, (SUSPECT_VERDICTS,))
-    total, suspects, n_lowpassed, n_verified, n_albums = cur.fetchone()
+    total, suspects, n_lowpassed, n_inconclusive, n_verified, n_albums = cur.fetchone()
 
     having = []
     having_params = []
@@ -327,6 +339,8 @@ def home():
         f'(fake lossless, transcode or fake hi-res), '
         f'<strong style="color:#d97706;">{n_lowpassed}</strong> lowpassed '
         f'(ambiguous: possibly genuine dark masters), '
+        f'<strong style="color:#6b7280;">{n_inconclusive}</strong> inconclusive '
+        f'(could not be analyzed: decode failure or unsupported format), '
         f'<strong style="color:#6b7280;">{n_verified}</strong> manually verified '
         f'(excluded from suspect and lowpassed counts).</p>'
         f'{queued_msg}'
@@ -390,7 +404,7 @@ def album():
         'SELECT item_id, title, artist, suffix, bitrate, sample_rate, cutoff_hz,'
         ' edge_db_khz, verdict, est_source, confidence, details,'
         ' to_char(analyzed_at, \'DD-MM-YYYY HH24:MI\'), spectrogram_b64, album_id,'
-        ' container_bits, effective_bits, verified, deep_pending'
+        ' container_bits, effective_bits, verified, deep_pending, deep_eligible'
         ' FROM ' + tbl + ' WHERE album = %s ORDER BY title', (name,))
     rows = cur.fetchall()
     cur.close()
@@ -400,7 +414,7 @@ def album():
     cards = []
     for (item_id, title, artist, suffix, bitrate, sr, cutoff, edge, verdict,
          est, conf, details, when, png, _aid, cbits, ebits, verified,
-         deep_pending) in rows:
+         deep_pending, deep_eligible) in rows:
         if cbits and ebits and ebits < cbits:
             bits = (f' / <span style="color:#dc2626;font-weight:600;" '
                     f'title="effective bits / container bits">{ebits}&rarr;{cbits} bit</span>')
@@ -437,9 +451,10 @@ def album():
             'Re-analyze</button></form>'
             f'<form method="post" action="{url_for("spectrum_analyzer.deep_rescan", item_id=item_id)}" '
             f'style="display:inline;margin-left:.4rem;">'
-            f'<button type="submit" class="btn" {"disabled" if deep_pending else ""} '
-            f'style="{BTN_DISABLED_STYLE if deep_pending else BTN_STYLE}" '
-            f'title="{"A deep scan is already queued for this track" if deep_pending else "Analyze the ENTIRE file (not a segment) and track the spectral edge over time: an edge that follows the music means a genuine dark master, a constant wall means a resampler/encoder"}">'
+            f'<button type="submit" class="btn" '
+            f'{"disabled" if deep_pending or not deep_eligible else ""} '
+            f'style="{BTN_DISABLED_STYLE if deep_pending or not deep_eligible else BTN_STYLE}" '
+            f'title="{"A deep scan is already queued for this track" if deep_pending else "This track could not be decoded at all — a deep scan would not add anything" if not deep_eligible else "Analyze the ENTIRE file (not a segment) and track the spectral edge over time: an edge that follows the music means a genuine dark master, a constant wall means a resampler/encoder"}">'
             'Deep analyze</button></form></div></div>'
             f'<p style="margin:.4rem 0;font-size:.9rem;">Cutoff <strong>{_khz(cutoff)} kHz</strong>'
             f' &middot; edge {edge if edge is not None else "?"} dB/kHz'
@@ -514,7 +529,8 @@ def deep_rescan(item_id):
     db = get_db()
     cur = db.cursor()
     cur.execute('UPDATE ' + table('results') + ' SET deep_pending=TRUE'
-                ' WHERE item_id=%s AND NOT deep_pending RETURNING item_id',
+                ' WHERE item_id=%s AND NOT deep_pending AND deep_eligible'
+                ' RETURNING item_id',
                 (item_id,))
     tagged = cur.fetchone()
     db.commit()
@@ -532,7 +548,7 @@ def _queue_deep_non_clean(album=None):
     cur = db.cursor()
     sql = ('UPDATE ' + table('results') + ' SET deep_pending=TRUE'
            " WHERE verdict IS DISTINCT FROM 'CLEAN'"
-           ' AND NOT verified AND NOT deep_pending')
+           ' AND NOT verified AND NOT deep_pending AND deep_eligible')
     if album is None:
         cur.execute(sql + ' RETURNING item_id')
     else:
@@ -605,6 +621,7 @@ def settings():
             except (TypeError, ValueError):
                 set_setting(key, dflt)
         set_setting('hook_enabled', bool(request.form.get('hook_enabled')))
+        set_setting('skip_clean_spectrograms', bool(request.form.get('skip_clean_spectrograms')))
         return redirect(manage_plugins_url())
 
     def num(key, dflt, label, hint):
@@ -614,10 +631,11 @@ def settings():
                 f'{hint}</span></label>')
 
     hook = 'checked' if get_setting('hook_enabled', True) else ''
+    skip_clean = 'checked' if get_setting('skip_clean_spectrograms', False) else ''
     body = (
         '<form method="post">'
         + num('segment_seconds', 90, 'Analyzed segment (s)',
-              'taken from the middle of each track')
+              'total budget, split across several windows spread through the track')
         + num('drop_db', 40, 'Cutoff threshold (dB)',
               'level drop below the 1-8 kHz reference that counts as "no content"')
         + num('img_w', 800, 'Spectrogram width (px)', '')
@@ -626,6 +644,10 @@ def settings():
         + f'<label style="display:block;margin:.6rem 0;">'
           f'<input type="checkbox" name="hook_enabled" {hook}> '
           'Also analyze songs automatically during core analysis (on_song_analyzed hook)</label>'
+        + f'<label style="display:block;margin:.6rem 0;">'
+          f'<input type="checkbox" name="skip_clean_spectrograms" {skip_clean}> '
+          'Skip storing a spectrogram for CLEAN tracks (saves CPU/DB space; audio isn\'t '
+          'retained after analysis, so a skipped spectrogram can\'t be rendered later)</label>'
         '<button type="submit" class="btn btn-primary" style="margin-top:1rem;">Save</button>'
         '</form>')
     return render_page(body, title='Spectrum Analyzer Settings')
