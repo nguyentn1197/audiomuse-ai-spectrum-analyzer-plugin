@@ -44,18 +44,80 @@ A plugin for Audiomuse-AI to run spectrum analysis over the whole library with f
 
 ## How the fake detection works
 
-A 90 s segment from the middle of the track is loaded at native sample rate, STFT'd (n_fft 4096), and reduced to a robust per-frequency "max hold" profile (95th percentile over time). The cutoff is the highest frequency still within 40 dB of the 1–8 kHz reference level. A lossy encoder's low-pass leaves a near-vertical wall (high dB/kHz edge) with digital silence above it; a genuine master rolls off gradually and keeps dither/analog noise above the rolloff. Verdict logic:
+The decode budget (90 s by default) is spread across several windows sampled through the track at native sample rate; each is STFT'd (n_fft 4096) and reduced to a robust per-frequency "max hold" profile (95th percentile over time). Per window, the cutoff is the highest frequency still within 40 dB of the 1–8 kHz reference level; the lowest-cutoff window drives the verdict. A lossy encoder's low-pass leaves a near-vertical wall (high dB/kHz edge) with digital silence above it; a genuine master rolls off gradually and keeps dither/analog noise above the rolloff. Verdict logic:
 
 - cutoff ≥ ~93 % of Nyquist (capped at 20.5 kHz) → `CLEAN` — genuine 44.1 kHz masters legitimately roll off at 20–21 kHz (anti-alias filters, mastering chains), and edge sharpness measured against the Nyquist wall means nothing
-- **except** in a hi-res container (> 48 kHz): a cutoff aligning with a standard lower rate's Nyquist (22.05 / 24 / 44.1 / 48 kHz ± 5 %) — or sitting below 23 kHz at all — means a resampled source → `UPSAMPLED` (fake hi-res). Confidence 0.5 base, +0.25 for a sharp edge, +0.15 for digital silence above the cutoff. When there *is* content above the cutoff, it's checked for **aliasing images**: if it mirrors the band below the cutoff (correlation ≥ 0.6), it's a resampler artifact and confidence jumps to 0.9; otherwise it gets a "could be a genuine but dark master" note
-- **bit-depth check** (independent of the spectrum): PCM samples are probed for zero-padded low bits. A > 16-bit container carrying ≤ 16 effective bits is fake 24-bit → `UPSCALED` (0.95 — the signature is deterministic) when the spectrum is otherwise clean, or a note on the existing verdict otherwise. Effective/container bits are stored per track and shown on the album page (e.g. "16→24 bit" in red)
+- **except** in a hi-res container (> 48 kHz): a cutoff aligning with a standard lower rate's Nyquist (22.05 / 24 / 44.1 / 48 kHz ± 5 %) — or sitting below 23 kHz at all — means a resampled source → `UPSAMPLED` (fake hi-res). Confidence 0.5 base, +0.25 for a sharp edge, +0.15 for digital silence above the cutoff (measured against the *loudest* window's reference — `shelf_ref_db` — so a quiet verdict window can't mask true silence), +0.15 when all sampled windows pin the same cutoff (a constant wall; content fades with the music). When there *is* content above the cutoff, it's checked for **aliasing images**: if it mirrors the band below the cutoff (correlation ≥ 0.6), it's a resampler artifact and confidence jumps to 0.9; otherwise it gets a "could be a genuine but dark master" note
+- **bit-depth check** (independent of the spectrum): PCM samples are probed for zero-padded low bits. A > 16-bit container where *every* tested sample is padded down to ≤ 16 effective bits is fake 24-bit → `UPSCALED` (0.9 for a normal scan's sampled window, 0.95 when a deep scan confirms it across the whole file — the signature itself is deterministic, the confidence just reflects how much was checked) when the spectrum is otherwise clean, or a note on the existing verdict otherwise. A file that's *mostly* but not exactly padded (a few genuinely deeper samples — dither, gain changes, edits) never triggers `UPSCALED`; it gets an informational note instead. Effective/container bits are stored per track and shown on the album page (e.g. "16→24 bit" in red)
 - lossless container + low cutoff + sharp edge + **silent shelf** above the cutoff → `FAKE_SUSPECT` (estimated source class, e.g. "~128 kbps")
 - lossless container + sharp edge but audible noise above the cutoff → `LOWPASSED` (an encoder wall leaves digital silence; noise points at a genuine low-passed master)
-- lossless container + gradual rolloff → `LOWPASSED` (lower confidence)
+- lossless container + gradual rolloff → `LOWPASSED` (lower confidence) — for lossless files the estimated source reads as measured bandwidth ("content ends ~19.7 kHz"), not a lossy bitrate class. **Exception:** a hi-res file whose sampled windows *disagree*, with the widest reaching full bandwidth and no wall signature in the lowest, is a genuinely dark passage dragging the minimum down, not a low-pass → `CLEAN` ("variable bandwidth")
 - lossy container whose cutoff is far below what its declared bitrate should reach → `TRANSCODED_LOSSY`
 - otherwise → `CONSISTENT_LOSSY`
 
 These are heuristics — treat `FAKE_SUSPECT` as "look at the spectrogram," not a conviction. Thresholds are calibrated against real ground-truth fixtures (see `tests/`): LAME 320 kbps transcodes (cutoff ~20.1 kHz, dither-only shelf) are caught, but very-high-bitrate transcodes whose cutoff reaches ≥ 20.5 kHz (e.g. AAC 256) still read as CLEAN — spectrally indistinguishable from a genuine master, and false accusations are worse.
+
+### Reading the raw metrics (the "details" JSON)
+
+Every track page has a collapsible **raw metrics** panel — the full evidence behind the verdict, as JSON. It's grouped into sections; each fact lives in exactly one section, and a value of `null` always means "not checked for this track" (as opposed to `false`, which means "checked, and no").
+
+**Top level** — numbers that describe the analyzed segment itself:
+
+| Field | Meaning |
+|---|---|
+| `nyquist_hz` | Half the sample rate — the highest frequency the file could possibly contain. |
+| `full_bandwidth_threshold_hz` | The cutoff frequency above which a track counts as "full bandwidth" (near `nyquist_hz`, capped at 20.5 kHz). |
+| `ref_level_db` | How loud the 1–8 kHz "reference" band is in the analyzed window (the one shown in the spectrogram). |
+| `shelf_ref_db` | The reference the shelf is actually measured against: the *loudest* sampled window's 1–8 kHz level ("program level"). The verdict window is usually the quietest passage in the track, and measuring the shelf against its own quiet reference would make true silence above the cutoff look like audible noise — when `shelf_ref_db` is well above `ref_level_db`, that's exactly the case this field exists to make auditable. Equal to `ref_level_db` for deep scans and single-window fallbacks. |
+| `shelf_db` | How loud the band *above* the cutoff is, relative to `shelf_ref_db`. A very quiet shelf (far below zero) means near-silence above the cutoff — see `shelf_digitally_silent` below. |
+| `drop_db` | The threshold used to find the cutoff: the point where content falls this many dB below the reference level. |
+| `declared_bitrate_kbps` / `suffix` | What the file claimed to be (from its metadata/extension), used to sanity-check the measured cutoff. |
+| `deep` | Whether this was a full-file "Deep analyze" (`true`) or a normal multi-window sample (`false`). |
+| `edge_var_hz` / `edge_median_hz` | Deep-scan only: how much the cutoff frequency wanders second-to-second. A constant edge means a machine-made wall; a wandering edge means it's just following the music. |
+| `analysis_rev` | Internal version stamp — which revision of the detection logic produced this row. |
+| `notes` | Plain-English explanations for the verdict (e.g. "sharp edge but audible noise above the cutoff"). |
+
+**`bit_depth`** — is the file's declared bit depth real?
+
+| Field | Meaning |
+|---|---|
+| `container_bits` | The bit depth the file claims (e.g. 24-bit). |
+| `effective_bits` | The bit depth actually being used, taken from the *least*-padded sample tested (e.g. only 16 real bits, the rest padded with zeros). A mismatch here — every tested sample padded — is what triggers `UPSCALED`. |
+| `predominant_bit_depth` | The most common per-sample bit depth across the tested audio. Informational: on its own it never triggers `UPSCALED`, even when it matches `effective_bits`. |
+| `lower_bit_activity_fraction` | The fraction of samples that show real content below 16 bits. A low but nonzero value (a mostly-padded file with a few genuinely deeper samples — dither, gain changes, edits) shows up as a note, not a verdict change. |
+| `coverage` | How much of the file the bit-depth check actually read: `sampled` (~30 s window, normal scan), `full` (deep scan, whole file), or `capped` (deep scan hit its time limit). An exact `UPSCALED` hit is more confident (0.95) when confirmed by `full`/`capped` than by `sampled` (0.9). |
+
+**`integrity`** — how much of the file was actually decoded:
+
+| Field | Meaning |
+|---|---|
+| `status` | `sampled_decode_ok` (normal scan, a few windows read), `full_decode_ok` (deep scan, whole file read), `decode_failed` (file couldn't be opened), or `unsupported` (DSD — deliberately not analyzed). |
+| `coverage` | How much of the file that status is based on: `sampled`, `partial`, `capped` (deep scan hit its time limit), or `full`. |
+
+**`delivery`** — what codec is actually inside the file (`null` if there's nothing to report — suffix and content agree and no codec was probed):
+
+| Field | Meaning |
+|---|---|
+| `codec` | The actual codec detected (e.g. `mp3`, `alac`) when it differs from a simple guess-by-extension. |
+| `codec_mismatch` | Set when the file extension lies about the format (e.g. a `.m4a` file that's actually lossless ALAC, or vice versa). |
+
+**`windows`** — multi-window sampling detail (`null` in deep-scan mode, which doesn't use windows):
+
+| Field | Meaning |
+|---|---|
+| `samples` | One entry per sampled window (spread through the track): its offset/length, the cutoff frequency found there, and whether it was too quiet to trust (`silent`). The *worst* (lowest-cutoff) window is what drives the verdict — one bad passage can't be averaged away — unless the windows disagree and the widest reaches full bandwidth (see `agree`). |
+| `agree` | `true` if all the windows found roughly the same cutoff, `false` if they disagree, `null` if there weren't enough usable windows to compare. This feeds the verdict both ways: agreement at a standard rate's Nyquist corroborates a resampler wall (a wall is constant; real content follows the music), while disagreement with the widest window reaching full bandwidth — and no encoder/resampler signature in the lowest — reads as a genuinely dark passage, not a wall (`CLEAN`, "variable bandwidth"). Disagreement is still worth a deep scan: it's also what a spliced or mixed-source file looks like. |
+
+**`evidence`** — specific clues checked while forming the verdict (see the table below; all nullable — `null` means that check didn't run for this file):
+
+| Field | Plain-English question | What it means |
+|---|---|---|
+| `edge_machine_like` | Does the sound cut off like a wall, or fade out naturally? | `true` = sharp, encoder-style cutoff; `false` = gradual, natural rolloff; `null` = not enough spectrum above the cutoff to tell. |
+| `shelf_digitally_silent` | Is there true silence above the cutoff, or just quiet noise? | `true` = digital silence (a transcode/fake signature); `false` = real noise floor present (points to a genuine recording); `null` = nothing measurable above the cutoff. |
+| `alias_image_detected` | Does the noise above the cutoff mirror the sound below it? | `true` = yes, a resampler artifact (strong upsampling proof); `false` = checked, no mirroring found; `null` = this check only runs when a track is already a hi-res-upsample candidate, so most tracks never reach it. |
+| `narrow_high_frequency_tone_present` | Is there one odd narrow spike high in the spectrum? | `true` = an isolated tone was found and excluded from the cutoff measurement (so it can't fake extra bandwidth); `false` = none found; `null` = not evaluated. |
+
+None of these fields change what verdict a track gets by themselves — they're the paper trail for the verdict the detection logic already reached.
 
 ## Install (local repository, per the official docs)
 
@@ -105,7 +167,7 @@ constants behind the detection thresholds.
 
 - **Only tracks already analyzed by core AudioMuse** get spectrum rows during a scan (the FK requires a `score` row). Un-analyzed tracks are counted as `not_in_score` and get picked up automatically by the hook when you run core analysis.
 - **Navidrome transcoding**: tracks are fetched via the Subsonic `stream` endpoint. Make sure the AudioMuse player/client in Navidrome has **no transcoding profile** ("raw"), otherwise you'd be analyzing the transcode, not the file.
-- **Database size**: at the default 800×280 px, a spectrogram is roughly 100–300 KB of base64. 10 000 songs ≈ 1–3 GB in Postgres. Tune the image size in settings if that matters; deleting rows for an album and rescanning regenerates them.
+- **Database size**: at the default 800×280 px, a spectrogram is roughly 100–300 KB of base64. 10 000 songs ≈ 1–3 GB in Postgres. Tune the image size in settings if that matters; deleting rows for an album and rescanning regenerates them. A "skip spectrogram for CLEAN tracks" toggle in settings (default off) skips storing one for tracks that pass clean — since audio isn't retained after analysis, a skipped spectrogram can't be generated later by re-visiting the row, only by rescanning the track.
 - **Verify mode** downloads every track (to hash it) — heavy on a big library over the network; use it when you suspect in-place file edits that Navidrome metadata wouldn't reveal.
 
 ## License

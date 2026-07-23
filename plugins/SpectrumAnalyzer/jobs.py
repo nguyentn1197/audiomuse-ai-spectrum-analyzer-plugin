@@ -183,6 +183,7 @@ def _settings():
         'drop_db': int(get_setting('drop_db', 40)),
         'img_w': int(get_setting('img_w', 800)),
         'img_h': int(get_setting('img_h', 280)),
+        'skip_clean_spectrograms': bool(get_setting('skip_clean_spectrograms', False)),
     }
 
 
@@ -214,8 +215,9 @@ def _upsert(item_id, info, result, meta_fp, audio_md5):
         'artist, album, album_id, file_path, '
         'suffix, bitrate, meta_fp, audio_md5, sample_rate, seg_offset, seg_seconds, '
         'cutoff_hz, edge_db_khz, shelf_db, verdict, est_source, confidence, details, '
-        'container_bits, effective_bits, spectrogram_b64, analyzed_at) '
-        'VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s, now()) '
+        'container_bits, effective_bits, spectrogram_b64, analysis_rev, deep_eligible, '
+        'analyzed_at) '
+        'VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s, now()) '
         'ON CONFLICT (item_id) DO UPDATE SET '
         'provider_track_id=EXCLUDED.provider_track_id, server_id=EXCLUDED.server_id, '
         'title=EXCLUDED.title, artist=EXCLUDED.artist, album=EXCLUDED.album, '
@@ -227,7 +229,9 @@ def _upsert(item_id, info, result, meta_fp, audio_md5):
         'verdict=EXCLUDED.verdict, est_source=EXCLUDED.est_source, '
         'confidence=EXCLUDED.confidence, details=EXCLUDED.details, '
         'container_bits=EXCLUDED.container_bits, effective_bits=EXCLUDED.effective_bits, '
-        'spectrogram_b64=EXCLUDED.spectrogram_b64, analyzed_at=now()',
+        'spectrogram_b64=EXCLUDED.spectrogram_b64, '
+        'analysis_rev=EXCLUDED.analysis_rev, deep_eligible=EXCLUDED.deep_eligible, '
+        'analyzed_at=now()',
         (
             item_id, info.get('provider_track_id'), info.get('server_id'),
             info.get('title'), info.get('artist'), info.get('album'),
@@ -238,6 +242,7 @@ def _upsert(item_id, info, result, meta_fp, audio_md5):
             result['verdict'], result['est_source'], result['confidence'],
             result['details'], result.get('container_bits'),
             result.get('effective_bits'), result['spectrogram_b64'],
+            result['analysis_rev'], result.get('deep_eligible', True),
         ),
     )
     db.commit()
@@ -254,15 +259,17 @@ def _touch_fingerprint(item_id, meta_fp):
 
 
 def _existing_rows(item_ids=None):
-    """item_id -> (meta_fp, audio_md5), optionally restricted to item_ids."""
+    """item_id -> (meta_fp, audio_md5, analysis_rev), optionally restricted
+    to item_ids."""
     db = get_db()
     cur = db.cursor()
     if item_ids is None:
-        cur.execute('SELECT item_id, meta_fp, audio_md5 FROM ' + table('results'))
+        cur.execute('SELECT item_id, meta_fp, audio_md5, analysis_rev FROM '
+                    + table('results'))
     else:
-        cur.execute('SELECT item_id, meta_fp, audio_md5 FROM ' + table('results')
-                    + ' WHERE item_id = ANY(%s)', (list(item_ids),))
-    rows = {r[0]: (r[1], r[2]) for r in cur.fetchall()}
+        cur.execute('SELECT item_id, meta_fp, audio_md5, analysis_rev FROM '
+                    + table('results') + ' WHERE item_id = ANY(%s)', (list(item_ids),))
+    rows = {r[0]: (r[1], r[2], r[3]) for r in cur.fetchall()}
     cur.close()
     return rows
 
@@ -391,14 +398,17 @@ def _analyze_download(track, info, meta_fp, settings, existing, mode, deep=False
             return 'error'
         md5 = file_md5(path)
         prev = existing.get(item_id)
-        if mode != 'force' and prev and prev[1] == md5:
-            # bytes unchanged; just refresh the cheap fingerprint
+        rev = dsp.analysis_rev(settings['drop_db'], settings['segment_seconds'])
+        if mode != 'force' and prev and prev[1] == md5 and prev[2] == rev:
+            # bytes unchanged and analyzed by the current analyzer;
+            # just refresh the cheap fingerprint
             _touch_fingerprint(item_id, meta_fp)
             return 'unchanged'
         result = dsp.analyze_file(
             path, suffix=info.get('suffix'), bitrate_kbps=info.get('bitrate'),
             segment_seconds=settings['segment_seconds'], drop_db=settings['drop_db'],
             img_w=settings['img_w'], img_h=settings['img_h'], deep=deep,
+            skip_spectrogram_for_clean=settings['skip_clean_spectrograms'],
         )
         _upsert(item_id, info, result, meta_fp, md5)
         return 'analyzed'
@@ -454,6 +464,7 @@ def scan_album_job(album_id, album_name, mode='changed', task_id=None,
     button (mode=force, no parent; server recovered from the stored rows)."""
     task_id = task_id or _rq_task_id() or str(uuid.uuid4())
     settings = _settings()
+    rev = dsp.analysis_rev(settings['drop_db'], settings['segment_seconds'])
     counters = {k: 0 for k in COUNTER_KEYS}
 
     def status(state, progress, detail):
@@ -501,7 +512,8 @@ def scan_album_job(album_id, album_name, mode='changed', task_id=None,
                 else:
                     meta_fp = meta_fingerprint(track)
                     prev = existing.get(item_id)
-                    if mode == 'changed' and prev and meta_fp and prev[0] == meta_fp:
+                    if (mode == 'changed' and prev and meta_fp
+                            and prev[0] == meta_fp and prev[2] == rev):
                         counters['skipped'] += 1
                     else:
                         try:
@@ -567,6 +579,8 @@ def scan_library_job(mode='changed', task_id=None, all_servers=False):
         parent_counters = {k: 0 for k in COUNTER_KEYS}
         score_ids = _score_ids() if mode == 'changed' else None
         existing = _existing_rows() if mode == 'changed' else None
+        s = _settings()
+        rev = dsp.analysis_rev(s['drop_db'], s['segment_seconds'])
 
         def snapshot(detail):
             rows = _child_rows(task_id)
@@ -637,7 +651,7 @@ def scan_library_job(mode='changed', task_id=None, all_servers=False):
                     else:
                         prev = existing.get(item_id)
                         fp = meta_fingerprint(track)
-                        if prev and fp and prev[0] == fp:
+                        if prev and fp and prev[0] == fp and prev[2] == rev:
                             tallies['skipped'] += 1
                         else:
                             pending += 1
@@ -795,19 +809,20 @@ def on_song_analyzed(song):
         meta_fp = meta_fingerprint(media_item) or None
 
         md5 = file_md5(path)
+        settings = _settings()
+        rev = dsp.analysis_rev(settings['drop_db'], settings['segment_seconds'])
         db = get_db()
         cur = db.cursor()
-        cur.execute('SELECT audio_md5 FROM ' + table('results') + ' WHERE item_id=%s',
-                    (item_id,))
+        cur.execute('SELECT audio_md5, analysis_rev FROM ' + table('results')
+                    + ' WHERE item_id=%s', (item_id,))
         row = cur.fetchone()
         cur.close()
-        if row and row[0] == md5:
+        if row and row[0] == md5 and row[1] == rev:
             if meta_fp:
                 _touch_fingerprint(item_id, meta_fp)  # backfill older hook rows
-            return  # same bytes, nothing to do
+            return  # same bytes, same analyzer, nothing to do
 
         meta = song.get('metadata') or {}
-        settings = _settings()
         info = {
             'item_id': item_id,
             'provider_track_id': str(native_id),
@@ -824,6 +839,7 @@ def on_song_analyzed(song):
             path, suffix=info['suffix'], bitrate_kbps=None,
             segment_seconds=settings['segment_seconds'], drop_db=settings['drop_db'],
             img_w=settings['img_w'], img_h=settings['img_h'],
+            skip_spectrogram_for_clean=settings['skip_clean_spectrograms'],
         )
         # (if the payload had no media_item — e.g. an older core — meta_fp is
         # NULL and the next 'changed' scan downloads once, notices the MD5
