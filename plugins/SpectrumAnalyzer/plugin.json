@@ -9,6 +9,11 @@
   "_comment": "Pre-0.1.0 development history (0.1.0..0.6.2 before the version reset) is preserved in CHANGELOG.md.",
   "versions": [
     {
+      "version": "0.3.3",
+      "min_core_version": "2.6.2",
+      "changelog": "Add Deep Queue requeue and cleaning mechanism"
+    },
+    {
       "version": "0.3.2",
       "min_core_version": "2.6.2",
       "changelog": "Phase 1 forensic improvements: distributed segment sampling (5 windows for native formats, 3 for ffmpeg-based) catches low-bandwidth passages missed by a single fixed offset; robust cutoff detection (gap-bridging, minimum width, isolated-tone exclusion) and phase-1b field-calibration against real 96 kHz tracks fix false CLEAN on upsamples and false LOWPASSED on genuine dark masters. Codec-aware transcode gating (MP3 only — other codecs get 'no calibrated mapping' notes). Container/codec probe (tier 2: soundfile for FLAC/WAV/AIFF/MP3/OGG native detection; tier 3: ffprobe for m4a/ALAC/opus/wma/mpc). Progressive integrity tracking (unsupported/decode_failed/sampled_decode_ok/full_decode_ok + coverage depth). Structured evidence namespaces (integrity.*, delivery.*, windows.*, bit_depth.*, evidence.*). Analysis-revision stamp ensures verdict-logic changes force re-analysis. Deep whole-file scanning (120s chunks, 30min cap, per-second spectra, constant-wall detection). Bit-depth histogram (sampled vs. full-file, predominant depth + low-activity fraction as informational notes).",
