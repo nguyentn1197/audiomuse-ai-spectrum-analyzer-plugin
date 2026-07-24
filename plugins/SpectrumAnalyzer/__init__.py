@@ -215,6 +215,10 @@ def home():
         min_bad = 0
     if suspects_only:
         min_bad = max(1, min_bad)
+    try:
+        min_conf = max(0, min(100, int(request.args.get('min_conf', 0) or 0)))
+    except ValueError:
+        min_conf = 0
     per_page = 100
 
     # manually verified tracks never count as suspect or lowpassed
@@ -246,6 +250,12 @@ def home():
     if min_bad:
         having.append(bad_expr + ' >= %s')
         having_params += [SUSPECT_VERDICTS, min_bad]
+    if min_conf:
+        # albums containing at least one song whose verdict confidence
+        # clears the threshold (confidence is stored 0.0-1.0; the UI is %)
+        cond = 'confidence >= %s' + (' AND NOT verified' if unverified_only else '')
+        having.append('COUNT(*) FILTER (WHERE ' + cond + ') > 0')
+        having_params.append(min_conf / 100.0)
     if verified_only:
         having.append('COUNT(*) FILTER (WHERE verified) > 0')
     having_sql = (' HAVING ' + ' AND '.join(having)) if having else ''
@@ -360,7 +370,7 @@ def home():
         for album, count, bad, low, ver, pending, min_cut, last in rows)
 
     def page_url(p):
-        params = {'q': q, 'min_bad': min_bad, 'p': p, 'v': sel_verdicts}
+        params = {'q': q, 'min_bad': min_bad, 'min_conf': min_conf, 'p': p, 'v': sel_verdicts}
         if verified_only:
             params['verified'] = 1
         if unverified_only:
@@ -396,6 +406,10 @@ def home():
         f'<label style="white-space:nowrap;">min suspect tracks '
         f'<input type="number" name="min_bad" min="0" value="{min_bad}" '
         f'style="width:4rem;"></label>'
+        f'<label style="white-space:nowrap;" title="Show only albums containing at '
+        f'least one track whose verdict confidence is at least this percentage">'
+        f'min confidence % <input type="number" name="min_conf" min="0" max="100" '
+        f'value="{min_conf}" style="width:4rem;"></label>'
         f'<label style="white-space:nowrap;"><input type="checkbox" name="verified" '
         f'value="1" {"checked" if verified_only else ""}> only albums with verified tracks</label>'
         f'<button type="submit" class="btn" style="{BTN_STYLE}">Filter</button></div>'
@@ -439,18 +453,46 @@ def home():
 def album():
     tbl = table('results')
     name = request.args.get('name') or ''
+    sel_verdicts = [v for v in request.args.getlist('v') if v in VERDICT_STYLE]
+    unverified_only = bool(request.args.get('unv'))
+    try:
+        min_conf = max(0, min(100, int(request.args.get('min_conf', 0) or 0)))
+    except ValueError:
+        min_conf = 0
+    filtered = bool(sel_verdicts or min_conf or unverified_only)
+
+    where = ['album = %s']
+    params = [name]
+    if sel_verdicts:
+        where.append('verdict = ANY(%s)')
+        params.append(sel_verdicts)
+    if min_conf:
+        where.append('confidence >= %s')
+        params.append(min_conf / 100.0)
+    if unverified_only:
+        where.append('NOT verified')
+
     db = get_db()
     cur = db.cursor()
+    # album_id is looked up independent of the filter above so "Re-analyze
+    # album" still works even when the filter hides every visible track
+    cur.execute('SELECT album_id FROM ' + tbl +
+                ' WHERE album = %s AND album_id IS NOT NULL LIMIT 1', (name,))
+    r = cur.fetchone()
+    album_id = r[0] if r else None
+
+    cur.execute('SELECT COUNT(*) FROM ' + tbl + ' WHERE album = %s', (name,))
+    total_tracks = cur.fetchone()[0]
+
     cur.execute(
         'SELECT item_id, title, artist, suffix, bitrate, sample_rate, cutoff_hz,'
         ' edge_db_khz, verdict, est_source, confidence, details,'
         ' to_char(analyzed_at, \'DD-MM-YYYY HH24:MI\'), spectrogram_b64, album_id,'
         ' container_bits, effective_bits, verified, deep_pending, deep_eligible'
-        ' FROM ' + tbl + ' WHERE album = %s ORDER BY title', (name,))
+        ' FROM ' + tbl + ' WHERE ' + ' AND '.join(where) + ' ORDER BY title',
+        tuple(params))
     rows = cur.fetchall()
     cur.close()
-
-    album_id = next((r[14] for r in rows if r[14]), None)
 
     cards = []
     for (item_id, title, artist, suffix, bitrate, sr, cutoff, edge, verdict,
@@ -471,7 +513,9 @@ def album():
             '<div style="margin:1rem 0;padding:.8rem;border:1px solid #ddd;border-radius:6px;">'
             '<div style="display:flex;justify-content:space-between;align-items:center;'
             'flex-wrap:wrap;gap:.5rem;">'
-            f'<div><strong>{_esc(title)}</strong> <span style="color:#6b7280;">'
+            f'<div><input type="checkbox" form="bulk-form" name="item_id" '
+            f'value="{_esc(item_id)}" class="bulk-select-cb" style="margin-right:.5rem;">'
+            f'<strong>{_esc(title)}</strong> <span style="color:#6b7280;">'
             f'{_esc(artist)} &middot; {fmt}</span></div>'
             f'<div>{_badge(verdict, conf)}'
             + ('<span style="background:#f59e0b;color:#fff;border-radius:4px;'
@@ -522,12 +566,67 @@ def album():
         f'CLEAN. Verified and already-queued tracks are skipped.">'
         'Deep scan all non-CLEAN</button></form>') if rows else ''
 
+    filter_form = (
+        f'<form method="get" style="margin:.6rem 0;">'
+        f'<input type="hidden" name="name" value="{_esc(name)}">'
+        f'<div style="display:flex;gap:.2rem .6rem;align-items:center;flex-wrap:wrap;">'
+        f'<span style="font-size:.85rem;color:#6b7280;margin-right:.2rem;" '
+        f'title="Show only tracks with any of the selected statuses">status:</span>'
+        + ''.join(
+            f'<label style="display:inline-flex;align-items:center;gap:.25rem;'
+            f'font-size:.85rem;white-space:nowrap;cursor:pointer;" title="{_esc(vlabel)}">'
+            f'<input type="checkbox" name="v" value="{v}" '
+            f'{"checked" if v in sel_verdicts else ""}>'
+            f'<span style="background:{color};color:#fff;border-radius:4px;'
+            f'padding:.05rem .4rem;">{v}</span></label>'
+            for v, (color, vlabel) in VERDICT_STYLE.items())
+        + f'<label style="white-space:nowrap;font-size:.85rem;margin-left:.4rem;" '
+          f'title="Show only tracks with verdict confidence at least this percentage">'
+          f'min confidence % <input type="number" name="min_conf" min="0" max="100" '
+          f'value="{min_conf}" style="width:4rem;"></label>'
+        + f'<label style="white-space:nowrap;font-size:.85rem;margin-left:.4rem;" '
+          f'title="Hide manually verified tracks">'
+          f'<input type="checkbox" name="unv" value="1" '
+          f'{"checked" if unverified_only else ""}> unverified tracks only</label>'
+        + f'<button type="submit" class="btn" style="{BTN_STYLE}">Filter</button>'
+        '</div></form>'
+        + (f'<p style="font-size:.85rem;color:#6b7280;">Showing {len(rows)} of '
+           f'{total_tracks} tracks matching filter.</p>' if filtered else '')
+    )
+
+    bulk_actions = (
+        f'<form id="bulk-form" method="post" '
+        f'action="{url_for("spectrum_analyzer.rescan_selected")}" style="margin:.6rem 0;">'
+        '<label style="font-size:.85rem;margin-right:.8rem;cursor:pointer;">'
+        '<input type="checkbox" onclick="var ck=this.checked;'
+        'document.querySelectorAll(\'.bulk-select-cb\').forEach('
+        'function(c){c.checked=ck;});"> select all shown</label>'
+        f'<button type="submit" class="btn" style="{BTN_STYLE}" '
+        f'formaction="{url_for("spectrum_analyzer.rescan_selected")}" '
+        'onclick="var n=document.querySelectorAll(\'.bulk-select-cb:checked\').length;'
+        'if(!n){alert(\'Select at least one track first.\');return false;}'
+        'return confirm(\'Re-analyze \'+n+\' selected track(s)?\');" '
+        'title="Force re-download and re-analyze the checked tracks">'
+        'Re-analyze selected</button> '
+        f'<button type="submit" class="btn" style="{BTN_STYLE}" '
+        f'formaction="{url_for("spectrum_analyzer.deep_rescan_selected")}" '
+        'onclick="var n=document.querySelectorAll(\'.bulk-select-cb:checked\').length;'
+        'if(!n){alert(\'Select at least one track first.\');return false;}'
+        'return confirm(\'Deep-scan \'+n+\' selected track(s)? Already-queued or '
+        'non-eligible tracks are skipped.\');" '
+        'title="Queue a deep (whole-file) scan for the checked tracks">'
+        'Deep-scan selected</button>'
+        '</form>'
+    ) if rows else ''
+
     body = (
         f'<p><a href="{url_for("spectrum_analyzer.home")}">&laquo; all albums</a></p>'
         f'<div style="display:flex;justify-content:space-between;align-items:center;'
         f'flex-wrap:wrap;gap:.5rem;">'
         f'<h3 style="margin:.2rem 0;">{_esc(name) or "(no album)"}</h3>{rescan_all}</div>'
-        + (''.join(cards) or '<p>No analyzed tracks in this album.</p>')
+        f'{filter_form}{bulk_actions}'
+        + (''.join(cards) or ('<p>No tracks match this filter.</p>' if filtered
+                              else '<p>No analyzed tracks in this album.</p>'))
     )
     return render_page(body, title='Spectrum Analyzer')
 
@@ -577,6 +676,36 @@ def deep_rescan(item_id):
     db.commit()
     cur.close()
     if tagged:
+        enqueue(jobs.analyze_track_job, item_id, deep=True, queue='high')
+    return redirect(request.referrer or url_for('spectrum_analyzer.home'))
+
+
+@bp.route('/album/rescan_selected', methods=['POST'])
+def rescan_selected():
+    item_ids = request.form.getlist('item_id')
+    for item_id in item_ids:
+        enqueue(jobs.analyze_track_job, item_id, queue='high')
+    return redirect(request.referrer or url_for('spectrum_analyzer.home'))
+
+
+@bp.route('/album/deep_rescan_selected', methods=['POST'])
+def deep_rescan_selected():
+    item_ids = request.form.getlist('item_id')
+    if not item_ids:
+        return redirect(request.referrer or url_for('spectrum_analyzer.home'))
+    # same NOT deep_pending AND deep_eligible guard as the single-track button;
+    # tag-and-collect keeps it idempotent for tracks already queued/running
+    db = get_db()
+    cur = db.cursor()
+    cur.execute(
+        'UPDATE ' + table('results') + ' SET deep_pending=TRUE, deep_pending_since=now()'
+        ' WHERE item_id = ANY(%s) AND NOT deep_pending AND deep_eligible'
+        ' RETURNING item_id',
+        (item_ids,))
+    tagged = [r[0] for r in cur.fetchall()]
+    db.commit()
+    cur.close()
+    for item_id in tagged:
         enqueue(jobs.analyze_track_job, item_id, deep=True, queue='high')
     return redirect(request.referrer or url_for('spectrum_analyzer.home'))
 
