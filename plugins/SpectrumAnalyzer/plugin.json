@@ -11,7 +11,7 @@
     {
       "version": "0.3.3",
       "min_core_version": "2.6.2",
-      "changelog": "Add Deep Queue requeue and cleaning mechanism"
+      "changelog": "Add Deep Queue requeue and cleaning mechanism. Improve UI"
     },
     {
       "version": "0.3.2",
