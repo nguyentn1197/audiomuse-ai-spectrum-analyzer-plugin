@@ -184,6 +184,7 @@ def _settings():
         'img_w': int(get_setting('img_w', 800)),
         'img_h': int(get_setting('img_h', 280)),
         'skip_clean_spectrograms': bool(get_setting('skip_clean_spectrograms', False)),
+        'deep_orphan_ttl_hours': int(get_setting('deep_orphan_ttl_hours', 2)),
     }
 
 
@@ -712,7 +713,7 @@ def _clear_deep_pending(item_id):
     try:
         db = get_db()
         cur = db.cursor()
-        cur.execute('UPDATE ' + table('results') + ' SET deep_pending=FALSE'
+        cur.execute('UPDATE ' + table('results') + ' SET deep_pending=FALSE, deep_pending_since=NULL'
                     ' WHERE item_id=%s', (item_id,))
         db.commit()
         cur.close()
@@ -787,6 +788,37 @@ def _analyze_track(item_id, deep):
 def scan_changed_task():
     """Entry point for Scheduled Tasks (cron/run-now): incremental scan."""
     return scan_library_job(mode='changed')
+
+
+def recover_deep_pending_task():
+    """Cron: re-queue deep scans whose job was lost while still queued.
+
+    deep_pending is set at enqueue time and only cleared by
+    analyze_track_job's finally block. If a worker dies before that job
+    ever dequeues, the flag sticks forever and the queue routes refuse to
+    re-queue while it's set. This finds rows stuck past the configured
+    TTL, resets the timestamp (so a second run inside the same TTL window
+    doesn't re-detect and re-queue the same row), and re-enqueues them.
+    """
+    ttl_hours = _settings()['deep_orphan_ttl_hours']
+    db = get_db()
+    cur = db.cursor()
+    cur.execute(
+        'UPDATE ' + table('results') + ' SET deep_pending_since = now()'
+        ' WHERE deep_pending = TRUE AND deep_eligible = TRUE'
+        ' AND (deep_pending_since IS NULL'
+        '      OR deep_pending_since < now() - make_interval(hours => %s))'
+        ' RETURNING item_id',
+        (ttl_hours,)
+    )
+    item_ids = [r[0] for r in cur.fetchall()]
+    db.commit()
+    cur.close()
+    for item_id in item_ids:
+        logger.warning(
+            'spectrum_analyzer: deep scan orphaned for %s, re-queuing', item_id)
+        enqueue(analyze_track_job, item_id, deep=True)
+    return {'requeued': len(item_ids)}
 
 
 def on_song_analyzed(song):
