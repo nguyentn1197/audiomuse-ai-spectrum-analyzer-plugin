@@ -11,7 +11,9 @@
     {
       "version": "0.3.3",
       "min_core_version": "2.6.2",
-      "changelog": "Add Deep Queue requeue and cleaning mechanism. Improve UI"
+      "changelog": "Add Deep Queue requeue and cleaning mechanism. Improve UI",
+      "sourceUrl": "https://raw.githubusercontent.com/nguyentn1197/audiomuse-ai-spectrum-analyzer-plugin/refs/heads/main/dist/spectrum_analyzer-0.3.3.zip",
+      "checksum": "70d09265275025e95594cebe2c09ad69"
     },
     {
       "version": "0.3.2",
