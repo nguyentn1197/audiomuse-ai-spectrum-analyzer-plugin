@@ -1,0 +1,40 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "autoshare": false,
+  "permissions": {
+    "bash": [
+      { "permission": "allow", "pattern": "git status*" },
+      { "permission": "allow", "pattern": "git diff*" },
+      { "permission": "allow", "pattern": "git log*" },
+      { "permission": "allow", "pattern": "git show*" },
+      { "permission": "allow", "pattern": "git branch*" },
+      { "permission": "allow", "pattern": "git remote*" },
+      { "permission": "allow", "pattern": "git stash list*" },
+      { "permission": "ask",   "pattern": "git add*" },
+      { "permission": "deny",   "pattern": "git commit*" },
+      { "permission": "ask",   "pattern": "git stash*" },
+      { "permission": "ask",   "pattern": "git checkout*" },
+      { "permission": "ask",   "pattern": "git switch*" },
+      { "permission": "deny",  "pattern": "git push*" },
+      { "permission": "deny",  "pattern": "git push --force*" },
+      { "permission": "allow", "pattern": "python3 -m unittest*" },
+      { "permission": "allow", "pattern": "python3 tests/run_verdicts.py*" },
+      { "permission": "allow", "pattern": "python3 tests/generate_adversarial_fixtures.py*" },
+      { "permission": "allow", "pattern": "python3 -c \"import*" },
+      { "permission": "allow", "pattern": "cat *" },
+      { "permission": "allow", "pattern": "head *" },
+      { "permission": "allow", "pattern": "tail *" },
+      { "permission": "allow", "pattern": "grep *" },
+      { "permission": "allow", "pattern": "rg *" },
+      { "permission": "allow", "pattern": "ls *" },
+      { "permission": "allow", "pattern": "find *" },
+      { "permission": "allow", "pattern": "ffprobe *" },
+      { "permission": "allow", "pattern": "ffmpeg -i *" },
+      { "permission": "ask",   "pattern": "ffmpeg *" },
+      { "permission": "ask",   "pattern": "./build.sh*" },
+      { "permission": "ask",   "pattern": "pip install*" },
+      { "permission": "ask",   "pattern": "pip3 install*" },
+      { "permission": "deny",  "pattern": "*" }
+    ]
+  }
+}
