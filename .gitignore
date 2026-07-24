@@ -9,3 +9,8 @@ __pycache__/
 .DS_Store
 .idea/
 .vscode/
+test_file/
+
+# OpenCode tool cache (machine-specific, auto-generated)
+.opencode/node_modules/
+.opencode/package-lock.json
