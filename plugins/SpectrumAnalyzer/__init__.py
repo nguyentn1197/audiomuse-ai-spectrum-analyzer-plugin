@@ -90,6 +90,9 @@ def migrate(db):
     # "deep scan any non-CLEAN track" behavior)
     cur.execute('ALTER TABLE ' + tbl +
                 ' ADD COLUMN IF NOT EXISTS deep_eligible BOOLEAN NOT NULL DEFAULT TRUE')
+    # Prerelease: timestamp when deep_pending was set, used for orphan detection
+    cur.execute('ALTER TABLE ' + tbl +
+                ' ADD COLUMN IF NOT EXISTS deep_pending_since TIMESTAMP')
     _migrate_v3_ids(db, cur, tbl)
     cur.execute('CREATE INDEX IF NOT EXISTS ' + tbl + '_album_idx ON ' + tbl + ' (album)')
     # optional weekly incremental scan, shipped disabled (admin enables it)
@@ -98,6 +101,13 @@ def migrate(db):
         'ON CONFLICT (task_type) DO NOTHING',
         ('plugin.spectrum_analyzer.scan_changed',
          'plugin.spectrum_analyzer.scan_changed', '0 4 * * 0'),
+    )
+    # optional deep-scan orphan recovery, shipped disabled (admin enables it)
+    cur.execute(
+        'INSERT INTO cron (name, task_type, cron_expr, enabled) VALUES (%s, %s, %s, FALSE) '
+        'ON CONFLICT (task_type) DO NOTHING',
+        ('plugin.spectrum_analyzer.recover_deep_pending',
+         'plugin.spectrum_analyzer.recover_deep_pending', '0 */3 * * *'),
     )
     db.commit()
     cur.close()
@@ -277,6 +287,25 @@ def home():
         f'every track in the library whose verdict is not CLEAN. Verified and '
         f'already-queued tracks are skipped.">Deep scan all non-CLEAN</button></form>')
 
+    requeue_pending_block = (
+        f'<form method="post" action="{url_for("spectrum_analyzer.requeue_deep_pending_all")}" '
+        f'style="display:inline-block;" '
+        f'onsubmit="return confirm(\'This force re-queues every track currently marked '
+        f'\\\'deep scan queued\\\', including ones that may still be legitimately '
+        f'running or waiting in line. Only do this if you are sure those scans are '
+        f'actually stuck (for example after a worker crash) - otherwise it will '
+        f'duplicate in-flight scans. Continue?\');">'
+        f'<button type="submit" class="btn" style="{BTN_STYLE}" '
+        f'title="Force re-queue every track currently flagged deep_pending right now, '
+        f'regardless of how long ago it was queued. Bypasses the automatic recovery '
+        f'timeout in Settings.">Force re-queue all pending deep scans</button></form>'
+        '<p style="font-size:.8rem;color:#dc2626;margin:.3rem 0 0;">'
+        '&#9888; Use carefully: this re-queues every track currently marked '
+        '&ldquo;deep scan queued&rdquo;, including any that may still be legitimately '
+        'running or waiting in line. Only use it when you are sure those scans are '
+        'actually stuck (e.g. after a worker crash) &mdash; otherwise you will get '
+        'duplicate scans.</p>')
+
     queued_msg = ''
     try:
         queued = int(request.args.get('queued', ''))
@@ -287,6 +316,17 @@ def home():
                       f'deep scan{"s" if queued != 1 else ""}'
                       + (' (all non-CLEAN tracks are already queued or verified)'
                          if queued == 0 else '') + '.</p>')
+
+    requeued_msg = ''
+    try:
+        requeued = int(request.args.get('requeued', ''))
+    except ValueError:
+        requeued = None
+    if requeued is not None:
+        requeued_msg = (f'<p style="color:#16a34a;font-weight:600;">Force re-queued '
+                        f'{requeued} deep scan{"s" if requeued != 1 else ""}'
+                        + (' (no tracks were currently marked deep scan queued)'
+                           if requeued == 0 else '') + '.</p>')
 
     def _album_tags(ver, pending):
         tags = ''
@@ -343,11 +383,12 @@ def home():
         f'(could not be analyzed: decode failure or unsupported format), '
         f'<strong style="color:#6b7280;">{n_verified}</strong> manually verified '
         f'(excluded from suspect and lowpassed counts).</p>'
-        f'{queued_msg}'
+        f'{queued_msg}{requeued_msg}'
         f'<div style="margin:.8rem 0;">{scan_buttons}</div>'
         '<p style="font-size:.85rem;color:#6b7280;">Scans run on the worker, album by album; '
         'progress appears under Active Tasks. Already-analyzed tracks are skipped unless '
         'their file changed.</p>'
+        f'<div style="margin:.8rem 0;">{requeue_pending_block}</div>'
         f'<form method="get" style="margin:.8rem 0;">'
         f'<div style="display:flex;gap:.8rem;align-items:center;flex-wrap:wrap;">'
         f'<input name="q" value="{_esc(q)}" placeholder="album / artist / song..." '
@@ -528,7 +569,7 @@ def deep_rescan(item_id):
     # button idempotent: repeat clicks while a scan is queued enqueue nothing.
     db = get_db()
     cur = db.cursor()
-    cur.execute('UPDATE ' + table('results') + ' SET deep_pending=TRUE'
+    cur.execute('UPDATE ' + table('results') + ' SET deep_pending=TRUE, deep_pending_since=now()'
                 ' WHERE item_id=%s AND NOT deep_pending AND deep_eligible'
                 ' RETURNING item_id',
                 (item_id,))
@@ -546,7 +587,7 @@ def _queue_deep_non_clean(album=None):
     scans are slow, let all workers share them instead of hogging high."""
     db = get_db()
     cur = db.cursor()
-    sql = ('UPDATE ' + table('results') + ' SET deep_pending=TRUE'
+    sql = ('UPDATE ' + table('results') + ' SET deep_pending=TRUE, deep_pending_since=now()'
            " WHERE verdict IS DISTINCT FROM 'CLEAN'"
            ' AND NOT verified AND NOT deep_pending AND deep_eligible')
     if album is None:
@@ -559,6 +600,33 @@ def _queue_deep_non_clean(album=None):
     for item_id in item_ids:
         enqueue(jobs.analyze_track_job, item_id, deep=True)
     return len(item_ids)
+
+
+def _requeue_all_deep_pending():
+    """Force re-queue every row currently flagged deep_pending, ignoring the
+    orphan-recovery TTL (see recover_deep_pending_task). Manual escape hatch
+    for when a user knows scans are stuck (e.g. after a worker crash) and
+    doesn't want to wait for the TTL/cron. Re-queuing a scan that is still
+    legitimately running or waiting in the queue causes a duplicate analysis,
+    so this is deliberately not automatic."""
+    db = get_db()
+    cur = db.cursor()
+    cur.execute(
+        'UPDATE ' + table('results') + ' SET deep_pending_since = now()'
+        ' WHERE deep_pending = TRUE AND deep_eligible = TRUE'
+        ' RETURNING item_id')
+    item_ids = [r[0] for r in cur.fetchall()]
+    db.commit()
+    cur.close()
+    for item_id in item_ids:
+        enqueue(jobs.analyze_track_job, item_id, deep=True)
+    return len(item_ids)
+
+
+@bp.route('/deep_pending/requeue_all', methods=['POST'])
+def requeue_deep_pending_all():
+    requeued = _requeue_all_deep_pending()
+    return redirect(url_for('spectrum_analyzer.home', requeued=requeued))
 
 
 @bp.route('/album/deep_all', methods=['POST'])
@@ -615,7 +683,8 @@ def settings():
         for key, lo, hi, dflt in (('segment_seconds', 20, 600, 90),
                                   ('drop_db', 20, 70, 40),
                                   ('img_w', 400, 2000, 800),
-                                  ('img_h', 160, 800, 280)):
+                                  ('img_h', 160, 800, 280),
+                                  ('deep_orphan_ttl_hours', 1, 168, 2)):  # 1h-7d, default 2h
             try:
                 set_setting(key, max(lo, min(hi, int(request.form.get(key, dflt)))))
             except (TypeError, ValueError):
@@ -641,6 +710,8 @@ def settings():
         + num('img_w', 800, 'Spectrogram width (px)', '')
         + num('img_h', 280, 'Spectrogram height (px)',
               'bigger images mean more base64 in the database')
+        + num('deep_orphan_ttl_hours', 2, 'Deep scan orphan timeout (hours)',
+              'hours a stuck "deep scan queued" flag sits before it\'s auto re-queued; must exceed worst-case queue wait')
         + f'<label style="display:block;margin:.6rem 0;">'
           f'<input type="checkbox" name="hook_enabled" {hook}> '
           'Also analyze songs automatically during core analysis (on_song_analyzed hook)</label>'
@@ -660,4 +731,5 @@ def register(ctx):
     # high queue: the orchestrator must not occupy the default workers its
     # per-album child jobs run on
     ctx.add_task('scan_changed', jobs.scan_changed_task, queue='high')
+    ctx.add_task('recover_deep_pending', jobs.recover_deep_pending_task, queue='high')
     ctx.on_song_analyzed(jobs.on_song_analyzed)
