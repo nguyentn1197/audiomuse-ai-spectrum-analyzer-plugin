@@ -12,8 +12,8 @@
       "version": "0.4.1",
       "min_core_version": "3.6.4",
       "changelog": "Fix issue on OPUS scan",
-      "sourceUrl": "",
-      "checksum": ""
+      "sourceUrl": "https://raw.githubusercontent.com/nguyentn1197/audiomuse-ai-spectrum-analyzer-plugin/refs/heads/main/dist/spectrum_analyzer-0.4.1.zip",
+      "checksum": "e4434f028efb6d5c08de1279312a6d7d"
     },
     {
       "version": "0.4.0",
