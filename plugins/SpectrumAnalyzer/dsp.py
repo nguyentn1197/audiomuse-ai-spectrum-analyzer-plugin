@@ -1163,7 +1163,9 @@ def analyze_file(path, suffix=None, bitrate_kbps=None, segment_seconds=90,
                                           segment_seconds, dsd_fmt)
 
     detected_fmt, detected_lossless, codec_name = _probe_container(path)
-    native_seekable = detected_fmt is not None
+    # libsndfile opens Ogg Opus but decodes it only in parts, so it stays on
+    # the ffmpeg tier even though tier 2 reports a format for it.
+    native_seekable = detected_fmt is not None and codec_name != 'opus'
 
     ffprobe_info = None
     if suffix in LOSSY_SUFFIXES and codec_name is None:

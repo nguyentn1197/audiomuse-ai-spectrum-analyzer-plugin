@@ -393,6 +393,27 @@ class TestDistributedSampling(unittest.TestCase):
                     self.assertIn('silent', w)
                 self.assertIn(d['windows']['agree'], (True, False))
 
+    def test_opus_takes_the_ffmpeg_window_tier(self):
+        # libsndfile 1.2.2 opens Ogg Opus, so tier 2 reports a format for it --
+        # but it decodes such a file only in parts, and a SoundFile window read
+        # raises at some offsets while returning audio at others. The tier
+        # choice must follow what libsndfile can decode, not what it can open.
+        import unittest.mock as mock
+        seen = {}
+
+        def record(path, segment_seconds, native_seekable, ffprobe_info):
+            seen['native_seekable'] = native_seekable
+            raise ValueError('could not decode audio (empty signal)')
+
+        path = os.path.join(FIXTURES, 'consistent_320.mp3')  # content irrelevant
+        with mock.patch.object(dsp, '_probe_container',
+                               return_value=('OGG', False, 'opus')), \
+             mock.patch.object(dsp, '_probe_ffprobe',
+                               return_value={'codec': 'opus', 'sample_rate': 48000,
+                                             'duration': 300.0}), \
+             mock.patch.object(dsp, '_load_windows', side_effect=record):
+            dsp.analyze_file(path, suffix='opus', bitrate_kbps=128)
+        self.assertIs(seen['native_seekable'], False)
 
 class TestStructuredEvidence(unittest.TestCase):
     """Structured evidence flags: every fact gets one namespaced home in
