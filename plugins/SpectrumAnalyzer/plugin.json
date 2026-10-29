@@ -9,6 +9,13 @@
   "_comment": "Pre-0.1.0 development history (0.1.0..0.6.2 before the version reset) is preserved in CHANGELOG.md.",
   "versions": [
     {
+      "version": "0.4.1",
+      "min_core_version": "3.6.4",
+      "changelog": "Fix issue on OPUS scan",
+      "sourceUrl": "",
+      "checksum": ""
+    },
+    {
       "version": "0.4.0",
       "min_core_version": "3.6.4",
       "changelog": "AudioMuse-AI 3.6.4 support. 3.2 replaced Redis/RQ with a Postgres task queue, which broke three things: scan task rows were keyed by an id the core no longer knew (duplicate rows in Active Tasks, and Cancel no longer stopping a scan), lost album jobs were never detected so a scan whose worker died drained forever, and queued album rows older than 30 minutes were failed by the core's stale-row sweep, ending a scan early while albums were still waiting. All three now follow the new queue. The queue guard also counts live plugin tasks, so every bulk button (Deep scan all non-CLEAN, Force re-queue, bulk selected) would have queued exactly ONE track; they now start one orchestrator task that feeds the tracks onto the queue in batches and reports progress under Active Tasks. The Scan / Re-analyze / Deep analyze buttons no longer return a 500 when the core refuses new work because another task is running: they explain it, and no longer leave a stuck \"deep scan queued\" tag behind. 3.3.1 moved the core to librosa 1.0, which removed the audioread backend: deep scans of m4a/mp4/ALAC/opus/wma files decoded through it and now go through ffmpeg like the normal scan already did (deep scan of an ALAC .m4a used to come back INCONCLUSIVE). matplotlib floor raised to 3.10 for the core's numpy 2. Deep-scan recovery is now a bounded reconciler, not an age-based re-queue: each deep scan is owned by a claim whose state is tracked (claimed/launched/running/failed/outcome_unknown), and the recovery cron reads the claim's real queue state to settle the plugin's markers without ever auto-retrying an uncertain outcome (a retry is always an explicit user action); a failed bulk launch no longer strands tags. ANALYSIS_REV bumped to 7 for the ffmpeg decode fallback. Requires AudioMuse-AI 3.6.4 or newer; older cores stay on 0.3.3. Tracks the catalogue cannot map to an id on their server are counted as unmapped and skipped, and deep-scan claims left on the retired RQ queue are quarantined as outcome unknown, so they can only be retried explicitly.",
