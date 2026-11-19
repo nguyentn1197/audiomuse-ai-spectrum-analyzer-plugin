@@ -714,8 +714,8 @@ def _clock(seconds):
 
 
 def summarize(stream):
-    """One line for est_source / notes, e.g. 'damaged file: 29 bad frames,
-    1.9 s affected (2:41.9-2:46.7, 3:01.0-3:01.8)'."""
+    """One ASCII line for est_source / notes, e.g. 'damaged file: 29 bad
+    frames, 2.69 s affected (2:41.9-2:46.7, 3:01.0-3:01.6)'."""
     if not stream or stream.get('result') != 'damaged':
         return None
     if stream.get('method') == METHOD_FFMPEG:
@@ -737,7 +737,9 @@ def summarize(stream):
         text += f", {stream['damaged_seconds']:g} s affected"
     regions = stream.get('regions') or []
     if regions:
-        shown = ', '.join(f'{_clock(a)}–{_clock(b)}' for a, b in regions[:4])
+        # ASCII hyphen: est_source is a raw TEXT column and has always been
+        # plain ASCII (notes go through json.dumps, which escapes)
+        shown = ', '.join(f'{_clock(a)}-{_clock(b)}' for a, b in regions[:4])
         more = len(regions) - 4 + (1 if stream.get('regions_capped') else 0)
         text += f' ({shown}{f", +{more} more" if more > 0 else ""})'
     if stream.get('truncated'):

@@ -34,9 +34,9 @@ N_FFT = 4096
 
 # Bump when verdict logic changes so stored results re-analyze on the next
 # non-force scan (the skip paths in jobs.py require a rev match).
-# 8: container integrity check (integrity.py) -- a damaged file is
-# INCONCLUSIVE/'corrupt' instead of whatever its decodable audio read as, so
-# every stored row has to be re-checked once.
+# 8: container integrity check (integrity.py) -- a damaged file is DAMAGED
+# (integrity.status 'corrupt') instead of whatever its decodable audio read
+# as, so every stored row has to be re-checked once.
 ANALYSIS_REV = 8
 
 
@@ -1103,11 +1103,12 @@ def _inconclusive_result(suffix, bitrate_kbps, deep, drop_db, segment_seconds, e
     attempt (segment or deep) won't fare better. Same key shape as a normal
     result so callers (_upsert, on_song_analyzed) need no special-casing.
     `stream` is the container check (integrity.check_file), which usually
-    explains *why* the decode failed."""
+    explains *why* the decode failed: when it found damage the row is
+    DAMAGED (the more specific, actionable answer), not INCONCLUSIVE."""
     notes = [f'decode failed: {exc}']
-    est = 'could not decode audio'
+    verdict, est, conf = 'INCONCLUSIVE', 'could not decode audio', 0.0
     if _stream_damaged(stream):
-        est = _integrity.summarize(stream)
+        verdict, est, conf = 'DAMAGED', _integrity.summarize(stream), 1.0
         notes.insert(0, f'integrity: {est}')
     return {
         'sample_rate': None,
@@ -1116,9 +1117,9 @@ def _inconclusive_result(suffix, bitrate_kbps, deep, drop_db, segment_seconds, e
         'cutoff_hz': None,
         'edge_db_khz': None,
         'shelf_db': None,
-        'verdict': 'INCONCLUSIVE',
+        'verdict': verdict,
         'est_source': est,
-        'confidence': 0.0,
+        'confidence': conf,
         'container_bits': None,
         'effective_bits': None,
         'deep_eligible': False,
@@ -1190,11 +1191,13 @@ def analyze_file(path, suffix=None, bitrate_kbps=None, segment_seconds=90,
     Every result also carries the container integrity check
     (integrity.check_file -> details.integrity.stream): native FLAC frames on
     every scan, plus the stream MD5 / an ffmpeg decode for other formats on
-    deep scans. A damaged file comes back INCONCLUSIVE with
-    integrity.status 'corrupt' whatever its audio looks like -- truncated or
-    zero-filled frames decode cleanly up to the damage, and the garbage a
-    decoder makes of a broken frame is broadband noise, so the spectral
-    reading of a damaged file is not evidence of authenticity either way.
+    deep scans. A damaged file comes back DAMAGED (confidence 1.0: the
+    evidence is the file's own checksums or decoder errors, not a heuristic)
+    with integrity.status 'corrupt', whatever its audio looks like --
+    truncated or zero-filled frames decode cleanly up to the damage, and the
+    garbage a decoder makes of a broken frame is broadband noise, so the
+    spectral reading of a damaged file is not evidence of authenticity
+    either way.
     """
     if suffix is None:
         suffix = os.path.splitext(path)[1].lstrip('.')
@@ -1372,7 +1375,7 @@ def analyze_file(path, suffix=None, bitrate_kbps=None, segment_seconds=90,
         notes.insert(0, f'integrity: {summary}')
         notes.append(f'spectral reading of the decodable audio: {verdict} ({est}) '
                      f'-- not evidence either way on a damaged file')
-        verdict, est, conf = 'INCONCLUSIVE', summary, 0.0
+        verdict, est, conf = 'DAMAGED', summary, 1.0
         deep_eligible = False
 
     if skip_spectrogram_for_clean and verdict == 'CLEAN':

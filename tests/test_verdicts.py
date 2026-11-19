@@ -642,12 +642,14 @@ class TestAdversarialFixtures(unittest.TestCase):
         # reads every frame header and checks the sample count against
         # STREAMINFO without decoding, so segment mode now catches it too --
         # a new capability, not a changed expectation. Both modes agree:
-        # INCONCLUSIVE, 'corrupt' based on the full file, truncated, and
+        # DAMAGED (its own verdict, not INCONCLUSIVE: the file is broken, not
+        # unanalyzable), 'corrupt' based on the full file, truncated, and
         # never full_decode_ok.
         for deep in (False, True):
             with self.subTest(deep=deep):
                 r = _analyze('truncated.flac', 'flac', 900, deep=deep)
-                self.assertEqual(r['verdict'], 'INCONCLUSIVE')
+                self.assertEqual(r['verdict'], 'DAMAGED')
+                self.assertEqual(r['confidence'], 1.0)
                 self.assertFalse(r['deep_eligible'])
                 d = json.loads(r['details'])
                 self.assertEqual((d['integrity']['status'], d['integrity']['coverage']),
@@ -676,7 +678,7 @@ class TestAdversarialFixtures(unittest.TestCase):
         stream = d_deep['integrity']['stream']
         self.assertEqual(stream['method'], 'ffmpeg_decode')
         if shutil.which('ffmpeg'):
-            self.assertEqual(r_deep['verdict'], 'INCONCLUSIVE')
+            self.assertEqual(r_deep['verdict'], 'DAMAGED')
             self.assertEqual((d_deep['integrity']['status'], d_deep['integrity']['coverage']),
                              ('corrupt', 'full'))
             self.assertTrue(stream['truncated'])
@@ -736,7 +738,7 @@ class TestAdversarialFixtures(unittest.TestCase):
         for name, kbps in (('lossless_alac.m4a', 900), ('lossy_aac_256.m4a', 256)):
             with self.subTest(fixture=name):
                 r = _analyze(name, 'm4a', kbps, deep=True)
-                self.assertNotEqual(r['verdict'], 'INCONCLUSIVE')
+                self.assertNotIn(r['verdict'], ('INCONCLUSIVE', 'DAMAGED'))
                 self.assertTrue(r['deep_eligible'])
                 d = json.loads(r['details'])
                 self.assertEqual(d['integrity']['status'], 'full_decode_ok')
@@ -748,12 +750,12 @@ class TestAdversarialFixtures(unittest.TestCase):
         # the gate on the fallback: for a container libsndfile CAN open, a
         # librosa failure is the finding (corruption), not the wrong decoder.
         # Handing truncated.flac to ffmpeg would decode its intact prefix and
-        # launder a decode failure into a verdict. (Its status reads 'corrupt'
-        # rather than 'decode_failed' since the container check positively
-        # identifies the truncation; what matters here is that no spectral
-        # verdict leaks through and no decoded seconds are claimed.)
+        # launder a decode failure into a verdict. (It reads DAMAGED/'corrupt'
+        # rather than INCONCLUSIVE/'decode_failed' since the container check
+        # positively identifies the truncation; what matters here is that no
+        # spectral verdict leaks through and no decoded seconds are claimed.)
         r = _analyze('truncated.flac', 'flac', 900, deep=True)
-        self.assertEqual(r['verdict'], 'INCONCLUSIVE')
+        self.assertEqual(r['verdict'], 'DAMAGED')
         self.assertIsNone(r['cutoff_hz'])
         self.assertEqual(json.loads(r['details'])['integrity']['status'], 'corrupt')
 

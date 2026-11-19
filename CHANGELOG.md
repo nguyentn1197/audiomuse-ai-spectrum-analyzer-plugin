@@ -33,22 +33,35 @@ The new `integrity.py` reads damage from the container's own checksums.
 
 ### Result
 
-- A damaged file is `INCONCLUSIVE`, with `integrity.status = corrupt`
-  (coverage `full`), `confidence` 0.0 and `deep_eligible = false`.
-  `est_source` gives the bad-frame count and the merged regions. The
-  spectral reading it would have had is kept as a note, along with all
-  measurements and the spectrogram.
+- New primary verdict **`DAMAGED`**, kept separate from `INCONCLUSIVE`:
+  "this file is broken, replace it" and "this file couldn't be analyzed"
+  call for different actions. A damaged file gets `integrity.status =
+  corrupt` (coverage `full`), `confidence` 1.0 (the evidence is checksums
+  or decoder errors, not a heuristic) and `deep_eligible = false`.
+  `est_source` gives the bad-frame count and the merged regions as plain
+  ASCII. The spectral reading it would have had is kept as a note, along
+  with all measurements and the spectrogram.
+- Overview: a damaged count next to suspect / lowpassed / inconclusive, a
+  Damaged column in the album table, and albums sorted by suspects, then
+  damaged. The verdict gets its own badge and filter chip. `DAMAGED` is not
+  a suspect verdict, and "deep scan all non-clean" skips it.
+- This amends the plan's verdict/substatus contract (INCONCLUSIVE was the
+  only non-authenticity verdict). `DAMAGED` clears all three objections that
+  contract guarded against: it can't vanish from the UI, pollute suspect
+  counts, or be swept into bulk deep scans. Amendment recorded in AGENTS.md
+  and IMPROVEMENT_PLAN.md.
 - New `details.integrity.stream`: method, result, frames / bad / missing,
   truncated, damaged seconds, regions, zero-filled bytes (the
   transfer-gap fingerprint), trailing bytes, MD5 status, or the ffmpeg
   errors and durations. It is `null` when no check ran.
-- A decode-failure INCONCLUSIVE on a damaged FLAC now says where the damage
-  is.
+- A decode failure on a damaged FLAC comes back `DAMAGED` with the
+  location. One with no provable damage (no FLAC marker, no ffmpeg check)
+  stays `INCONCLUSIVE`.
 - `ANALYSIS_REV` 7 → 8: every stored row is re-checked once on the next scan.
 
 ### Tests
 
-- `tests/test_integrity.py` (30 tests). Damage variants are deterministic
+- `tests/test_integrity.py` (32 tests). Damage variants are deterministic
   transforms of committed fixtures, built on the fly rather than committed:
   zero-fill burst, single bit flip, dropped frame, cut on a frame boundary,
   header damage, MD5 flip/zero, large ID3v2 prefix, ID3v1 and junk suffixes,
@@ -58,13 +71,14 @@ The new `integrity.py` reads damage from the container's own checksums.
   MD5. ffmpeg reports zero errors on every committed MP3/M4A/OGG.
 - Changed expectations: `truncated.flac` is now caught in segment mode too.
   The old test pinned that as a documented limitation, not as the desired
-  outcome. Its deep-mode status reads `corrupt` instead of `decode_failed`.
+  outcome. Both modes now read `DAMAGED`/`corrupt`; deep mode used to give
+  `INCONCLUSIVE`/`decode_failed`.
   `truncated.mp3` is caught by deep scans when ffmpeg is present. Exact
   `details.integrity` comparisons gained the `stream` key.
 - Field check: a real 16-bit/44.1 kHz FLAC damaged in a download
   (54 zero-filled 1158-byte holes on a 1348-byte grid) is reported as 29
-  bad frames, 6 missing, 62,532 zero-filled bytes, at 2:41.9–2:46.7 and
-  3:01.0–3:01.6, matching a manual frame-by-frame analysis. Before, it was
+  bad frames, 6 missing, 62,532 zero-filled bytes, at 2:41.9-2:46.7 and
+  3:01.0-3:01.6, matching a manual frame-by-frame analysis. Before, it was
   CLEAN in both modes. A clean 24-bit/48 kHz copy of the same track passes,
   MD5 included.
 

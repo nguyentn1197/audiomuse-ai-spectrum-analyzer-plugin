@@ -44,8 +44,12 @@ VERDICT_STYLE = {
     'UPSCALED':         ('#7c3aed', 'Fake 24-bit: zero-padded 16-bit source'),
     'TRANSCODED_LOSSY': ('#dc2626', 'Lossy re-encoded from lower bitrate'),
     'FAKE_SUSPECT':     ('#dc2626', 'Suspect fake lossless (transcode)'),
-    'INCONCLUSIVE':     ('#6b7280', 'Could not be analyzed (damaged file, decode failure or unsupported format)'),
+    'DAMAGED':          ('#1f2937', 'Damaged file: broken or missing frames, truncated, or '
+                                    'checksum mismatch — replace the file'),
+    'INCONCLUSIVE':     ('#6b7280', 'Could not be analyzed (decode failure or unsupported format)'),
 }
+# DAMAGED is deliberately not a suspect verdict: it says nothing about
+# authenticity, and it is never deep-scan eligible (bulk deep scans skip it)
 SUSPECT_VERDICTS = ('FAKE_SUSPECT', 'TRANSCODED_LOSSY', 'UPSAMPLED', 'UPSCALED')
 
 
@@ -359,14 +363,17 @@ def home():
     low_expr = "COUNT(*) FILTER (WHERE verdict = 'LOWPASSED' AND NOT verified)"
     inconclusive_expr = ("COUNT(*) FILTER (WHERE verdict = 'INCONCLUSIVE'"
                          ' AND NOT verified)')
+    damaged_expr = "COUNT(*) FILTER (WHERE verdict = 'DAMAGED' AND NOT verified)"
 
     db = get_db()
     cur = db.cursor()
     cur.execute(
-        'SELECT COUNT(*), ' + bad_expr + ', ' + low_expr + ', ' + inconclusive_expr + ','
+        'SELECT COUNT(*), ' + bad_expr + ', ' + low_expr + ', ' + damaged_expr + ', '
+        + inconclusive_expr + ','
         ' COUNT(*) FILTER (WHERE verified),'
         ' COUNT(DISTINCT album) FROM ' + tbl, (SUSPECT_VERDICTS,))
-    total, suspects, n_lowpassed, n_inconclusive, n_verified, n_albums = cur.fetchone()
+    (total, suspects, n_lowpassed, n_damaged, n_inconclusive, n_verified,
+     n_albums) = cur.fetchone()
 
     # deep-claim breakdown for the retry controls: legacy (no claim metadata),
     # failed, outcome_unknown, and live (claimed/launched/running)
@@ -437,7 +444,7 @@ def home():
     params = ([SUSPECT_VERDICTS] + having_params
               + [SUSPECT_VERDICTS, per_page + 1, page * per_page])
     cur.execute(
-        'SELECT album, COUNT(*), ' + bad_expr + ', ' + low_expr + ','
+        'SELECT album, COUNT(*), ' + bad_expr + ', ' + low_expr + ', ' + damaged_expr + ','
         ' COUNT(*) FILTER (WHERE verified),'
         ' COUNT(*) FILTER (WHERE deep_pending),'
         " COUNT(*) FILTER (WHERE deep_pending AND deep_claim_state = 'failed'),"
@@ -446,7 +453,7 @@ def home():
         ' MIN(cutoff_hz), to_char(MAX(analyzed_at), \'DD-MM-YYYY HH24:MI\')'
         ' FROM ' + tbl + ' GROUP BY album'
         + having_sql +
-        ' ORDER BY ' + bad_expr + ' DESC, album'
+        ' ORDER BY ' + bad_expr + ' DESC, ' + damaged_expr + ' DESC, album'
         ' LIMIT %s OFFSET %s',
         tuple(params))
     rows = cur.fetchall()
@@ -563,11 +570,13 @@ def home():
         f'<td style="padding:.3rem .6rem;border-top:1px solid #ccc;text-align:right;'
         f'color:{"#d97706" if low else "#6b7280"};font-weight:600;">{low or ""}</td>'
         f'<td style="padding:.3rem .6rem;border-top:1px solid #ccc;text-align:right;'
+        f'color:#1f2937;font-weight:600;">{damaged or ""}</td>'
+        f'<td style="padding:.3rem .6rem;border-top:1px solid #ccc;text-align:right;'
         f'color:#6b7280;">{ver or ""}</td>'
         f'<td style="padding:.3rem .6rem;border-top:1px solid #ccc;text-align:right;">{_khz(min_cut)} kHz</td>'
         f'<td style="padding:.3rem .6rem;border-top:1px solid #ccc;">{_esc(last)}</td>'
         '</tr>'
-        for album, count, bad, low, ver, pending, pending_failed,
+        for album, count, bad, low, damaged, ver, pending, pending_failed,
         pending_unknown, min_cut, last in rows)
 
     def page_url(p):
@@ -592,6 +601,8 @@ def home():
         f'(fake lossless, transcode or fake hi-res), '
         f'<strong style="color:#d97706;">{n_lowpassed}</strong> lowpassed '
         f'(ambiguous: possibly genuine dark masters), '
+        f'<strong style="color:#1f2937;">{n_damaged}</strong> damaged '
+        f'(broken or truncated files: replace them), '
         f'<strong style="color:#6b7280;">{n_inconclusive}</strong> inconclusive '
         f'(could not be analyzed: decode failure or unsupported format), '
         f'<strong style="color:#6b7280;">{n_verified}</strong> manually verified '
@@ -645,6 +656,9 @@ def home():
         '<th style="text-align:right;padding:.3rem .6rem;" '
         'title="LOWPASSED verdicts: limited bandwidth without a clear encoder '
         'signature — possibly genuine dark masters, worth a deep scan">Lowpassed</th>'
+        '<th style="text-align:right;padding:.3rem .6rem;" '
+        'title="DAMAGED verdicts: broken, missing or truncated frames — the file '
+        'needs replacing, a rescan won\'t fix it">Damaged</th>'
         '<th style="text-align:right;padding:.3rem .6rem;">Verified</th>'
         '<th style="text-align:right;padding:.3rem .6rem;">Lowest cutoff</th>'
         '<th style="text-align:left;padding:.3rem .6rem;">Last analyzed</th></tr>'

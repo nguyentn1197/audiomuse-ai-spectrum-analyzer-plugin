@@ -223,7 +223,7 @@ class TestFlacDamage(_TempFiles):
         r = integrity.check_flac(self.write('flip2.flac', data))
         self.assertEqual(integrity.summarize(r),
                          f'damaged file: 1 bad frame, {r["damaged_seconds"]:g} s affected '
-                         f'(0:{first / self.sr:04.1f}–0:{(first + self.bs) / self.sr:04.1f})')
+                         f'(0:{first / self.sr:04.1f}-0:{(first + self.bs) / self.sr:04.1f})')
         self.assertIsNone(integrity.summarize({'result': 'ok'}))
 
 
@@ -269,13 +269,15 @@ class TestAnalyzeFileWiring(_TempFiles):
                              bitrate_kbps=900, deep=deep, **kw)
         return r, json.loads(r['details'])
 
-    def test_damaged_file_is_inconclusive_corrupt(self):
+    def test_damaged_file_gets_its_own_verdict(self):
         # decodes fine and reads CLEAN spectrally, but it is damaged: damage
-        # outranks the spectral verdict, which survives as a note
+        # outranks the spectral verdict, which survives as a note. DAMAGED is
+        # its own primary verdict (not INCONCLUSIVE): the evidence is the
+        # file's own checksums, so confidence is 1.0
         path = self.write('zf.flac', G.zero_fill_burst(self.cd))
         r, d = self._run(path, skip_spectrogram_for_clean=True)
-        self.assertEqual(r['verdict'], 'INCONCLUSIVE')
-        self.assertEqual(r['confidence'], 0.0)
+        self.assertEqual(r['verdict'], 'DAMAGED')
+        self.assertEqual(r['confidence'], 1.0)
         self.assertFalse(r['deep_eligible'])
         self.assertEqual((d['integrity']['status'], d['integrity']['coverage']), ('corrupt', 'full'))
         self.assertTrue(r['est_source'].startswith('damaged file:'), r['est_source'])
@@ -287,7 +289,7 @@ class TestAnalyzeFileWiring(_TempFiles):
 
     def test_bit_rot_that_decodes_cleanly_is_still_caught(self):
         r, d = self._run(self.write('flip.flac', G.bit_flip(self.cd)[0]))
-        self.assertEqual(r['verdict'], 'INCONCLUSIVE')
+        self.assertEqual(r['verdict'], 'DAMAGED')
         self.assertEqual(d['integrity']['stream']['bad_frames'], 1)
 
     def test_md5_mismatch_needs_deep(self):
@@ -296,7 +298,7 @@ class TestAnalyzeFileWiring(_TempFiles):
         self.assertEqual(r['verdict'], 'CLEAN')
         self.assertEqual(d['integrity']['stream']['result'], 'ok')
         r, d = self._run(path, deep=True)
-        self.assertEqual(r['verdict'], 'INCONCLUSIVE')
+        self.assertEqual(r['verdict'], 'DAMAGED')
         self.assertEqual(d['integrity']['stream']['md5'], 'mismatch')
         self.assertEqual(d['integrity']['status'], 'corrupt')
 
@@ -306,22 +308,40 @@ class TestAnalyzeFileWiring(_TempFiles):
         self.assertEqual(d['integrity']['stream']['trailing_bytes'], 4000)
 
     def test_damage_also_explains_a_decode_failure(self):
-        # the frame walk runs before decoding, so an INCONCLUSIVE from a
-        # failed decode says why
+        # the frame walk runs before decoding, so a failed decode on a
+        # damaged file is DAMAGED with the location, not a bare INCONCLUSIVE
         r, d = self._run(os.path.join(FIXTURES, 'truncated.flac'), deep=True)
+        self.assertEqual((r['verdict'], r['confidence']), ('DAMAGED', 1.0))
         self.assertIsNone(r['cutoff_hz'])
         self.assertIn('decode_error', d)
         self.assertTrue(r['est_source'].startswith('damaged file:'))
         self.assertTrue(any(n.startswith('decode failed') for n in d['notes']))
 
+    def test_undecodable_but_not_provably_damaged_stays_inconclusive(self):
+        # garbage with no FLAC marker: nothing to verify, so no damage claim
+        # -- the row is INCONCLUSIVE (couldn't analyze), never DAMAGED
+        r, d = self._run(self.write('garbage.flac', b'not actually audio' * 100))
+        self.assertEqual((r['verdict'], r['confidence']), ('INCONCLUSIVE', 0.0))
+        self.assertEqual(d['integrity']['status'], 'decode_failed')
+        self.assertIsNone(d['integrity']['stream'])
+
+    def test_damaged_is_not_a_suspect_verdict(self):
+        # the web layer's suspect counts and bulk deep scans must not pick
+        # damaged rows up; the verdict still gets a style (badge + filter)
+        src = open(os.path.join(os.path.dirname(_HERE), 'plugins', 'SpectrumAnalyzer',
+                                '__init__.py'), encoding='utf-8').read()
+        self.assertIn("'DAMAGED':", src)
+        suspects = src.split('SUSPECT_VERDICTS = ', 1)[1].split('\n', 1)[0]
+        self.assertNotIn('DAMAGED', suspects)
+
     @unittest.skipUnless(HAS_FFMPEG, 'requires ffmpeg on PATH')
     def test_deep_scan_of_damaged_mp3(self):
         path = self.write('zf.mp3', G.zero_fill_burst(_read('consistent_320.mp3')))
         r, d = self._run(path)  # normal scan: no container check for MP3
-        self.assertNotEqual(r['verdict'], 'INCONCLUSIVE')
+        self.assertNotEqual(r['verdict'], 'DAMAGED')
         self.assertIsNone(d['integrity']['stream'])
         r, d = self._run(path, deep=True)
-        self.assertEqual(r['verdict'], 'INCONCLUSIVE')
+        self.assertEqual(r['verdict'], 'DAMAGED')
         self.assertEqual(d['integrity']['stream']['method'], 'ffmpeg_decode')
 
 
