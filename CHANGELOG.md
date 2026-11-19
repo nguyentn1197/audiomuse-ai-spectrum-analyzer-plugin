@@ -83,9 +83,32 @@ The new `integrity.py` reads damage from the container's own checksums.
   never silent: `md5: not_checked` comes with a new `md5_detail` saying
   why.
 
+### Second review fixes (before release)
+
+- **Bounded memory.**
+  - The final-frame walk used to expand the frame into per-bit numpy arrays
+    and Python lists, about 550× the frame: 415 MiB for one valid 786 KB
+    8-channel/24-bit/32768-sample frame. It now reads bits straight from the
+    frame's bytes, so memory is one copy of the frame (0.75 MiB there). It
+    is also faster: ~1.4 ms instead of ~9 ms for a typical frame.
+  - The whole check now runs at a constant ~8 MiB plus a few hundred bytes
+    per frame. The frame-sync scan, zero-run count and trailer check work in
+    place on the memory map instead of building ~3× the file in temporaries
+    (117 MiB for a 39 MiB FLAC before).
+  - The CRC pass is block-parallel (256-byte blocks chained by CRC
+    linearity). A few huge frames no longer degenerate it (3.5 s → ~10 ms),
+    and ordinary files check 2–4× faster: ~55 ms average across the
+    fixtures, 0.5 s for a 117 MiB 24/96 file.
+- **Enforceable ffmpeg MD5 deadline.** A blocked pipe read never reached
+  the clock check, so a stalled ffmpeg held the worker: with a 0.5 s
+  timeout it waited until the process died 30 s later. A watchdog now kills
+  ffmpeg at the deadline, including one that closed its output but never
+  exits, and always reaps it. The timeout becomes `md5: not_checked` with
+  the reason.
+
 ### Tests
 
-- `tests/test_integrity.py` (44 tests). Damage variants are deterministic
+- `tests/test_integrity.py` (50 tests). Damage variants are deterministic
   transforms of committed fixtures, built on the fly rather than committed:
   zero-fill burst, single bit flip, dropped frame, cut on a frame boundary,
   header damage, MD5 flip/zero, large ID3v2 prefix, ID3v1 and junk suffixes,
@@ -98,7 +121,13 @@ The new `integrity.py` reads damage from the container's own checksums.
   4/8/12/16/20/24/32 bit. The odd depths come from a new spec-complete
   verbatim FLAC writer, cross-checked by libsndfile and ffmpeg. A 32-bit
   file from ffmpeg's own encoder is also covered, and the no-ffmpeg path is
-  tested.
+  tested. Second-review regressions:
+  - a valid 786 KB 8-channel frame walked within 3× its size
+  - ffmpeg-encoded Rice-coded 32768-sample 8-channel frames
+  - whole-check peak flat from a 5 to a 14 MiB file
+  - the block CRC matched against a reference over arbitrary span layouts
+  - a fake ffmpeg that stalls (silent, or closed-stdout-but-alive), killed
+    at a 0.5 s deadline and proven reaped
 - No false alarms: every committed FLAC fixture passes every frame and its
   MD5. ffmpeg reports zero errors on every committed MP3/M4A/OGG.
 - Changed expectations: `truncated.flac` is now caught in segment mode too.

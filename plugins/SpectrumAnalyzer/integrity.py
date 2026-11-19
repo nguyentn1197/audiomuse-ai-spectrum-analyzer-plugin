@@ -46,7 +46,7 @@ import re
 import shutil
 import subprocess
 import tempfile
-import time
+import threading
 from collections import Counter
 
 import numpy as np
@@ -66,6 +66,9 @@ _MAX_REGIONS = 32
 # runs), so inside a damaged frame it is the fingerprint of a zero-filled
 # transfer gap rather than bit rot.
 _ZERO_RUN_MIN = 256
+_ZERO_RUN = re.compile(rb'\x00{%d,}' % _ZERO_RUN_MIN)
+_NONZERO = re.compile(rb'[^\x00]')
+_SYNC = re.compile(rb'\xff[\xf8\xf9]')
 
 
 # --------------------------------------------------------------------------
@@ -114,17 +117,14 @@ def _crc16(data, crc=0):
     return crc
 
 
-def _crc16_spans(buf, starts, lengths):
-    """CRC-16 of buf[s:s+n] for many spans at once. Each span ends with its
-    own stored big-endian CRC, so 0 means intact.
-
-    Frame-parallel: spans are end-aligned and consumed two bytes per step,
-    so the Python loop runs (longest span / 2) times over arrays of at most
-    len(starts) elements instead of once per byte (~12x faster than a
-    per-byte loop on a real track). Sorted longest-first, the spans that
-    have started at any step are always a prefix; an odd-length span eats
-    its first byte up front through the one-byte table (equivalent to a
-    leading zero byte, which a zero-init CRC ignores)."""
+def _crc16_ragged(buf, starts, lengths):
+    """CRC-16 of buf[s:s+n] for many spans at once (spans end-aligned,
+    consumed two bytes per step, so the loop runs longest/2 times over
+    arrays of at most len(starts) elements). Sorted longest-first, the spans
+    that have started at any step are always a prefix; an odd-length span
+    eats its first byte up front through the one-byte table (equivalent to
+    a leading zero byte, which a zero-init CRC ignores). Fast for many short
+    spans; _crc16_spans only ever hands it spans of <= _CRC_BLOCK bytes."""
     n = len(starts)
     out = np.zeros(n, dtype=np.uint16)
     if n == 0:
@@ -149,6 +149,88 @@ def _crc16_spans(buf, starts, lengths):
             crc[:m] = t2[crc[:m] ^ word]
     out[order] = crc
     return out
+
+
+_CRC_BLOCK = 256       # bytes; even
+_CRC_CHUNK = 8192      # blocks per vectorised batch (2 MiB of frame bytes)
+_CRC_SHIFT = None      # state after _CRC_BLOCK zero bytes, per start state
+
+
+def _crc16_shift_table():
+    global _CRC_SHIFT
+    if _CRC_SHIFT is None:  # once per process, ~10 ms
+        c = np.arange(65536, dtype=np.uint16)
+        for _ in range(_CRC_BLOCK // 2):
+            c = _CRC16_2[c]  # two zero bytes: crc' = T2[crc ^ 0]
+        _CRC_SHIFT = c
+    return _CRC_SHIFT
+
+
+def _crc16_spans(buf, starts, lengths):
+    """CRC-16 of buf[s:s+n] for many spans at once. Each span ends with its
+    own stored big-endian CRC, so 0 means intact.
+
+    Block-parallel, so the cost doesn't depend on how frame sizes are
+    distributed: each span is cut into _CRC_BLOCK-byte blocks aligned to its
+    end (the short remainder at its start goes to _crc16_ragged), every
+    block's CRC is computed at once in _CRC_BLOCK/2 vectorised steps, and
+    each span's blocks are chained with the linearity of a zero-init CRC:
+    crc(A + B) = shift(crc(A), len(B)) ^ crc(B), shift being one lookup in
+    a precomputed table. A frame-parallel walk alone degenerates on a few
+    huge frames (a handful of 640 KB 8-channel frames took 3.5 s: 320k
+    sequential steps over 2-element arrays); this takes ~10 ms there and is
+    faster on ordinary files too."""
+    starts = np.asarray(starts, dtype=np.int64)
+    lengths = np.asarray(lengths, dtype=np.int64)
+    n = len(starts)
+    if n == 0:
+        return np.zeros(0, dtype=np.uint16)
+    B = _CRC_BLOCK
+    full = (lengths - 1) // B                 # whole blocks after the head
+    head = lengths - full * B                 # 1..B bytes at the start
+    crc = _crc16_ragged(buf, starts, head)
+    if not full.any():
+        return crc
+    t2 = _CRC16_2
+    shift = _crc16_shift_table()
+    rows = np.lib.stride_tricks.sliding_window_view(buf, B)  # a view, no copy
+    cum = np.cumsum(full)
+    i0 = 0
+    while i0 < n:
+        # spans in groups of ~_CRC_CHUNK blocks: memory stays constant
+        # however long the file is
+        done = int(cum[i0 - 1]) if i0 else 0
+        i1 = max(i0 + 1, int(np.searchsorted(cum, done + _CRC_CHUNK, side='right')))
+        g_full = full[i0:i1]
+        total = int(g_full.sum())
+        if total:
+            # every whole block's own CRC (zero-init), vectorised
+            g_off = np.concatenate(([0], np.cumsum(g_full)[:-1]))
+            span_of = np.repeat(np.arange(i1 - i0), g_full)
+            bstart = (starts[i0:i1][span_of] + head[i0:i1][span_of]
+                      + (np.arange(total) - g_off[span_of]) * B)
+            bcrc = np.empty(total, dtype=np.uint16)
+            for c0 in range(0, total, _CRC_CHUNK):  # one span may be huge
+                blk = rows[bstart[c0:c0 + _CRC_CHUNK]]
+                words = (blk[:, 0::2].astype(np.uint16) << 8) | blk[:, 1::2]
+                acc = np.zeros(len(blk), dtype=np.uint16)
+                for j in range(B // 2):
+                    acc = t2[acc ^ words[:, j]]
+                bcrc[c0:c0 + _CRC_CHUNK] = acc
+            # chain each span's blocks onto its head; longest first, so the
+            # spans still being extended at step j are always a prefix
+            order = np.argsort(-g_full, kind='stable')
+            group = crc[i0:i1]                  # a view into crc
+            acc = group[order]
+            off = g_off[order]
+            cnt = g_full[order]
+            active = np.searchsorted(-cnt, -np.arange(1, int(cnt[0]) + 1), side='right')
+            for j in range(int(cnt[0])):
+                m = active[j]
+                acc[:m] = shift[acc[:m]] ^ bcrc[off[:m] + j]
+            group[order] = acc
+        i0 = i1
+    return crc
 
 
 # --------------------------------------------------------------------------
@@ -322,17 +404,16 @@ def _longest_increasing_chain(keys):
 def _trailer_ok(raw, end):
     """True when everything after `end` is nothing, zero padding, or a
     known trailing tag (ID3v1, APEv2); otherwise the trailing bytes are
-    reported as unrecognized (still not damage -- decoders ignore them)."""
-    tail = raw[end:]
-    if not tail or not any(tail):
-        return True
-    if len(tail) >= 128 and tail[-128:-125] == b'TAG':
-        tail = tail[:-128]
-    if len(tail) >= 32 and tail[-32:-24] == b'APETAGEX':
-        size = int.from_bytes(tail[-20:-16], 'little')
-        flags = int.from_bytes(tail[-12:-8], 'little')
-        tail = tail[:max(0, len(tail) - size - (32 if flags & 0x80000000 else 0))]
-    return not tail or not any(tail)
+    reported as unrecognized (still not damage -- decoders ignore them).
+    Scans in place: the "tail" can be most of a badly damaged file."""
+    stop = len(raw)
+    if stop - end >= 128 and raw[stop - 128:stop - 125] == b'TAG':
+        stop -= 128
+    if stop - end >= 32 and raw[stop - 32:stop - 24] == b'APETAGEX':
+        size = int.from_bytes(raw[stop - 20:stop - 16], 'little')
+        flags = int.from_bytes(raw[stop - 12:stop - 8], 'little')
+        stop = max(end, stop - size - (32 if flags & 0x80000000 else 0))
+    return stop <= end or _NONZERO.search(raw, end, stop) is None
 
 
 class _BadFrame(Exception):
@@ -353,8 +434,14 @@ def _frame_end(raw, p, hl, info, bs, limit):
     (PR #16 review: 146 of 200 single-byte corruptions of a one-frame file
     passed that way). The structure gives the one true end; the CRC is then
     checked there, so a damaged final frame fails like any other frame.
-    Only skipped fields are counted, never sample values decoded, so this
-    costs a few ms for one frame."""
+
+    Bits are read straight from the frame's bytes -- never expanded into
+    per-bit arrays or lists, which cost ~550x the frame (415 MiB for one
+    valid 786 KB 8-channel frame; second PR #16 review). Memory is one copy
+    of the frame; only skipped fields are counted, never sample values
+    decoded. A Rice residual is a unary run of zeros ended by a 1, then
+    `param` bits: the run's end is found from the current byte's
+    bit_length(), and whole zero bytes are skipped by a C-level search."""
     b3 = raw[p + 3]
     ch_code, ss_code = b3 >> 4, (b3 >> 1) & 0x7
     bps = _SAMPLE_SIZES[ss_code] if ss_code else info['bits']
@@ -362,25 +449,29 @@ def _frame_end(raw, p, hl, info, bs, limit):
     # stereo decorrelation: the side channel carries one extra bit
     side = {8: 1, 9: 0, 10: 1}.get(ch_code)
     start = p + hl
-    data = np.frombuffer(raw[start:min(len(raw), start + limit)], dtype=np.uint8)
-    bits = np.unpackbits(data)
-    n = len(bits)
-    # nxt[i] = position of the first 1 bit at or after i (n past the end):
-    # each Rice residual is a unary run of zeros ended by a 1, then `k` bits
-    pad = 64
-    nxt_arr = np.full(n + pad, n, dtype=np.int64)
-    ones = np.flatnonzero(bits)
-    nxt_arr[ones] = ones
-    nxt = np.minimum.accumulate(nxt_arr[::-1])[::-1].tolist()
-    bitlist = bits.tolist() + [0] * pad
+    data = bytes(raw[start:min(len(raw), start + limit)])
+    n = len(data) * 8
+    nonzero = _NONZERO.search
 
     def read(pos, k):
-        if pos + k > n:
+        """The k-bit unsigned field at bit position pos."""
+        end = pos + k
+        if end > n:
             raise _BadFrame
-        v = 0
-        for i in range(pos, pos + k):
-            v = (v << 1) | bitlist[i]
-        return v
+        b0, b1 = pos >> 3, (end + 7) >> 3
+        return (int.from_bytes(data[b0:b1], 'big') >> ((b1 << 3) - end)) & ((1 << k) - 1)
+
+    def first_one(pos):
+        """Position of the first 1 bit at or after pos."""
+        bi = pos >> 3
+        v = data[bi] & (0xFF >> (pos & 7))
+        if not v:
+            m = nonzero(data, bi + 1)
+            if m is None:
+                raise _BadFrame
+            bi = m.start()
+            v = data[bi]
+        return (bi << 3) + 8 - v.bit_length()
 
     def residual(pos, order):
         method = read(pos, 2)
@@ -400,9 +491,17 @@ def _frame_end(raw, p, hl, info, bs, limit):
             if param == escape:
                 pos += 5 + read(pos, 5) * count
             else:
-                step = 1 + param
-                for _ in range(count):
-                    pos = nxt[pos] + step
+                step = 9 + param        # 8 - bit_length() + 1 + param
+                for _ in range(count):  # inlined first_one(): the hot loop
+                    bi = pos >> 3
+                    v = data[bi] & (0xFF >> (pos & 7))
+                    if not v:
+                        m = nonzero(data, bi + 1)
+                        if m is None:
+                            raise _BadFrame
+                        bi = m.start()
+                        v = data[bi]
+                    pos = (bi << 3) + step - v.bit_length()
             if pos > n:
                 raise _BadFrame
         return pos
@@ -417,9 +516,7 @@ def _frame_end(raw, p, hl, info, bs, limit):
             wasted = read(pos + 7, 1)
             pos += 8
             if wasted:                # unary k-1, so k = zeros + 1
-                j = nxt[pos]
-                if j >= n:
-                    raise _BadFrame
+                j = first_one(pos)
                 sbps -= j - pos + 1
                 pos = j + 1
                 if sbps <= 0:
@@ -456,8 +553,8 @@ def _zero_filled_bytes(raw, spans):
         else:
             merged.append([a, b])
     total = 0
-    for a, b in merged:
-        for m in re.finditer(rb'\x00{%d,}' % _ZERO_RUN_MIN, raw[a:b]):
+    for a, b in merged:  # in place: a damaged span can be most of the file
+        for m in _ZERO_RUN.finditer(raw, a, b):
             total += m.end() - m.start()
     return total
 
@@ -502,12 +599,22 @@ def _md5_libsndfile(path, bits, channels):
     return h.digest()
 
 
-def _md5_ffmpeg(path, bits, channels, timeout=_MD5_FFMPEG_TIMEOUT):
+def _md5_ffmpeg(path, bits, channels, timeout=None):
     """FLAC-layout MD5 via ffmpeg, for every depth FLAC allows (4-32 bit).
     ffmpeg's FLAC decoder hands out samples left-justified in s16 (up to 16
     bits) or s32 (above), so requesting exactly that PCM format involves no
     conversion and an arithmetic right shift recovers the true value; its
-    low (bits+7)//8 little-endian bytes are FLAC's MD5 layout."""
+    low (bits+7)//8 little-endian bytes are FLAC's MD5 layout.
+
+    The deadline is enforced by a watchdog thread, not by checking the
+    clock between reads: a read from a pipe blocks for as long as ffmpeg
+    stays alive without writing, so a stalled ffmpeg would never reach such
+    a check and would hold the worker forever (second PR #16 review). The
+    watchdog kills the process at the deadline, which ends the blocked read
+    with EOF; the process is always reaped before returning or raising.
+    `timeout` defaults to _MD5_FFMPEG_TIMEOUT, read at call time."""
+    if timeout is None:
+        timeout = _MD5_FFMPEG_TIMEOUT
     wide = bits > 16
     fmt, width = ('s32le', 4) if wide else ('s16le', 2)
     shift = (32 if wide else 16) - bits
@@ -515,25 +622,43 @@ def _md5_ffmpeg(path, bits, channels, timeout=_MD5_FFMPEG_TIMEOUT):
     dtype = '<i4' if wide else '<i2'
     frame = width * channels
     h = hashlib.md5()
-    deadline = time.monotonic() + timeout
-    with tempfile.TemporaryFile() as err, subprocess.Popen(
+    timed_out = threading.Event()
+    with tempfile.TemporaryFile() as err:
+        proc = subprocess.Popen(
             ['ffmpeg', '-hide_banner', '-nostdin', '-v', 'error', '-i', path,
              '-map', '0:a:0', '-f', fmt, '-c:a', 'pcm_' + fmt, '-'],
-            stdout=subprocess.PIPE, stderr=err) as proc:
-        rest = b''
-        while True:
-            chunk = proc.stdout.read(frame * 65536)
-            if not chunk:
-                break
-            if time.monotonic() > deadline:
+            stdout=subprocess.PIPE, stderr=err)
+
+        def expire():
+            timed_out.set()
+            proc.kill()
+
+        watchdog = threading.Timer(timeout, expire)
+        watchdog.daemon = True
+        watchdog.start()
+        try:
+            rest = b''
+            while True:
+                chunk = proc.stdout.read(frame * 65536)
+                if not chunk or timed_out.is_set():
+                    break
+                chunk = rest + chunk
+                cut = len(chunk) - len(chunk) % frame
+                rest = chunk[cut:]
+                v = np.frombuffer(chunk[:cut], dtype=dtype).astype('<i4') >> shift
+                h.update(v.view(np.uint8).reshape(-1, 4)[:, :nbytes].tobytes())
+            # EOF: let ffmpeg exit on its own -- the watchdog still bounds
+            # this wait, so a process that hangs after closing stdout is
+            # killed at the deadline too
+            proc.wait()
+        finally:
+            watchdog.cancel()
+            if proc.poll() is None:        # an exception left it running
                 proc.kill()
-                raise TimeoutError(f'ffmpeg MD5 decode took over {timeout:g} s')
-            chunk = rest + chunk
-            cut = len(chunk) - len(chunk) % frame
-            rest = chunk[cut:]
-            v = np.frombuffer(chunk[:cut], dtype=dtype).astype('<i4') >> shift
-            h.update(v.view(np.uint8).reshape(-1, 4)[:, :nbytes].tobytes())
-        proc.wait()
+            proc.stdout.close()
+            proc.wait()                    # reap: the process is dead by now
+        if timed_out.is_set():
+            raise TimeoutError(f'ffmpeg MD5 decode took over {timeout:g} s (killed)')
         if proc.returncode != 0 or rest:
             err.seek(0)
             msg = err.read().decode('utf-8', 'replace').strip().splitlines()
@@ -592,12 +717,13 @@ def frame_index(raw):
     info, audio_start = _parse_streaminfo(raw, off)
     if info is None:
         return None, audio_start, 0, []
-    buf = np.frombuffer(raw, dtype=np.uint8)
-    # candidate syncs: 0xFF then 0xF8 (fixed block size) or 0xF9 (variable)
-    a = buf[audio_start:]
-    cand = np.flatnonzero((a[:-1] == 0xFF) & ((a[1:] & 0xFE) == 0xF8)) + audio_start
+    # candidate syncs: 0xFF then 0xF8 (fixed block size) or 0xF9 (variable),
+    # found in place on the memory map: a numpy comparison over the whole
+    # file costs ~3x the file size in temporaries (117 MiB for a 39 MiB
+    # FLAC); the regex holds only the matches
     parsed = {0: [], 1: []}
-    for p in cand.tolist():
+    for m in _SYNC.finditer(raw, audio_start):
+        p = m.start()
         strategy = raw[p + 1] & 1
         h = _parse_frame_header(raw, p, info, strategy)
         if h:

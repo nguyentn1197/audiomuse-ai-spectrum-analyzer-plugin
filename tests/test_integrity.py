@@ -366,6 +366,147 @@ class TestMd5AllBitDepths(_TempFiles):
         self.assertEqual((r['result'], r['md5']), ('ok', 'match'), r['md5_detail'])
 
 
+class TestResourceBounds(_TempFiles):
+    """Second PR #16 review: the final-frame walk expanded the frame into
+    per-bit arrays and lists (415 MiB for one valid 786 KB frame), and the
+    ffmpeg MD5 deadline could not fire while a read was blocked. Memory must
+    stay near the frame/file-independent baseline, and a stalled ffmpeg must
+    be killed and reaped at the deadline."""
+
+    def _peak(self, fn, *args):
+        import tracemalloc
+        tracemalloc.start()
+        try:
+            result = fn(*args)
+            return result, tracemalloc.get_traced_memory()[1]
+        finally:
+            tracemalloc.stop()
+
+    def test_large_multichannel_frame_walk_is_bounded(self):
+        # the reviewer's case: 8 channels x 24 bit x 32768 samples, one
+        # ~786 KB frame
+        rng = np.random.default_rng(5)
+        raw = G.verbatim_flac(rng.integers(-(1 << 23), 1 << 23, (32768, 8)), 48000, 24,
+                              blocksize=32768)
+        info, _start, _strategy, chain = integrity.frame_index(raw)
+        p, hl, _num, bs = chain[0]
+        frame = len(raw) - p
+        self.assertGreater(frame, 780_000)
+        end, peak = self._peak(integrity._frame_end, raw, p, hl, info, bs,
+                               integrity.max_frame_bytes(info, chain))
+        self.assertEqual(end, len(raw))
+        self.assertLess(peak, 3 * frame)   # was ~550x the frame
+        path = self.write('big8ch.flac', raw)
+        integrity._crc16_shift_table()   # one-time table, not per file
+        r, peak = self._peak(integrity.check_flac, path)
+        self.assertEqual(r['result'], 'ok')
+        self.assertLess(peak, 8 * frame)   # whole check incl. the CRC's batches
+        bad = bytearray(raw)
+        bad[p + hl + frame // 2] ^= 0x10
+        self.assertEqual(integrity.check_flac(self.write('big8ch_bad.flac', bytes(bad)))['result'],
+                         'damaged')
+
+    @unittest.skipUnless(HAS_FFMPEG, 'requires ffmpeg on PATH')
+    def test_large_rice_coded_frames_are_bounded(self):
+        # same size class through the residual-decoding path (a real encoder)
+        import subprocess
+        path = os.path.join(self.tmp, 'big8ch_rice.flac')
+        subprocess.run(['ffmpeg', '-hide_banner', '-nostdin', '-v', 'error', '-y', '-f', 'lavfi',
+                        '-i', 'anoisesrc=d=1.5:c=pink:r=48000:a=0.3', '-af',
+                        'pan=7.1|c0=c0|c1=0.9*c0|c2=0.8*c0|c3=0.2*c0|c4=0.7*c0|c5=0.6*c0'
+                        '|c6=0.5*c0|c7=0.4*c0', '-sample_fmt', 's32', '-bits_per_raw_sample',
+                        '24', '-c:a', 'flac', '-frame_size', '32768', path], check=True)
+        raw = open(path, 'rb').read()
+        info, _start, _strategy, chain = integrity.frame_index(raw)
+        p, hl, _num, bs = chain[-1]
+        end, peak = self._peak(integrity._frame_end, raw, p, hl, info, bs,
+                               integrity.max_frame_bytes(info, chain))
+        self.assertEqual(end, len(raw))
+        self.assertLess(peak, 3 * (len(raw) - p))
+        self.assertEqual(integrity.check_flac(path, verify_md5=True)['md5'], 'match')
+
+    def test_whole_check_memory_does_not_scale_with_file_size(self):
+        # the sync scan used to build ~3x the file in numpy temporaries; now
+        # the working set is a constant few MiB (the CRC's batches) plus a
+        # few hundred bytes per frame
+        import soundfile as sf
+        rng = np.random.default_rng(9)
+        integrity._crc16_shift_table()   # one-time table, not per file
+        peaks, sizes = [], []
+        for seconds in (30, 90):
+            path = os.path.join(self.tmp, f'long{seconds}.flac')
+            sf.write(path, (rng.standard_normal((44100 * seconds, 2)) * 8000).astype(np.int16),
+                     44100, subtype='PCM_16')
+            r, peak = self._peak(integrity.check_flac, path)
+            self.assertEqual(r['result'], 'ok')
+            peaks.append(peak)
+            sizes.append(os.path.getsize(path))
+        self.assertGreater(sizes[1], 12_000_000)
+        self.assertLess(peaks[1], 1.3 * peaks[0] + 1_000_000)   # 3x the file, ~same peak
+        self.assertLess(peaks[1], sizes[1])                     # was ~3x the file
+
+    def test_block_crc_matches_reference_for_any_span_layout(self):
+        rng = np.random.default_rng(11)
+        buf = rng.integers(0, 256, 1_500_000, dtype=np.uint8)
+        raw = buf.tobytes()
+        starts = rng.integers(0, 700_000, 200)
+        lengths = rng.integers(1, 20000, 200)
+        lengths[:9] = [1, 2, 255, 256, 257, 511, 512, 513, 790_000]
+        lengths = np.minimum(lengths, len(buf) - starts)
+        got = integrity._crc16_spans(buf, starts, lengths)
+        self.assertEqual(got.tolist(), [integrity._crc16(raw[s:s + n])
+                                        for s, n in zip(starts, lengths)])
+
+    def _fake_ffmpeg(self, mode):
+        """An 'ffmpeg' on PATH that writes some PCM, then stalls: 'silent'
+        keeps stdout open and writes nothing more; 'linger' closes stdout but
+        never exits. Records its pid so the test can prove it was reaped."""
+        bindir = os.path.join(self.tmp, 'fakebin_' + mode)
+        os.makedirs(bindir, exist_ok=True)
+        pidfile = os.path.join(bindir, 'pid')
+        with open(os.path.join(bindir, 'ffmpeg'), 'w') as f:
+            f.write(f'#!{sys.executable}\n'
+                    'import os, sys, time\n'
+                    f'open({pidfile!r}, "w").write(str(os.getpid()))\n'
+                    'sys.stdout.buffer.write(b"\\0" * 4096); sys.stdout.flush()\n'
+                    + ('os.close(1)\n' if mode == 'linger' else '')
+                    + 'time.sleep(60)\n')
+        os.chmod(os.path.join(bindir, 'ffmpeg'), 0o755)
+        return bindir, pidfile
+
+    def _assert_gone(self, pidfile):
+        pid = int(open(pidfile).read())
+        with self.assertRaises(ProcessLookupError):
+            os.kill(pid, 0)
+
+    @unittest.skipUnless(os.name == 'posix', 'fake executable needs a POSIX shebang')
+    def test_stalled_ffmpeg_is_killed_at_the_deadline(self):
+        import time
+        flac = self.write('v20.flac', G.verbatim_flac(G.odd_depth_samples(20), 44100, 20))
+        for mode in ('silent', 'linger'):
+            with self.subTest(mode=mode):
+                bindir, pidfile = self._fake_ffmpeg(mode)
+                env = dict(os.environ, PATH=bindir + os.pathsep + os.environ.get('PATH', ''))
+                with mock.patch.dict(os.environ, env):
+                    t = time.monotonic()
+                    with self.assertRaises(TimeoutError):
+                        integrity._md5_ffmpeg(flac, 20, 2, timeout=0.5)
+                    self.assertLess(time.monotonic() - t, 10)   # not the fake's 60 s
+                self._assert_gone(pidfile)
+
+    @unittest.skipUnless(os.name == 'posix', 'fake executable needs a POSIX shebang')
+    def test_stalled_md5_degrades_to_not_checked_with_a_reason(self):
+        flac = self.write('v12.flac', G.verbatim_flac(G.odd_depth_samples(12), 44100, 12))
+        bindir, pidfile = self._fake_ffmpeg('silent')
+        env = dict(os.environ, PATH=bindir + os.pathsep + os.environ.get('PATH', ''))
+        with mock.patch.dict(os.environ, env), \
+                mock.patch.object(integrity, '_MD5_FFMPEG_TIMEOUT', 0.5):
+            r = integrity.check_flac(flac, verify_md5=True)
+        self.assertEqual((r['result'], r['md5']), ('ok', 'not_checked'))
+        self.assertIn('killed', r['md5_detail'])
+        self._assert_gone(pidfile)
+
+
 class TestFfmpegCheck(_TempFiles):
     def test_without_ffmpeg_reports_not_checked(self):
         with mock.patch.object(integrity.shutil, 'which', return_value=None):
