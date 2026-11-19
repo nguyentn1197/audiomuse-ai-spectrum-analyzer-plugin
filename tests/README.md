@@ -82,6 +82,9 @@ python3 tests/generate_adversarial_fixtures.py --integrity /tmp/integrity_varian
 | `id3v2_prefix` / `id3v1_suffix` / `junk_suffix` | a 100 KB leading ID3v2 tag, a trailing ID3v1 tag, random bytes appended | must all pass (junk is reported as trailing data: decoders play it fine) |
 | `variable_blocksize` | the same audio re-framed as a variable-block-size stream | must decode sample-identical and verify; a bit flip in it is still pinned |
 | `zero_fill_burst` on MP3 | transfer damage in a non-FLAC file | deep-mode ffmpeg decode errors |
+| byte flips inside the **final** frame (incl. 120 positions of a one-frame file) | damage the last frame, which has no next header to bound it | the structural frame-end walk + CRC-16 at that end (PR #16 review, P1) |
+| MP4: 4 s video, 1 s audio; audio-only Matroska | valid multi-stream / no-stream-duration containers | must pass: truncation is judged against the audio stream's own duration (P2) |
+| `verbatim_flac()` at 4/8/12/16/20/24/32 bit (+ ffmpeg's own 32-bit encoder) | every depth FLAC allows | MD5 `match`, a flipped MD5 → `mismatch`; without ffmpeg, odd depths are `not_checked` with a reason (P3) |
 
 Clean-file baseline: every committed FLAC fixture passes every frame CRC and
 its stream MD5, and ffmpeg reports zero errors and a decoded length within

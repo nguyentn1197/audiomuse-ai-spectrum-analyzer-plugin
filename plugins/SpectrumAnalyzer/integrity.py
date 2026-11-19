@@ -40,16 +40,22 @@ be able to break the analysis it is attached to.
 
 import bisect
 import hashlib
+import json
 import mmap
 import re
 import shutil
 import subprocess
+import tempfile
+import time
 from collections import Counter
 
 import numpy as np
 
 METHOD_FLAC = 'flac_frames'
 METHOD_FFMPEG = 'ffmpeg_decode'
+
+# Full-stream MD5 decode via ffmpeg (deep scans, depths libsndfile can't read)
+_MD5_FFMPEG_TIMEOUT = 600.0
 
 # Regions of damage closer together than this are reported as one region
 # (the bad-frame count and damaged_seconds stay exact).
@@ -315,8 +321,8 @@ def _longest_increasing_chain(keys):
 
 def _trailer_ok(raw, end):
     """True when everything after `end` is nothing, zero padding, or a
-    known trailing tag (ID3v1, APEv2) -- i.e. `end` is a believable end of
-    the last frame rather than a CRC-16 that hit zero by chance."""
+    known trailing tag (ID3v1, APEv2); otherwise the trailing bytes are
+    reported as unrecognized (still not damage -- decoders ignore them)."""
     tail = raw[end:]
     if not tail or not any(tail):
         return True
@@ -329,32 +335,117 @@ def _trailer_ok(raw, end):
     return not tail or not any(tail)
 
 
-def _last_frame_end(raw, start, hdr_len, limit):
-    """(end offset, trailer recognized) for the final frame, which has no
-    next header to bound it, or (None, False) when it never verifies.
+class _BadFrame(Exception):
+    """The bits do not form a valid frame (or run past the data)."""
 
-    A running CRC-16 reaches 0 at the true end -- and, by chance, about once
-    per 64 KiB elsewhere. An end followed by nothing, zero padding or a known
-    tag is believable, so the latest such is taken. Failing that, the
-    earliest zero is accepted with the rest reported as unrecognized
-    trailing data, not damage: libFLAC and ffmpeg both play a file with
-    junk appended to completion, so calling it damaged would be a false
-    alarm. The price is that a cut inside the final frame alone escapes in
-    the rare case a chance zero lands before the cut."""
-    stop = min(len(raw), start + limit)
-    crc = _crc16(raw[start:start + hdr_len])
-    t = _CRC16
-    candidates = []
-    for e in range(start + hdr_len, stop):
-        crc = ((crc << 8) & 0xFFFF) ^ t[(crc >> 8) ^ raw[e]]
-        if crc == 0:
-            candidates.append(e + 1)
-    for end in reversed(candidates):
-        if _trailer_ok(raw, end):
-            return end, True
-    if candidates:
-        return candidates[0], False
-    return None, False
+
+def _frame_end(raw, p, hl, info, bs, limit):
+    """Byte offset just past the CRC-16 of the frame at p, found by walking
+    its structure the way a decoder does -- subframe headers, wasted bits,
+    warm-up samples, LPC coefficients, Rice-coded residual partitions, zero
+    padding -- or None if the bits are not a valid frame within `limit`
+    bytes.
+
+    This is what bounds the *final* frame, which has no next header after
+    it. Looking for where a running CRC-16 happens to reach zero is not good
+    enough: in an intact frame it also hits zero by chance about once per
+    64 KiB, and once it has, every corruption after that point verifies
+    (PR #16 review: 146 of 200 single-byte corruptions of a one-frame file
+    passed that way). The structure gives the one true end; the CRC is then
+    checked there, so a damaged final frame fails like any other frame.
+    Only skipped fields are counted, never sample values decoded, so this
+    costs a few ms for one frame."""
+    b3 = raw[p + 3]
+    ch_code, ss_code = b3 >> 4, (b3 >> 1) & 0x7
+    bps = _SAMPLE_SIZES[ss_code] if ss_code else info['bits']
+    channels = ch_code + 1 if ch_code < 8 else 2
+    # stereo decorrelation: the side channel carries one extra bit
+    side = {8: 1, 9: 0, 10: 1}.get(ch_code)
+    start = p + hl
+    data = np.frombuffer(raw[start:min(len(raw), start + limit)], dtype=np.uint8)
+    bits = np.unpackbits(data)
+    n = len(bits)
+    # nxt[i] = position of the first 1 bit at or after i (n past the end):
+    # each Rice residual is a unary run of zeros ended by a 1, then `k` bits
+    pad = 64
+    nxt_arr = np.full(n + pad, n, dtype=np.int64)
+    ones = np.flatnonzero(bits)
+    nxt_arr[ones] = ones
+    nxt = np.minimum.accumulate(nxt_arr[::-1])[::-1].tolist()
+    bitlist = bits.tolist() + [0] * pad
+
+    def read(pos, k):
+        if pos + k > n:
+            raise _BadFrame
+        v = 0
+        for i in range(pos, pos + k):
+            v = (v << 1) | bitlist[i]
+        return v
+
+    def residual(pos, order):
+        method = read(pos, 2)
+        if method > 1:
+            raise _BadFrame
+        pbits = 4 + method
+        escape = (1 << pbits) - 1
+        porder = read(pos + 2, 4)
+        pos += 6
+        psize = bs >> porder
+        if psize << porder != bs or psize < order:
+            raise _BadFrame
+        for part in range(1 << porder):
+            count = psize - order if part == 0 else psize
+            param = read(pos, pbits)
+            pos += pbits
+            if param == escape:
+                pos += 5 + read(pos, 5) * count
+            else:
+                step = 1 + param
+                for _ in range(count):
+                    pos = nxt[pos] + step
+            if pos > n:
+                raise _BadFrame
+        return pos
+
+    pos = 0
+    try:
+        for ch in range(channels):
+            sbps = bps + (1 if ch == side else 0)
+            if read(pos, 1):          # subframe header starts with a zero bit
+                raise _BadFrame
+            kind = read(pos + 1, 6)
+            wasted = read(pos + 7, 1)
+            pos += 8
+            if wasted:                # unary k-1, so k = zeros + 1
+                j = nxt[pos]
+                if j >= n:
+                    raise _BadFrame
+                sbps -= j - pos + 1
+                pos = j + 1
+                if sbps <= 0:
+                    raise _BadFrame
+            if kind == 0:             # CONSTANT
+                pos += sbps
+            elif kind == 1:           # VERBATIM
+                pos += sbps * bs
+            elif 8 <= kind <= 12:     # FIXED, order 0-4
+                order = kind - 8
+                pos = residual(pos + order * sbps, order)
+            elif kind >= 32:          # LPC, order 1-32
+                order = (kind & 31) + 1
+                pos += order * sbps
+                precision = read(pos, 4)
+                if precision == 15:
+                    raise _BadFrame
+                pos = residual(pos + 4 + 5 + order * (precision + 1), order)
+            else:                     # reserved subframe type
+                raise _BadFrame
+            if pos > n:
+                raise _BadFrame
+    except (_BadFrame, IndexError):
+        return None
+    end = start + (pos + 7) // 8 + 2  # byte-aligned, then the CRC-16
+    return end if end <= len(raw) else None
 
 
 def _zero_filled_bytes(raw, spans):
@@ -387,19 +478,15 @@ def _merge_regions(intervals, sr):
     return [[round(a / sr, 2), round(b / sr, 2)] for a, b in merged], round(damaged, 2)
 
 
-def _stream_md5(path, bits, channels):
-    """MD5 of the decoded stream in FLAC's own layout (interleaved,
-    little-endian, (bits+7)//8 bytes per sample), or None when this
-    backend can't reproduce that layout. libsndfile's int reads are exact
-    (no scaling) for 8/16/24-bit FLAC; 24-bit arrives left-justified in
+def _md5_libsndfile(path, bits, channels):
+    """FLAC-layout MD5 via libsndfile, which reads 8/16/24-bit FLAC only.
+    Its int reads are exact (no scaling); 24-bit arrives left-justified in
     int32, so its top three bytes are the sample."""
     import soundfile as sf
-    if bits not in (8, 16, 24):
-        return None
     h = hashlib.md5()
     with sf.SoundFile(path) as f:
         if f.channels != channels:
-            return None
+            raise ValueError(f'libsndfile sees {f.channels} channels, STREAMINFO {channels}')
         dtype = 'int16' if bits <= 16 else 'int32'
         while True:
             blk = f.read(1 << 16, dtype=dtype, always_2d=True)
@@ -415,6 +502,67 @@ def _stream_md5(path, bits, channels):
     return h.digest()
 
 
+def _md5_ffmpeg(path, bits, channels, timeout=_MD5_FFMPEG_TIMEOUT):
+    """FLAC-layout MD5 via ffmpeg, for every depth FLAC allows (4-32 bit).
+    ffmpeg's FLAC decoder hands out samples left-justified in s16 (up to 16
+    bits) or s32 (above), so requesting exactly that PCM format involves no
+    conversion and an arithmetic right shift recovers the true value; its
+    low (bits+7)//8 little-endian bytes are FLAC's MD5 layout."""
+    wide = bits > 16
+    fmt, width = ('s32le', 4) if wide else ('s16le', 2)
+    shift = (32 if wide else 16) - bits
+    nbytes = (bits + 7) // 8
+    dtype = '<i4' if wide else '<i2'
+    frame = width * channels
+    h = hashlib.md5()
+    deadline = time.monotonic() + timeout
+    with tempfile.TemporaryFile() as err, subprocess.Popen(
+            ['ffmpeg', '-hide_banner', '-nostdin', '-v', 'error', '-i', path,
+             '-map', '0:a:0', '-f', fmt, '-c:a', 'pcm_' + fmt, '-'],
+            stdout=subprocess.PIPE, stderr=err) as proc:
+        rest = b''
+        while True:
+            chunk = proc.stdout.read(frame * 65536)
+            if not chunk:
+                break
+            if time.monotonic() > deadline:
+                proc.kill()
+                raise TimeoutError(f'ffmpeg MD5 decode took over {timeout:g} s')
+            chunk = rest + chunk
+            cut = len(chunk) - len(chunk) % frame
+            rest = chunk[cut:]
+            v = np.frombuffer(chunk[:cut], dtype=dtype).astype('<i4') >> shift
+            h.update(v.view(np.uint8).reshape(-1, 4)[:, :nbytes].tobytes())
+        proc.wait()
+        if proc.returncode != 0 or rest:
+            err.seek(0)
+            msg = err.read().decode('utf-8', 'replace').strip().splitlines()
+            raise RuntimeError(msg[0] if msg else f'ffmpeg exited with status {proc.returncode}')
+    return h.digest()
+
+
+def _stream_md5(path, bits, channels):
+    """(digest, None) -- the decoded stream's MD5 in FLAC's own layout --
+    or (None, why it couldn't be computed). libsndfile first for 8/16/24
+    bit (no subprocess; the only backend in this repo's CI); ffmpeg for
+    every other depth, and as the fallback when libsndfile can't open the
+    file. Never silent: a skipped check always says why (PR #16 review)."""
+    reasons = []
+    if bits in (8, 16, 24):
+        try:
+            return _md5_libsndfile(path, bits, channels), None
+        except Exception as exc:
+            reasons.append(f'libsndfile: {exc}')
+    else:
+        reasons.append(f'libsndfile reads only 8/16/24-bit FLAC, this is {bits}-bit')
+    if not shutil.which('ffmpeg'):
+        return None, '; '.join(reasons + ['ffmpeg is not on PATH'])
+    try:
+        return _md5_ffmpeg(path, bits, channels), None
+    except Exception as exc:
+        return None, '; '.join(reasons + [f'ffmpeg: {exc}'])
+
+
 def check_flac(path, verify_md5=False):
     """Verify every frame of a native FLAC file. See the module docstring.
 
@@ -423,7 +571,8 @@ def check_flac(path, verify_md5=False):
     bad_frames), truncated, damaged_seconds, regions ([[start_s, end_s]...],
     merged, at most _MAX_REGIONS), regions_capped, zero_filled_bytes,
     trailing_bytes, md5 ('match' | 'mismatch' | 'unset' | 'not_checked' |
-    None = not attempted), detail."""
+    None = not attempted), md5_detail (why md5 is not 'match'/'mismatch'
+    when it was attempted), detail."""
     try:
         return _check_flac(path, verify_md5)
     except Exception as exc:  # never let the verifier break an analysis
@@ -459,6 +608,15 @@ def frame_index(raw):
     return info, audio_start, strategy, chain
 
 
+def max_frame_bytes(info, chain):
+    """Upper bound on one frame's size: every channel verbatim, one of them
+    a side channel with an extra bit, plus header/subframe overhead. Spans
+    longer than this between two headers are damaged without a CRC, and it
+    bounds the final-frame structure walk."""
+    max_bs = max(info['max_blocksize'], max(h[3] for h in chain))
+    return max_bs * info['channels'] * (info['bits'] + 1) // 8 + 64
+
+
 def _check_flac(path, verify_md5):
     # memory-mapped, not read: a long hi-res FLAC can be hundreds of MB and
     # several workers analyze at once; the OS pages in what the walk touches
@@ -486,7 +644,7 @@ def _verify_flac(raw, path, verify_md5):
                 'bad_frames': None, 'missing_frames': None, 'truncated': None,
                 'damaged_seconds': None, 'regions': [], 'regions_capped': False,
                 'zero_filled_bytes': 0, 'trailing_bytes': None, 'md5': None,
-                'detail': audio_start}
+                'md5_detail': None, 'detail': audio_start}
     sr = info['sample_rate']
     buf = np.frombuffer(raw, dtype=np.uint8)
     if not chain:
@@ -494,7 +652,7 @@ def _verify_flac(raw, path, verify_md5):
                 'bad_frames': None, 'missing_frames': None, 'truncated': None,
                 'damaged_seconds': round(info['total_samples'] / sr, 2) or None,
                 'regions': [], 'regions_capped': False, 'zero_filled_bytes': 0,
-                'trailing_bytes': None, 'md5': None,
+                'trailing_bytes': None, 'md5': None, 'md5_detail': None,
                 'detail': 'no valid frame header found'}
 
     if strategy:  # variable block size: coded number is the first sample
@@ -505,10 +663,7 @@ def _verify_flac(raw, path, verify_md5):
         nominal = Counter(h[3] for h in chain).most_common(1)[0][0]
         first_sample = [h[2] * nominal for h in chain]
     total = info['total_samples']
-    # worst case: every channel verbatim, one of them a side channel with
-    # an extra bit, plus header/subframe overhead
-    max_bs = max(info['max_blocksize'], max(h[3] for h in chain))
-    max_frame = max_bs * info['channels'] * (info['bits'] + 1) // 8 + 64
+    max_frame = max_frame_bytes(info, chain)
 
     def frames_in(samples):
         return -(-samples // nominal) if samples > 0 else 0
@@ -557,21 +712,34 @@ def _verify_flac(raw, path, verify_md5):
         missing += lost
         bad.append(((0, max(first_sample[0], 1)), (audio_start, chain[0][0])))
 
-    # the last frame: no next header to bound it
+    # the last frame: no next header to bound it, so its end comes from its
+    # own structure and its CRC is checked there (see _frame_end)
     p, hl, num, bs = chain[-1]
-    end, recognized = _last_frame_end(raw, p, hl, max_frame)
+    end = _frame_end(raw, p, hl, info, bs, max_frame)
     trailing = None
-    if end is None:
+    if end is None or _crc16_spans(buf, [p], [end - p])[0]:
         bad_frames += 1
         bad.append(((first_sample[-1], first_sample[-1] + bs), (p, len(raw))))
     else:
         trailing = len(raw) - end
-        if not recognized and detail is None:
-            detail = f'{trailing} unrecognized bytes after the last frame (not damage)'
 
     # completeness against STREAMINFO: catches a tail cut on a frame boundary
     stream_end = first_sample[-1] + bs
     truncated = bool(total) and stream_end < total
+
+    if trailing and not _trailer_ok(raw, end):
+        if raw[end] == 0xFF and raw[end + 1:end + 2] in (b'\xf8', b'\xf9'):
+            # a frame sync whose header failed its CRC-8: a damaged final
+            # frame, not junk (with a known total the truncation check below
+            # already counts it)
+            if not truncated:
+                bad_frames += 1
+                missing += 1
+                bad.append(((stream_end, stream_end + nominal), (end, len(raw))))
+            if detail is None:
+                detail = f'damaged frame data in the last {trailing} bytes'
+        elif detail is None:
+            detail = f'{trailing} unrecognized bytes after the last frame (not damage)'
     if truncated:
         lost = frames_in(total - stream_end)
         bad_frames += lost
@@ -594,21 +762,20 @@ def _verify_flac(raw, path, verify_md5):
         'zero_filled_bytes': _zero_filled_bytes(raw, [b for _, b in bad]),
         'trailing_bytes': trailing,
         'md5': None,
+        'md5_detail': None,
         'detail': detail,
     }
     if verify_md5:
         if bad:
-            pass  # a decoder stops at the first broken frame; nothing to add
+            result['md5_detail'] = 'skipped: frames are already damaged'
         elif not any(info['md5']):
             result['md5'] = 'unset'
+            result['md5_detail'] = 'the encoder never stored an MD5'
         else:
-            try:
-                digest = _stream_md5(path, info['bits'], info['channels'])
-            except Exception as exc:
-                digest = None
-                result['detail'] = f'md5 not checked: {exc}'
+            digest, why = _stream_md5(path, info['bits'], info['channels'])
             if digest is None:
                 result['md5'] = 'not_checked'
+                result['md5_detail'] = why
             elif digest == info['md5']:
                 result['md5'] = 'match'
             else:
@@ -631,26 +798,54 @@ _TRUNCATION_TOLERANCE_FRAC = 0.01
 
 
 def _declared_duration(path, timeout=30.0):
-    """(seconds, reliable) from the container. A duration ffmpeg estimated
-    from the bitrate (an MP3 with no Xing/VBRI header) is not a promise the
-    file made, so it can't prove a truncation."""
+    """(seconds, reliable): how long the decoded audio stream (a:0, the one
+    check_ffmpeg decodes) says it is.
+
+    The audio stream's own duration, never the container's: a container
+    lasts as long as its longest stream, so a valid MP4 with 4 s of video
+    and 1 s of audio would otherwise "decode short" (PR #16 review). Only
+    when the stream reports no duration (Matroska audio, for one) and the
+    audio is the container's *only* stream is the container duration the
+    same thing and used instead; otherwise there is no trustworthy promise
+    and no truncation is claimed. A duration ffmpeg estimated from the
+    bitrate (an MP3 with no Xing/VBRI header) is not a promise either."""
     try:
         p = subprocess.run(
-            ['ffprobe', '-v', 'warning', '-show_entries', 'format=duration',
-             '-of', 'csv=p=0', path],
+            ['ffprobe', '-v', 'warning', '-select_streams', 'a:0',
+             '-show_entries', 'stream=duration:format=duration,nb_streams',
+             '-of', 'json', path],
             capture_output=True, text=True, timeout=timeout)
-        seconds = float(p.stdout.strip().splitlines()[0])
-    except (OSError, subprocess.SubprocessError, ValueError, IndexError):
+        meta = json.loads(p.stdout or '{}')
+    except (OSError, subprocess.SubprocessError, ValueError):
         return None, False
-    return seconds, 'estimating duration from bitrate' not in p.stderr.lower()
+    streams = meta.get('streams') or []
+    fmt = meta.get('format') or {}
+    if not streams:
+        return None, False
+
+    def seconds(v):
+        try:
+            v = float(v)
+        except (TypeError, ValueError):
+            return None
+        return v if v > 0 else None
+
+    declared = seconds(streams[0].get('duration'))
+    if declared is None and fmt.get('nb_streams') == 1:
+        declared = seconds(fmt.get('duration'))
+    if declared is None:
+        return None, False
+    return declared, 'estimating duration from bitrate' not in p.stderr.lower()
 
 
 def check_ffmpeg(path, timeout=_FFMPEG_TIMEOUT):
     """Decode the whole first audio stream with ffmpeg's CRC/bitstream
     checks on. Result keys: method, result ('ok' | 'damaged' |
     'not_checked'), errors, messages (first five, decoder addresses
-    stripped), declared_seconds, decoded_seconds, truncated (None when the
-    declared duration is unknown or only estimated), detail."""
+    stripped), declared_seconds (the audio stream's own duration),
+    decoded_seconds, truncated (None when the declared duration is unknown,
+    only estimated, or only the container's in a multi-stream file),
+    detail."""
     base = {'method': METHOD_FFMPEG, 'result': 'not_checked', 'errors': None,
             'messages': [], 'declared_seconds': None, 'decoded_seconds': None,
             'truncated': None, 'detail': None}

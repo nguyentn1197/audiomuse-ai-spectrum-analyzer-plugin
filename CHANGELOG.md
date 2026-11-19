@@ -59,14 +59,46 @@ The new `integrity.py` reads damage from the container's own checksums.
   stays `INCONCLUSIVE`.
 - `ANALYSIS_REV` 7 → 8: every stored row is re-checked once on the next scan.
 
+### Review fixes (before release)
+
+- **Final FLAC frame.** The last frame has no next header to bound it. It
+  used to be bounded at the first place a running CRC-16 reached zero, but
+  in an intact frame that also happens by chance. After such a point every
+  corruption verified: 146/200 single-byte corruptions of a one-frame file
+  passed. Its end is now found by walking its structure the way a decoder
+  does (subframes, wasted bits, warm-up samples, LPC coefficients,
+  Rice/escape residual partitions, padding), and the CRC is checked there.
+  The walker lands exactly on the next header on every frame of every
+  fixture, and on ffmpeg-encoded mono/6-channel/24/32-bit and
+  compression-level 0/12 streams. Final-frame corruptions caught: 1000/1000
+  across five encodings. Trailing bytes that start with a frame sync are a
+  damaged final frame, not junk.
+- **Multi-stream containers.** The truncation check compares against the
+  audio stream's own duration, never the container's. A valid MP4 with 4 s
+  of video and 1 s of audio was flagged truncated. The container duration
+  is used only when the stream reports none and audio is the only stream
+  (Matroska).
+- **MD5 at every FLAC depth (4–32 bit).** libsndfile handles 8/16/24-bit;
+  ffmpeg handles every other depth and is the fallback. A skipped check is
+  never silent: `md5: not_checked` comes with a new `md5_detail` saying
+  why.
+
 ### Tests
 
-- `tests/test_integrity.py` (32 tests). Damage variants are deterministic
+- `tests/test_integrity.py` (44 tests). Damage variants are deterministic
   transforms of committed fixtures, built on the fly rather than committed:
   zero-fill burst, single bit flip, dropped frame, cut on a frame boundary,
   header damage, MD5 flip/zero, large ID3v2 prefix, ID3v1 and junk suffixes,
   a variable-block-size rewrite (verified sample-identical), scattered
-  damage beyond the region cap, and a zero-filled MP3.
+  damage beyond the region cap, and a zero-filled MP3. Review regressions:
+  byte flips inside the final frame (including 120 positions of a one-frame
+  file), the structural frame end checked against the next header on every
+  fixture, a damaged final header with no declared total, an MP4 whose
+  audio is shorter than its video, audio-only Matroska, and MD5 at
+  4/8/12/16/20/24/32 bit. The odd depths come from a new spec-complete
+  verbatim FLAC writer, cross-checked by libsndfile and ffmpeg. A 32-bit
+  file from ffmpeg's own encoder is also covered, and the no-ffmpeg path is
+  tested.
 - No false alarms: every committed FLAC fixture passes every frame and its
   MD5. ffmpeg reports zero errors on every committed MP3/M4A/OGG.
 - Changed expectations: `truncated.flac` is now caught in segment mode too.

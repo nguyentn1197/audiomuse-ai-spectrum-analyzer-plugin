@@ -162,6 +162,7 @@ class TestFlacDamage(_TempFiles):
     def test_unset_md5_is_not_damage(self):
         r = integrity.check_flac(self.write('nomd5.flac', G.md5_zero(self.cd)), verify_md5=True)
         self.assertEqual((r['result'], r['md5']), ('ok', 'unset'))
+        self.assertIn('never stored', r['md5_detail'])
 
     def test_large_leading_id3v2_tag(self):
         # bigger than any fixed sniff window, as embedded cover art makes it
@@ -227,6 +228,144 @@ class TestFlacDamage(_TempFiles):
         self.assertIsNone(integrity.summarize({'result': 'ok'}))
 
 
+class TestFinalFrame(_TempFiles):
+    """PR #16 review, P1: the final frame has no next header, and accepting
+    the first place a running CRC-16 hits zero let corruption after a chance
+    zero pass (146/200 single-byte corruptions of a one-frame file). Its end
+    now comes from walking its structure; the CRC is checked there."""
+
+    def _flip(self, raw, offset, mask=0x5A):
+        data = bytearray(raw)
+        data[offset] ^= mask
+        return bytes(data)
+
+    def test_bit_flip_inside_the_final_frame(self):
+        p, hl, num, bs = self.chain[-1]
+        last_start = num * self.bs
+        r = integrity.check_flac(self.write('last.flac',
+                                            self._flip(self.cd, (p + hl + len(self.cd)) // 2)))
+        self.assertEqual(r['result'], 'damaged')
+        self.assertEqual((r['bad_frames'], r['missing_frames']), (1, 0))
+        self.assertEqual(r['regions'], [[round(last_start / self.sr, 2),
+                                         round((last_start + bs) / self.sr, 2)]])
+
+    def test_every_byte_position_of_a_single_frame_file(self):
+        # the reviewer's scenario: a one-frame file, one byte changed. Before
+        # the fix most positions passed; now every one must be caught.
+        import soundfile as sf
+        rng = np.random.default_rng(0)
+        path = os.path.join(self.tmp, 'single.flac')
+        sf.write(path, (rng.standard_normal((4000, 2)) * 3000).astype(np.int16), 44100,
+                 subtype='PCM_16')
+        raw = open(path, 'rb').read()
+        self.assertEqual(integrity.check_flac(path)['result'], 'ok')
+        p, hl = integrity.frame_index(raw)[3][0][:2]
+        offsets = np.linspace(p + hl, len(raw) - 3, 120).astype(int)
+        missed = [int(o) for o in offsets
+                  if integrity.check_flac(self.write('s.flac', self._flip(raw, o)))['result']
+                  != 'damaged']
+        self.assertEqual(missed, [])
+
+    def test_structural_end_matches_the_next_header_on_every_fixture(self):
+        # the frame walker must land exactly on the next frame header for
+        # every encoding the fixtures hold (sampled to keep the suite quick)
+        for path in sorted(glob.glob(os.path.join(FIXTURES, '*.flac'))):
+            if os.path.basename(path) == 'truncated.flac':
+                continue
+            raw = open(path, 'rb').read()
+            info, _start, _strategy, chain = integrity.frame_index(raw)
+            limit = integrity.max_frame_bytes(info, chain)
+            with self.subTest(fixture=os.path.basename(path)):
+                picks = sorted(set(np.linspace(0, len(chain) - 1, 25).astype(int)))
+                for i in picks:
+                    p, hl, _num, bs = chain[i]
+                    want = chain[i + 1][0] if i + 1 < len(chain) else len(raw)
+                    self.assertEqual(integrity._frame_end(raw, p, hl, info, bs, limit), want,
+                                     f'frame {i}')
+
+    def test_damaged_final_header_without_a_declared_total(self):
+        # no STREAMINFO total to compare against: a final frame whose header
+        # fails its CRC-8 must still not pass as "trailing junk"
+        data = bytearray(self.cd)
+        si = integrity.flac_offset(self.cd) + 8
+        x = int.from_bytes(data[si + 10:si + 18], 'big') & ~((1 << 36) - 1)
+        data[si + 10:si + 18] = x.to_bytes(8, 'big')       # total_samples = 0
+        data[self.chain[-1][0] + 2] ^= 0x01                # break the last header
+        r = integrity.check_flac(self.write('nototal.flac', bytes(data)))
+        self.assertEqual(r['result'], 'damaged')
+        self.assertIn('damaged frame data', r['detail'])
+
+    def test_trailing_tag_and_junk_still_pass(self):
+        for name, data in (('id3v1', G.id3v1_suffix(self.cd)), ('junk', G.junk_suffix(self.cd))):
+            with self.subTest(case=name):
+                r = integrity.check_flac(self.write(name + '.flac', data))
+                self.assertEqual(r['result'], 'ok')
+
+
+class TestMd5AllBitDepths(_TempFiles):
+    """PR #16 review, P3: FLAC allows 4-32-bit samples; libsndfile reads
+    only 8/16/24, so other depths go through ffmpeg -- and when neither can,
+    md5 is 'not_checked' with md5_detail saying why, never silently."""
+    DEPTHS = (4, 8, 12, 16, 20, 24, 32)
+
+    def _file(self, bits):
+        return self.write(f'v{bits}.flac',
+                          G.verbatim_flac(G.odd_depth_samples(bits), 44100, bits))
+
+    def test_verbatim_writer_output_decodes_to_its_samples(self):
+        # the generator is only a fair test input if real decoders agree
+        import soundfile as sf
+        for bits in (8, 16, 24):
+            with self.subTest(bits=bits):
+                y, _ = sf.read(self._file(bits), dtype='int32')
+                self.assertTrue(np.array_equal(y >> (32 - bits), G.odd_depth_samples(bits)))
+        for bits in self.DEPTHS:
+            with self.subTest(bits=bits):
+                self.assertEqual(integrity.check_flac(self._file(bits))['result'], 'ok')
+
+    def test_libsndfile_depths_need_no_ffmpeg(self):
+        with mock.patch.object(integrity.shutil, 'which', return_value=None):
+            for bits in (8, 16, 24):
+                with self.subTest(bits=bits):
+                    r = integrity.check_flac(self._file(bits), verify_md5=True)
+                    self.assertEqual((r['md5'], r['md5_detail']), ('match', None))
+
+    def test_other_depths_without_ffmpeg_say_why(self):
+        with mock.patch.object(integrity.shutil, 'which', return_value=None):
+            for bits in (4, 12, 20, 32):
+                with self.subTest(bits=bits):
+                    r = integrity.check_flac(self._file(bits), verify_md5=True)
+                    self.assertEqual((r['result'], r['md5']), ('ok', 'not_checked'))
+                    self.assertIn(f'{bits}-bit', r['md5_detail'])
+                    self.assertIn('ffmpeg is not on PATH', r['md5_detail'])
+
+    @unittest.skipUnless(HAS_FFMPEG, 'requires ffmpeg on PATH')
+    def test_every_depth_verifies_and_catches_a_wrong_md5(self):
+        for bits in self.DEPTHS:
+            with self.subTest(bits=bits):
+                path = self._file(bits)
+                r = integrity.check_flac(path, verify_md5=True)
+                self.assertEqual((r['result'], r['md5']), ('ok', 'match'), r['md5_detail'])
+                bad = integrity.check_flac(self.write(f'v{bits}_bad.flac',
+                                                      G.md5_flip(open(path, 'rb').read())),
+                                           verify_md5=True)
+                self.assertEqual((bad['result'], bad['md5']), ('damaged', 'mismatch'))
+
+    @unittest.skipUnless(HAS_FFMPEG, 'requires ffmpeg on PATH')
+    def test_real_encoder_32_bit(self):
+        # independent of the generator: ffmpeg's own 32-bit FLAC encoder
+        import subprocess
+        path = os.path.join(self.tmp, 'enc32.flac')
+        p = subprocess.run(['ffmpeg', '-hide_banner', '-nostdin', '-v', 'error', '-y', '-f',
+                            'lavfi', '-i', 'anoisesrc=d=1:c=pink:r=48000:a=0.3', '-ac', '2',
+                            '-sample_fmt', 's32', '-bits_per_raw_sample', '32', '-strict',
+                            'experimental', '-c:a', 'flac', path], capture_output=True)
+        if p.returncode != 0:
+            self.skipTest('this ffmpeg cannot encode 32-bit FLAC')
+        r = integrity.check_flac(path, verify_md5=True)
+        self.assertEqual((r['result'], r['md5']), ('ok', 'match'), r['md5_detail'])
+
+
 class TestFfmpegCheck(_TempFiles):
     def test_without_ffmpeg_reports_not_checked(self):
         with mock.patch.object(integrity.shutil, 'which', return_value=None):
@@ -252,6 +391,36 @@ class TestFfmpegCheck(_TempFiles):
         self.assertTrue(r['truncated'])
         self.assertLess(r['decoded_seconds'], r['declared_seconds'] - 10)
         self.assertIn('decodes to', integrity.summarize(r))
+
+    @unittest.skipUnless(HAS_FFMPEG, 'requires ffmpeg on PATH')
+    def test_video_longer_than_audio_is_not_truncation(self):
+        # PR #16 review, P2: a container lasts as long as its longest stream;
+        # a valid MP4 with 4 s of video and 1 s of audio is not truncated
+        import subprocess
+        path = os.path.join(self.tmp, 'av.mp4')
+        subprocess.run(['ffmpeg', '-hide_banner', '-nostdin', '-v', 'error', '-y',
+                        '-f', 'lavfi', '-i', 'testsrc=duration=4:size=64x64:rate=10',
+                        '-f', 'lavfi', '-i', 'sine=frequency=440:duration=1',
+                        '-c:v', 'mpeg4', '-c:a', 'aac', path], check=True)
+        r = integrity.check_ffmpeg(path)
+        self.assertEqual((r['result'], r['truncated'], r['errors']), ('ok', False, 0))
+        self.assertAlmostEqual(r['declared_seconds'], 1.0, delta=0.1)
+        r, _d = (lambda res: (res, json.loads(res['details'])))(
+            dsp.analyze_file(path, suffix='mp4', bitrate_kbps=128, deep=True))
+        self.assertNotEqual(r['verdict'], 'DAMAGED')
+
+    @unittest.skipUnless(HAS_FFMPEG, 'requires ffmpeg on PATH')
+    def test_single_stream_container_without_stream_duration(self):
+        # Matroska reports no per-stream duration; with audio as the only
+        # stream, the container duration is the same promise
+        import subprocess
+        path = os.path.join(self.tmp, 'a.mka')
+        subprocess.run(['ffmpeg', '-hide_banner', '-nostdin', '-v', 'error', '-y',
+                        '-f', 'lavfi', '-i', 'sine=frequency=440:duration=3',
+                        '-c:a', 'flac', path], check=True)
+        r = integrity.check_ffmpeg(path)
+        self.assertEqual((r['result'], r['truncated']), ('ok', False))
+        self.assertAlmostEqual(r['declared_seconds'], 3.0, delta=0.1)
 
     @unittest.skipUnless(HAS_FFMPEG, 'requires ffmpeg on PATH')
     def test_zero_filled_mp3_raises_decoder_errors(self):

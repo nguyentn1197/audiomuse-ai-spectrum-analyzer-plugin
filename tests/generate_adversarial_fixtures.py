@@ -345,6 +345,54 @@ def variable_blocksize(raw):
     return bytes(out)
 
 
+def verbatim_flac(samples, sample_rate, bits, blocksize=4096):
+    """A minimal but spec-complete FLAC writer: STREAMINFO (with the MD5 of
+    the source samples) and fixed-block-size frames of VERBATIM subframes,
+    both CRCs computed. It exists because no encoder available here writes
+    the depths FLAC allows beyond 8/16/24/32 (ffmpeg rounds 12 -> 16 and
+    20 -> 24), and MD5 verification must be tested on them. Not circular:
+    libsndfile (8/16/24) and ffmpeg (any depth) decode its output
+    independently, and the tests compare that against the source samples.
+    `samples`: int array (frames,) or (frames, channels) within `bits`."""
+    import hashlib
+    x = np.asarray(samples, dtype=np.int64)
+    if x.ndim == 1:
+        x = x[:, None]
+    n, ch = x.shape
+    assert 4 <= bits <= 32 and 1 <= ch <= 8
+    assert x.min() >= -(1 << (bits - 1)) and x.max() < (1 << (bits - 1))
+    integ = _plugin_integrity()
+    nbytes = (bits + 7) // 8
+    md5 = hashlib.md5(x.astype('<i8').view(np.uint8).reshape(-1, 8)[:, :nbytes]
+                      .tobytes()).digest()
+    si = (blocksize.to_bytes(2, 'big') * 2 + b'\x00' * 6
+          + ((sample_rate << 44) | ((ch - 1) << 41) | ((bits - 1) << 36) | n)
+          .to_bytes(8, 'big') + md5)
+    out = bytearray(b'fLaC' + bytes([0x80]) + len(si).to_bytes(3, 'big') + si)
+    ss_code = {8: 1, 12: 2, 16: 4, 20: 5, 24: 6, 32: 7}.get(bits, 0)  # 0: STREAMINFO
+    shifts = np.arange(bits - 1, -1, -1)
+    sub_header = np.array([0, 0, 0, 0, 0, 0, 1, 0], dtype=np.uint8)  # VERBATIM
+    for index, s0 in enumerate(range(0, n, blocksize)):
+        blk = x[s0:s0 + blocksize]
+        head = (bytes([0xFF, 0xF8, 0x70, ((ch - 1) << 4) | (ss_code << 1)])
+                + _coded_number(index) + (len(blk) - 1).to_bytes(2, 'big'))
+        head += bytes([integ._crc8(head)])
+        parts = []
+        for c in range(ch):
+            v = blk[:, c] & ((1 << bits) - 1)
+            parts += [sub_header, ((v[:, None] >> shifts) & 1).astype(np.uint8).ravel()]
+        frame = head + np.packbits(np.concatenate(parts)).tobytes()
+        out += frame + integ._crc16(frame).to_bytes(2, 'big')
+    return bytes(out)
+
+
+def odd_depth_samples(bits, seconds=0.5, sample_rate=44100, seed=3):
+    """Stereo noise using the full range of `bits`."""
+    rng = np.random.default_rng(seed)
+    hi = (1 << (bits - 1)) - 1
+    return rng.integers(-hi - 1, hi + 1, (int(seconds * sample_rate), 2))
+
+
 INTEGRITY_VARIANTS = {
     'corrupt_zerofill.flac': lambda cd, mp3: zero_fill_burst(cd),
     'corrupt_bitflip.flac': lambda cd, mp3: bit_flip(cd)[0],
