@@ -205,11 +205,179 @@ def gen_truncated(out):
             f.write(data[:len(data) // 2])
 
 
+# --------------------------------------------------------------------------
+# Container-damage variants for integrity.py. Deliberately NOT committed:
+# each is a deterministic byte transform of an already-committed fixture,
+# so tests/test_integrity.py builds them into a temp dir on the fly (no
+# ~4 MB binary per variant in the repo). `--integrity` writes them out for
+# manual inspection (run_verdicts.py, the debug app, a real AudioMuse).
+
+def _plugin_integrity():
+    import sys
+    plugin_dir = os.path.join(os.path.dirname(_HERE), 'plugins', 'SpectrumAnalyzer')
+    if plugin_dir not in sys.path:
+        sys.path.insert(0, plugin_dir)
+    import integrity
+    return integrity
+
+
+def _frames(raw):
+    """(info, audio_start, [(offset, header len, number, block size)]) of a
+    clean FLAC -- the frame boundaries the transforms below cut along."""
+    info, audio_start, _strategy, chain = _plugin_integrity().frame_index(raw)
+    assert info is not None and chain, 'source must be a clean native FLAC'
+    return info, audio_start, chain
+
+
+def zero_fill_burst(raw, at=0.6, stride=1348, run=1158, holes=(0, 4, 9, 11, 14, 15)):
+    """The real-world case this check was built for: a transfer that lost
+    chunks and filled them with zeros -- `run` zero bytes on a `stride`-byte
+    grid, a burst of `holes` starting `at` of the way into the audio. Works
+    on any container (no frame parsing)."""
+    out = bytearray(raw)
+    start = len(raw) // 10 if raw[:4] != b'fLaC' else _frames(raw)[1]
+    base = start + int(at * (len(raw) - start))
+    for k in holes:
+        s = base + k * stride
+        out[s:s + run] = b'\x00' * run
+    return bytes(out)
+
+
+def bit_flip(raw, frame=None):
+    """Bit rot: one flipped bit in the middle of one frame's body. A decoder
+    often plays the garbage without complaint; only the frame CRC sees it.
+    Returns (bytes, frame number, first sample of that frame)."""
+    _info, _start, chain = _frames(raw)
+    i = len(chain) // 2 if frame is None else frame
+    p, hl, num, bs = chain[i]
+    end = chain[i + 1][0]
+    out = bytearray(raw)
+    out[p + hl + (end - p - hl) // 2] ^= 0x10
+    return bytes(out), num, num * chain[0][3]
+
+
+def drop_frame(raw, frame):
+    """A whole frame missing (header and body): the frame numbering jumps."""
+    _info, _start, chain = _frames(raw)
+    return raw[:chain[frame][0]] + raw[chain[frame + 1][0]:]
+
+
+def cut_at_frame(raw, frame):
+    """Truncated exactly on a frame boundary: every remaining frame passes
+    its CRC, so only STREAMINFO's total sample count reveals the loss."""
+    _info, _start, chain = _frames(raw)
+    return raw[:chain[frame][0]]
+
+
+def _md5_offset(raw):
+    return _plugin_integrity().flac_offset(raw) + 4 + 4 + 18
+
+
+def md5_flip(raw):
+    """Every frame intact but STREAMINFO's MD5 no longer matches the audio
+    (what `flac -t` reports as an MD5 mismatch)."""
+    out = bytearray(raw)
+    out[_md5_offset(raw)] ^= 0xFF
+    return bytes(out)
+
+
+def md5_zero(raw):
+    """An encoder that never computed the MD5 (all zeros = unset)."""
+    o = _md5_offset(raw)
+    return raw[:o] + b'\x00' * 16 + raw[o + 16:]
+
+
+def id3v2_prefix(raw, size=100_000):
+    """A leading ID3v2 tag (non-standard on FLAC but common) larger than any
+    fixed sniff window, as embedded cover art makes it."""
+    synchsafe = bytes([(size >> 21) & 0x7F, (size >> 14) & 0x7F,
+                       (size >> 7) & 0x7F, size & 0x7F])
+    return b'ID3\x04\x00\x00' + synchsafe + b'\x00' * size + raw
+
+
+def id3v1_suffix(raw):
+    return raw + b'TAG' + b'x' * 125
+
+
+def junk_suffix(raw, n=4000, seed=0):
+    """Random bytes appended after the last frame. Decoders play the file to
+    completion, so this is reported as trailing data, never as damage."""
+    return raw + np.random.default_rng(seed).integers(0, 256, n, dtype=np.uint8).tobytes()
+
+
+def _coded_number(v):
+    """FLAC's UTF-8-like frame/sample number coding (up to 36 bits)."""
+    if v < 0x80:
+        return bytes([v])
+    for n, bits in ((2, 11), (3, 16), (4, 21), (5, 26), (6, 31), (7, 36)):
+        if v < (1 << bits):
+            tail = []
+            for _ in range(n - 1):
+                tail.append(0x80 | (v & 0x3F))
+                v >>= 6
+            lead = 0xFE if n == 7 else (0xFF << (8 - n)) & 0xFF
+            return bytes([lead | v] + tail[::-1])
+    raise ValueError('number too large for FLAC coding')
+
+
+def variable_blocksize(raw):
+    """Rewrite a fixed-block-size FLAC as a variable-block-size stream: every
+    header gets the variable strategy bit and the frame's first sample
+    number instead of its frame index, with both CRCs recomputed. The audio
+    is untouched, so it must decode sample-identical to the source."""
+    integ = _plugin_integrity()
+    _info, audio_start, chain = _frames(raw)
+    nominal = chain[0][3]
+    end_of_audio = len(raw)
+    out = bytearray(raw[:audio_start])
+    for i, (p, hl, num, _bs) in enumerate(chain):
+        end = chain[i + 1][0] if i + 1 < len(chain) else end_of_audio
+        old_num_len = len(_coded_number(num))
+        # header = sync(2) b2 b3 | number | optional bs/sr bytes | crc8
+        extra = raw[p + 4 + old_num_len:p + hl - 1]
+        head = bytes([0xFF, 0xF9, raw[p + 2], raw[p + 3]]) + \
+            _coded_number(num * nominal) + extra
+        head += bytes([integ._crc8(head)])
+        body = raw[p + hl:end - 2]
+        frame = head + body
+        crc = integ._crc16(frame)
+        out += frame + crc.to_bytes(2, 'big')
+    return bytes(out)
+
+
+INTEGRITY_VARIANTS = {
+    'corrupt_zerofill.flac': lambda cd, mp3: zero_fill_burst(cd),
+    'corrupt_bitflip.flac': lambda cd, mp3: bit_flip(cd)[0],
+    'corrupt_dropped_frame.flac': lambda cd, mp3: drop_frame(cd, 200),
+    'corrupt_cut_on_boundary.flac': lambda cd, mp3: cut_at_frame(cd, 400),
+    'corrupt_md5.flac': lambda cd, mp3: md5_flip(cd),
+    'variable_blocksize.flac': lambda cd, mp3: variable_blocksize(cd),
+    'corrupt_zerofill.mp3': lambda cd, mp3: zero_fill_burst(mp3),
+}
+
+
+def gen_integrity_variants(out):
+    with open(CD, 'rb') as f:
+        cd = f.read()
+    with open(os.path.join(FIXTURES, 'consistent_320.mp3'), 'rb') as f:
+        mp3 = f.read()
+    for name, make in INTEGRITY_VARIANTS.items():
+        with open(os.path.join(out, name), 'wb') as f:
+            f.write(make(cd, mp3))
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--ffmpeg', default='ffmpeg')
     ap.add_argument('--out', default=FIXTURES)
+    ap.add_argument('--integrity', metavar='DIR',
+                    help='only write the (uncommitted) container-damage variants to DIR')
     args = ap.parse_args()
+    if args.integrity:
+        os.makedirs(args.integrity, exist_ok=True)
+        gen_integrity_variants(args.integrity)
+        print(f'container-damage variants written to {args.integrity}')
+        return
     os.makedirs(args.out, exist_ok=True)
 
     gen_pilot_tone(args.out)

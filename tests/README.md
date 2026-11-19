@@ -59,6 +59,34 @@ truncations, and dithered fixture are pure numpy/soundfile and don't. Running
 the script with no ffmpeg on PATH regenerates those three and leaves the
 other six untouched.
 
+### Container-damage variants (integrity check)
+
+`test_integrity.py` covers `plugins/SpectrumAnalyzer/integrity.py` with
+damage variants that are **not committed**: each is a deterministic byte
+transform of `genuine_cd_1644.flac` (or `consistent_320.mp3`), defined in
+`generate_adversarial_fixtures.py` and built into a temp dir by the tests,
+so the repo doesn't carry ~4 MB of binary per variant. To write them out for
+manual inspection (`run_verdicts.py`, the debug app, a real AudioMuse):
+
+```bash
+python3 tests/generate_adversarial_fixtures.py --integrity /tmp/integrity_variants
+```
+
+| Variant | What it simulates | What must catch it |
+|---|---|---|
+| `zero_fill_burst` | chunks lost in transfer and zero-filled: 1158-byte holes on a 1348-byte grid (the real-world case the check was built from) | frame CRC-16 + broken headers; `zero_filled_bytes` = 6 × 1158 |
+| `bit_flip` | bit rot: one flipped bit mid-frame, which a decoder plays without complaint | that one frame's CRC-16 (exactly 1 bad frame, exact region) |
+| `drop_frame` | one whole frame missing | the frame-number jump (1 missing, its neighbour still verified) |
+| `cut_at_frame` | truncated exactly on a frame boundary | only STREAMINFO's total sample count — every remaining frame passes its CRC |
+| `md5_flip` / `md5_zero` | frames intact, MD5 wrong / never computed | deep-mode MD5: `mismatch` → damaged; `unset` → fine |
+| `id3v2_prefix` / `id3v1_suffix` / `junk_suffix` | a 100 KB leading ID3v2 tag, a trailing ID3v1 tag, random bytes appended | must all pass (junk is reported as trailing data: decoders play it fine) |
+| `variable_blocksize` | the same audio re-framed as a variable-block-size stream | must decode sample-identical and verify; a bit flip in it is still pinned |
+| `zero_fill_burst` on MP3 | transfer damage in a non-FLAC file | deep-mode ffmpeg decode errors |
+
+Clean-file baseline: every committed FLAC fixture passes every frame CRC and
+its stream MD5, and ffmpeg reports zero errors and a decoded length within
+0.1 s of the declared one on every committed MP3/M4A/OGG fixture.
+
 ## Calibration notes (measured on these fixtures, 2026-07)
 
 - Shelf above a transcode/resample cutoff: −73…−106 dB relative to reference

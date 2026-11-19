@@ -21,6 +21,11 @@ import os
 
 import numpy as np
 
+try:
+    from . import integrity as _integrity
+except ImportError:  # imported as a top-level module (tests, debug_app)
+    import integrity as _integrity
+
 # Containers we treat as claiming to be lossless.
 LOSSLESS_SUFFIXES = {'flac', 'wav', 'alac', 'ape', 'aiff', 'aif', 'wv', 'tta', 'shn'}
 LOSSY_SUFFIXES = {'mp3', 'ogg', 'opus', 'aac', 'm4a', 'mp4', 'wma', 'mpc'}
@@ -29,7 +34,10 @@ N_FFT = 4096
 
 # Bump when verdict logic changes so stored results re-analyze on the next
 # non-force scan (the skip paths in jobs.py require a rev match).
-ANALYSIS_REV = 7
+# 8: container integrity check (integrity.py) -- a damaged file is
+# INCONCLUSIVE/'corrupt' instead of whatever its decodable audio read as, so
+# every stored row has to be re-checked once.
+ANALYSIS_REV = 8
 
 
 def analysis_rev(drop_db, segment_seconds):
@@ -1070,12 +1078,37 @@ def _render_spectrogram(S_db, sr, seg_offset, seg_len_s, cutoff_hz,
     return base64.b64encode(buf.getvalue()).decode('ascii')
 
 
-def _inconclusive_result(suffix, bitrate_kbps, deep, drop_db, segment_seconds, exc):
+def _stream_damaged(stream):
+    return bool(stream) and stream.get('result') == 'damaged'
+
+
+def _integrity_state(status, coverage, stream):
+    """details.integrity with the container check folded in. A positively
+    damaged stream overrides the decode-derived status with 'corrupt', and
+    its coverage is 'full': coverage says how much of the file the status is
+    based on, and both check methods walk the whole file. Otherwise the
+    decode status stands -- a frame walk that passes is not a decode, so it
+    never upgrades sampled_decode_ok (progressive-integrity contract);
+    integrity.stream carries its own pass/fail."""
+    if _stream_damaged(stream):
+        status, coverage = 'corrupt', 'full'
+    return {'status': status, 'coverage': coverage, 'stream': stream}
+
+
+def _inconclusive_result(suffix, bitrate_kbps, deep, drop_db, segment_seconds, exc,
+                         stream=None):
     """Result dict for a file that could not be decoded at all: a stored,
     visible INCONCLUSIVE row instead of a silently dropped analysis.
     deep_eligible=False — if the file couldn't be decoded once, a repeat
     attempt (segment or deep) won't fare better. Same key shape as a normal
-    result so callers (_upsert, on_song_analyzed) need no special-casing."""
+    result so callers (_upsert, on_song_analyzed) need no special-casing.
+    `stream` is the container check (integrity.check_file), which usually
+    explains *why* the decode failed."""
+    notes = [f'decode failed: {exc}']
+    est = 'could not decode audio'
+    if _stream_damaged(stream):
+        est = _integrity.summarize(stream)
+        notes.insert(0, f'integrity: {est}')
     return {
         'sample_rate': None,
         'seg_offset': 0.0,
@@ -1084,7 +1117,7 @@ def _inconclusive_result(suffix, bitrate_kbps, deep, drop_db, segment_seconds, e
         'edge_db_khz': None,
         'shelf_db': None,
         'verdict': 'INCONCLUSIVE',
-        'est_source': 'could not decode audio',
+        'est_source': est,
         'confidence': 0.0,
         'container_bits': None,
         'effective_bits': None,
@@ -1095,9 +1128,9 @@ def _inconclusive_result(suffix, bitrate_kbps, deep, drop_db, segment_seconds, e
             'suffix': suffix,
             'deep': deep,
             'drop_db': drop_db,
-            'integrity': {'status': 'decode_failed', 'coverage': None},
+            'integrity': _integrity_state('decode_failed', None, stream),
             'analysis_rev': analysis_rev(drop_db, segment_seconds),
-            'notes': [f'decode failed: {exc}'],
+            'notes': notes,
         }),
         'spectrogram_b64': None,
         'analysis_rev': analysis_rev(drop_db, segment_seconds),
@@ -1129,7 +1162,7 @@ def _unsupported_format_result(suffix, bitrate_kbps, deep, drop_db, segment_seco
             'suffix': suffix,
             'deep': deep,
             'drop_db': drop_db,
-            'integrity': {'status': 'unsupported', 'coverage': None},
+            'integrity': {'status': 'unsupported', 'coverage': None, 'stream': None},
             'analysis_rev': analysis_rev(drop_db, segment_seconds),
             'notes': [f'{fmt.upper()} recognized by magic bytes: DSD content is '
                       f'not analyzed by the PCM spectrum heuristics'],
@@ -1153,6 +1186,15 @@ def analyze_file(path, suffix=None, bitrate_kbps=None, segment_seconds=90,
     comes out CLEAN (spectrogram_b64 is None in the result). Audio isn't
     retained after analysis, so a spectrogram not rendered here can never be
     rendered later -- this is a settings-gated tradeoff, not a default.
+
+    Every result also carries the container integrity check
+    (integrity.check_file -> details.integrity.stream): native FLAC frames on
+    every scan, plus the stream MD5 / an ffmpeg decode for other formats on
+    deep scans. A damaged file comes back INCONCLUSIVE with
+    integrity.status 'corrupt' whatever its audio looks like -- truncated or
+    zero-filled frames decode cleanly up to the damage, and the garbage a
+    decoder makes of a broken frame is broadband noise, so the spectral
+    reading of a damaged file is not evidence of authenticity either way.
     """
     if suffix is None:
         suffix = os.path.splitext(path)[1].lstrip('.')
@@ -1161,6 +1203,8 @@ def analyze_file(path, suffix=None, bitrate_kbps=None, segment_seconds=90,
     if dsd_fmt:
         return _unsupported_format_result(suffix, bitrate_kbps, deep, drop_db,
                                           segment_seconds, dsd_fmt)
+
+    stream = _integrity.check_file(path, deep=deep)
 
     detected_fmt, detected_lossless, codec_name = _probe_container(path)
     # libsndfile opens Ogg Opus but decodes it only in parts, so it stays on
@@ -1237,7 +1281,7 @@ def analyze_file(path, suffix=None, bitrate_kbps=None, segment_seconds=90,
             cutoff_hz, ref, narrow_tone = primary['cutoff_hz'], primary['ref'], primary['narrow_tone']
     except ValueError as exc:
         return _inconclusive_result(suffix, bitrate_kbps, deep, drop_db,
-                                    segment_seconds, exc)
+                                    segment_seconds, exc, stream)
 
     if deep:
         if len(edge_series) >= 10:
@@ -1319,21 +1363,33 @@ def analyze_file(path, suffix=None, bitrate_kbps=None, segment_seconds=90,
             f'{container_bits}-bit container ({lower_bit_activity_fraction * 100:.2f}% '
             f'of samples show real content below 16 bits) -- not flagged as padded')
 
+    deep_eligible = True
+    if _stream_damaged(stream):
+        # damage outranks every spectral verdict (see the docstring); keep
+        # the spectral reading as a note so nothing measured is lost. Not
+        # deep-eligible: a deep scan re-reads the same broken bytes.
+        summary = _integrity.summarize(stream)
+        notes.insert(0, f'integrity: {summary}')
+        notes.append(f'spectral reading of the decodable audio: {verdict} ({est}) '
+                     f'-- not evidence either way on a damaged file')
+        verdict, est, conf = 'INCONCLUSIVE', summary, 0.0
+        deep_eligible = False
+
     if skip_spectrogram_for_clean and verdict == 'CLEAN':
         png_b64 = None
     else:
         png_b64 = _render_spectrogram(S_db, sr, offset, seg_len, cutoff_hz, img_w, img_h)
 
     if not deep:
-        integrity = {'status': 'sampled_decode_ok', 'coverage': 'sampled'}
+        integrity = _integrity_state('sampled_decode_ok', 'sampled', stream)
     elif chunk_error:
         # a chunk load raised before reaching either the natural end of the
         # file or the time budget - some usable data, but cut short
-        integrity = {'status': 'sampled_decode_ok', 'coverage': 'partial'}
+        integrity = _integrity_state('sampled_decode_ok', 'partial', stream)
     elif capped:
-        integrity = {'status': 'sampled_decode_ok', 'coverage': 'capped'}
+        integrity = _integrity_state('sampled_decode_ok', 'capped', stream)
     else:
-        integrity = {'status': 'full_decode_ok', 'coverage': 'full'}
+        integrity = _integrity_state('full_decode_ok', 'full', stream)
     delivery = {}
     if codec_mismatch:
         delivery['codec_mismatch'] = codec_mismatch
@@ -1353,7 +1409,7 @@ def analyze_file(path, suffix=None, bitrate_kbps=None, segment_seconds=90,
         'confidence': round(conf, 2),
         'container_bits': container_bits,
         'effective_bits': effective_bits,
-        'deep_eligible': True,
+        'deep_eligible': deep_eligible,
         'details': json.dumps({
             'ref_level_db': round(ref, 2),
             'shelf_ref_db': round(shelf_ref, 2),
