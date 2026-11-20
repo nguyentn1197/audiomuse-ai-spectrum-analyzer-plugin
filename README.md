@@ -11,7 +11,8 @@ A plugin for Audiomuse-AI to run spectrum analysis over the whole library with f
 - **Each song analyzed once, re-analyzed only when the file changes** — two layers:
   1. *Metadata fingerprint* (path, size, suffix, bitRate, created…) from the media-server track object → unchanged tracks are skipped without downloading.
   2. *Audio MD5* of the downloaded bytes → if metadata changed but bytes didn't, only the fingerprint is refreshed; if bytes changed, full re-analysis.
-- **Fake detection output per song** — frequency cutoff (Hz), edge sharpness (dB/kHz), noise-shelf level, container/effective bit depth, verdict (`CLEAN`, `CONSISTENT_LOSSY`, `LOWPASSED`, `UPSAMPLED`, `UPSCALED`, `TRANSCODED_LOSSY`, `FAKE_SUSPECT`), estimated source-bitrate class, confidence, raw metrics JSON. `FAKE_SUSPECT`, `TRANSCODED_LOSSY`, `UPSAMPLED` and `UPSCALED` count as suspect in the overview.
+- **Fake detection output per song** — frequency cutoff (Hz), edge sharpness (dB/kHz), noise-shelf level, container/effective bit depth, verdict (`CLEAN`, `CONSISTENT_LOSSY`, `LOWPASSED`, `UPSAMPLED`, `UPSCALED`, `TRANSCODED_LOSSY`, `FAKE_SUSPECT`, plus `DAMAGED` and `INCONCLUSIVE`), estimated source-bitrate class, confidence, raw metrics JSON. `FAKE_SUSPECT`, `TRANSCODED_LOSSY`, `UPSAMPLED` and `UPSCALED` count as suspect in the overview; `DAMAGED` (the file is broken) and `INCONCLUSIVE` (it couldn't be analyzed) each get their own count, and `DAMAGED` its own column in the album table.
+- **Damaged-file detection** — every FLAC's frames are verified against their own checksums on every scan (no decode, ~0.1 s per track), and deep scans add the stream MD5 (FLAC) or a checked full decode (everything else). A damaged file — zero-filled or truncated by a bad download, bit rot, missing frames — comes back `DAMAGED` with *where* it's damaged ("damaged file: 29 bad frames, 2.69 s affected (2:41.9-2:46.7, 3:01.0-3:01.6)"), whatever its spectrum looks like. See [Damaged files](#damaged-files).
 - **Spectrogram stored as base64 PNG** in the plugin's own Postgres table (`plugin_spectrum_analyzer__results`), rendered spek-style with a red line at the detected cutoff.
 - **Reacts to the core cleanup task** — `item_id` is a foreign key to `score(item_id)` with `ON DELETE CASCADE` (same pattern as core's `embedding` tables), so when `tasks/cleaning.py` removes an orphaned track, its spectrogram row disappears too.
 - **Manual re-run** — a Re-analyze button on every track (runs on the `high` queue) and a Re-analyze album button on each album page (one forced album task on the default queue), plus three scan modes: *changed* (default), *verify* (re-hash everything), *force* (redo everything).
@@ -55,6 +56,15 @@ The decode budget (90 s by default) is spread across several windows sampled thr
 - lossy container whose cutoff is far below what its declared bitrate should reach → `TRANSCODED_LOSSY`
 - otherwise → `CONSISTENT_LOSSY`
 
+### Damaged files
+
+Whether a file is *authentic* and whether it is *intact* are separate questions, and the spectrum can't answer the second: a FLAC with zero-filled or truncated frames decodes cleanly right up to the damage (a normal scan's sampled windows may never touch it), and the garbage a decoder makes of a broken frame is broadband noise. So integrity is read from the container's own checksums, by content (magic bytes), not by file extension:
+
+- **FLAC, every scan** — every frame header (CRC-8) and frame body (CRC-16) is verified in numpy without decoding any audio, and the frame sequence is checked against the total sample count in STREAMINFO, so a file cut exactly on a frame boundary — which no per-frame checksum can see — is caught too. The final frame, which has no next header to bound it, is walked like a decoder walks it to find its exact end before its checksum is read. Deep scans also decode the stream and compare it with STREAMINFO's MD5, at every bit depth FLAC allows (4–32 bit; depths other than 8/16/24 need ffmpeg). Together that is what `flac -t` checks.
+- **Every other format, deep scans only** — a full ffmpeg decode with its CRC/bitstream checks on, plus the decoded length against the audio stream's own declared duration (a half-truncated MP3 decodes without a single error, but not to its declared 45 s). The audio stream's, not the container's: a video file whose audio is shorter than its picture is not truncated. Weaker by nature: MP3 rarely carries CRCs and PCM/ALAC carry none, so a pass means "decodes cleanly to its declared length", not "bit-identical". It's deep-only because one subprocess and a full decode per track is too much for a library scan.
+
+A damaged file gets its own verdict, `DAMAGED` (`integrity.status = corrupt`, confidence 100 % — the evidence is the file's own checksums or decoder errors, not a heuristic), its location in the estimated-source line, and the spectral reading it *would* have had as a note. It's kept apart from `INCONCLUSIVE` on purpose: "this file is broken, replace it" and "this file couldn't be analyzed" call for different actions. `DAMAGED` doesn't count as suspect (it says nothing about authenticity) and isn't offered a deep scan — that would re-read the same broken bytes — so "deep scan all" skips it. A file that can't be decoded *and* can't be shown to be damaged (not a FLAC, no ffmpeg check) stays `INCONCLUSIVE`. The fix for `DAMAGED` is a fresh copy of the file. Trailing bytes after the last frame (ID3v1/APE tags, or junk players ignore anyway) are reported, never counted as damage.
+
 These are heuristics — treat `FAKE_SUSPECT` as "look at the spectrogram," not a conviction. Thresholds are calibrated against real ground-truth fixtures (see `tests/`): LAME 320 kbps transcodes (cutoff ~20.1 kHz, dither-only shelf) are caught, but very-high-bitrate transcodes whose cutoff reaches ≥ 20.5 kHz (e.g. AAC 256) still read as CLEAN — spectrally indistinguishable from a genuine master, and false accusations are worse.
 
 ### Reading the raw metrics (the "details" JSON)
@@ -87,12 +97,28 @@ Every track page has a collapsible **raw metrics** panel — the full evidence b
 | `lower_bit_activity_fraction` | The fraction of samples that show real content below 16 bits. A low but nonzero value (a mostly-padded file with a few genuinely deeper samples — dither, gain changes, edits) shows up as a note, not a verdict change. |
 | `coverage` | How much of the file the bit-depth check actually read: `sampled` (~30 s window, normal scan), `full` (deep scan, whole file), or `capped` (deep scan hit its time limit). An exact `UPSCALED` hit is more confident (0.95) when confirmed by `full`/`capped` than by `sampled` (0.9). |
 
-**`integrity`** — how much of the file was actually decoded:
+**`integrity`** — how much of the file was actually decoded, and whether it's damaged:
 
 | Field | Meaning |
 |---|---|
-| `status` | `sampled_decode_ok` (normal scan, a few windows read), `full_decode_ok` (deep scan, whole file read), `decode_failed` (file couldn't be opened), or `unsupported` (DSD — deliberately not analyzed). |
+| `status` | `sampled_decode_ok` (normal scan, a few windows read), `full_decode_ok` (deep scan, whole file read), `corrupt` (the container check below found damage — always with coverage `full` and verdict `DAMAGED`), `decode_failed` (file couldn't be opened), or `unsupported` (DSD — deliberately not analyzed). A container check that *passes* never upgrades the status: verifying frame checksums isn't decoding. |
 | `coverage` | How much of the file that status is based on: `sampled`, `partial`, `capped` (deep scan hit its time limit), or `full`. |
+| `stream` | The container check ([Damaged files](#damaged-files)), or `null` when none ran (non-FLAC on a normal scan, DSD). Fields below. |
+
+**`integrity.stream`** — common fields: `method` (`flac_frames` or `ffmpeg_decode`), `result` (`ok`, `damaged`, or `not_checked` — e.g. no ffmpeg on PATH), `truncated`, `detail` (free text, e.g. why something wasn't checked, or "4000 unrecognized bytes after the last frame (not damage)").
+
+| Field (`flac_frames`) | Meaning |
+|---|---|
+| `frames` / `bad_frames` / `missing_frames` | Frames the file should have, how many are broken, and how many of those lost their header entirely. |
+| `damaged_seconds` / `regions` | Total audio affected, and where: `[[start_s, end_s], …]`, neighbours under 1 s apart merged, at most 32 (`regions_capped` says there were more). |
+| `zero_filled_bytes` | Bytes inside damaged frames that are long runs of zeros — the fingerprint of a download/transfer that lost chunks, as opposed to bit rot. |
+| `trailing_bytes` | Bytes after the last frame (an ID3v1/APE tag, padding, junk) — reported, never damage. |
+| `md5` / `md5_detail` | Deep scans: `match`, `mismatch` (frames intact but the audio isn't what was encoded → damaged), `unset` (encoder never wrote one), `not_checked` (e.g. a 20-bit file with no ffmpeg on PATH — `md5_detail` always says why). `null` on a normal scan. |
+
+| Field (`ffmpeg_decode`) | Meaning |
+|---|---|
+| `errors` / `messages` | How many errors the decoder logged, and the first five. |
+| `declared_seconds` / `decoded_seconds` | The audio stream's declared duration vs. what actually decoded. `truncated` is `null` when there's no trustworthy declared duration: only estimated from the bitrate (e.g. an MP3 with no Xing header), or only the container's in a file with other streams. |
 
 **`delivery`** — what codec is actually inside the file (`null` if there's nothing to report — suffix and content agree and no codec was probed):
 
@@ -181,6 +207,7 @@ AGPL-3.0-only (same as AudioMuse-AI core, and required for the community plugin 
 - `plugins/SpectrumAnalyzer/__init__.py` — blueprint, pages (album overview with suspect filters, per-album detail), settings, migration, `register(ctx)`
 - `plugins/SpectrumAnalyzer/jobs.py` — scan orchestrator + per-album child tasks, single-track re-run, fingerprints, hook, DB upsert
 - `plugins/SpectrumAnalyzer/dsp.py` — STFT profile, cutoff/edge/shelf/aliasing/bit-depth metrics, verdict, deep scan, spectrogram PNG
+- `plugins/SpectrumAnalyzer/integrity.py` — container integrity check: FLAC frame CRCs + STREAMINFO sample count/MD5, ffmpeg decode check for other formats
 - `build.sh` → `dist/spectrum_analyzer-<version>.zip` — the flat code zip AudioMuse installs (run by CI on push to main)
 - `plugins/SpectrumAnalyzer/plugin.json` — the plugin descriptor (community-catalog layout: it lives next to the code, so the folder is a drop-in PR payload)
 - `manifest.json` — self-hosted catalog pointing at the descriptor (`CHANGELOG.md` holds the version history)

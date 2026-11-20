@@ -71,6 +71,8 @@ VERDICT_STYLE = {
     'UPSCALED':         ('#7c3aed', 'Fake 24-bit: zero-padded 16-bit source'),
     'TRANSCODED_LOSSY': ('#dc2626', 'Lossy re-encoded from lower bitrate'),
     'FAKE_SUSPECT':     ('#dc2626', 'Suspect fake lossless (transcode)'),
+    'DAMAGED':          ('#1f2937', 'Damaged file: broken or missing frames, truncated, or '
+                                    'checksum mismatch — replace the file'),
     'INCONCLUSIVE':     ('#6b7280', 'Could not be analyzed (decode failure or unsupported format)'),
 }
 

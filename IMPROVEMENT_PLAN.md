@@ -142,7 +142,14 @@ have is deferred.
       signatures, calibration-table revisions — one string is enough.
       *Cost: one column + one comparison.*
 
-- [x] **Verdict/substatus contract.** New states introduced by this plan
+- [x] **Verdict/substatus contract.** *(Amended 2026-11, 0.5.0, maintainer
+      decision: files the container integrity check proves broken get a
+      second non-authenticity primary verdict, `DAMAGED`, instead of an
+      INCONCLUSIVE substatus — "replace this file" and "couldn't analyze
+      it" are different actions. It meets all three objections below: its
+      own count, album column and filter (never invisible); not in
+      `SUSPECT_VERDICTS`; `deep_eligible=False`, so bulk deep scans skip
+      it. See AGENTS.md.)* New states introduced by this plan
       (integrity, DSD, unsupported formats) are **substatuses in the details
       JSON, never new primary verdicts** — `bad_expr`, the album filters and
       the bulk `deep_rescan_all` route are all keyed to the fixed verdict

@@ -99,7 +99,10 @@ class TestSegmentVerdicts(unittest.TestCase):
         self.assertFalse(r['deep_eligible'])
         self.assertEqual(r['analysis_rev'], dsp.analysis_rev(40, 90))
         d = json.loads(r['details'])
-        self.assertEqual(d['integrity'], {'status': 'decode_failed', 'coverage': None})
+        # not a FLAC stream (no 'fLaC' marker) and not deep -> no container
+        # check ran, so integrity.stream is null and the decode status stands
+        self.assertEqual(d['integrity'],
+                         {'status': 'decode_failed', 'coverage': None, 'stream': None})
 
     def test_dsd_magic_bytes_unsupported(self):
         # DSD must be recognized (and refused) by content, not extension --
@@ -128,14 +131,18 @@ class TestSegmentVerdicts(unittest.TestCase):
                 self.assertFalse(r['deep_eligible'])
                 d = json.loads(r['details'])
                 self.assertEqual(d['detected_format'], fmt)
-                self.assertEqual(d['integrity'], {'status': 'unsupported', 'coverage': None})
+                self.assertEqual(d['integrity'],
+                                 {'status': 'unsupported', 'coverage': None, 'stream': None})
 
     def test_container_probe_no_regression(self):
         # the soundfile-based tier-2 probe must be a no-op for every fixture
         # we have (suffix and detected format already agree)
         r = _analyze('genuine_cd_1644.flac', 'flac', 900)
         d = json.loads(r['details'])
-        self.assertEqual(d['integrity'], {'status': 'sampled_decode_ok', 'coverage': 'sampled'})
+        self.assertEqual((d['integrity']['status'], d['integrity']['coverage']),
+                         ('sampled_decode_ok', 'sampled'))
+        # the frame walk passing never upgrades a sampled decode status
+        self.assertEqual(d['integrity']['stream']['result'], 'ok')
         self.assertIsNone(d['delivery'])
         r = _analyze('consistent_320.mp3', 'mp3', 320)
         # tier-2 soundfile subtype resolves the codec for free -- 'delivery'
@@ -179,7 +186,11 @@ class TestDeepVerdicts(unittest.TestCase):
         # the 1800 s cap, with no chunk errors -> full_decode_ok/full
         r = _analyze('genuine_cd_1644.flac', 'flac', 900, deep=True)
         d = json.loads(r['details'])
-        self.assertEqual(d['integrity'], {'status': 'full_decode_ok', 'coverage': 'full'})
+        self.assertEqual((d['integrity']['status'], d['integrity']['coverage']),
+                         ('full_decode_ok', 'full'))
+        # deep scans of FLAC also verify the stream MD5, like `flac -t`
+        self.assertEqual(d['integrity']['stream']['result'], 'ok')
+        self.assertEqual(d['integrity']['stream']['md5'], 'match')
 
 
 class TestCutoffDetection(unittest.TestCase):
@@ -623,34 +634,58 @@ class TestAdversarialFixtures(unittest.TestCase):
         self.assertLess(d['bit_depth']['lower_bit_activity_fraction'], 0.1)
         self.assertTrue(any('not flagged as padded' in n for n in d['notes']), d['notes'])
 
-    def test_truncated_flac_partial_windows_vs_deep_decode_failure(self):
-        # round-5 correction: expectations are per mode. Segment mode's
-        # sampled windows that happen to fall before the truncation point
-        # still decode fine -> sampled_decode_ok/sampled, NOT a detection
-        # miss. Deep mode's single large sequential read hits the corruption
-        # immediately -> decode_failed/None (INCONCLUSIVE).
-        r_seg = _analyze('truncated.flac', 'flac', 900)
+    def test_truncated_flac_caught_in_both_modes(self):
+        # Before the container check (ANALYSIS_REV 8) this test pinned a
+        # documented *limitation*: segment mode's sampled windows that fall
+        # before the truncation point decode fine, so it reported
+        # sampled_decode_ok and only deep mode failed. The FLAC frame walk
+        # reads every frame header and checks the sample count against
+        # STREAMINFO without decoding, so segment mode now catches it too --
+        # a new capability, not a changed expectation. Both modes agree:
+        # DAMAGED (its own verdict, not INCONCLUSIVE: the file is broken, not
+        # unanalyzable), 'corrupt' based on the full file, truncated, and
+        # never full_decode_ok.
+        for deep in (False, True):
+            with self.subTest(deep=deep):
+                r = _analyze('truncated.flac', 'flac', 900, deep=deep)
+                self.assertEqual(r['verdict'], 'DAMAGED')
+                self.assertEqual(r['confidence'], 1.0)
+                self.assertFalse(r['deep_eligible'])
+                d = json.loads(r['details'])
+                self.assertEqual((d['integrity']['status'], d['integrity']['coverage']),
+                                 ('corrupt', 'full'))
+                stream = d['integrity']['stream']
+                self.assertEqual(stream['method'], 'flac_frames')
+                self.assertTrue(stream['truncated'])
+                self.assertTrue(r['est_source'].startswith('damaged file'), r['est_source'])
+
+    def test_truncated_mp3(self):
+        # Segment mode: an MP3 backend returns a clean short read at EOF
+        # instead of raising, and there is no per-track container check for
+        # non-FLAC formats (one subprocess per track is too much for a
+        # library scan) -- so a normal scan still can't tell, by design.
+        r_seg = _analyze('truncated.mp3', 'mp3', 320)
         d_seg = json.loads(r_seg['details'])
         self.assertEqual(d_seg['integrity']['status'], 'sampled_decode_ok')
-        self.assertNotEqual(d_seg['integrity']['status'], 'full_decode_ok')
-
-        r_deep = _analyze('truncated.flac', 'flac', 900, deep=True)
-        self.assertEqual(r_deep['verdict'], 'INCONCLUSIVE')
-        self.assertFalse(r_deep['deep_eligible'])
-        d_deep = json.loads(r_deep['details'])
-        self.assertEqual(d_deep['integrity'], {'status': 'decode_failed', 'coverage': None})
-
-    def test_truncated_mp3_decodes_short_without_raising(self):
-        # documented, deliberate non-goal: an MP3 backend that returns a
-        # clean short read at EOF instead of raising is indistinguishable
-        # here from a genuinely complete file -- both modes report a normal
-        # decode-ok status even though the file is half its declared length
-        r_seg = _analyze('truncated.mp3', 'mp3', 320)
-        self.assertEqual(json.loads(r_seg['details'])['integrity']['status'],
-                         'sampled_decode_ok')
+        self.assertIsNone(d_seg['integrity']['stream'])
+        # Deep mode adds the ffmpeg decode check, which compares the decoded
+        # length against the Xing header's declared 45 s. Without ffmpeg the
+        # check reports not_checked and the old behavior stands -- both forks
+        # are asserted so the suite is green either way.
+        import shutil
         r_deep = _analyze('truncated.mp3', 'mp3', 320, deep=True)
-        self.assertEqual(json.loads(r_deep['details'])['integrity'],
-                         {'status': 'full_decode_ok', 'coverage': 'full'})
+        d_deep = json.loads(r_deep['details'])
+        stream = d_deep['integrity']['stream']
+        self.assertEqual(stream['method'], 'ffmpeg_decode')
+        if shutil.which('ffmpeg'):
+            self.assertEqual(r_deep['verdict'], 'DAMAGED')
+            self.assertEqual((d_deep['integrity']['status'], d_deep['integrity']['coverage']),
+                             ('corrupt', 'full'))
+            self.assertTrue(stream['truncated'])
+        else:
+            self.assertEqual(stream['result'], 'not_checked')
+            self.assertEqual((d_deep['integrity']['status'], d_deep['integrity']['coverage']),
+                             ('full_decode_ok', 'full'))
 
     def test_ogg_opus_and_vorbis_codec_identified_without_ffmpeg(self):
         # OGG/Opus and OGG/Vorbis are soundfile-native (tier 2) -- codec
@@ -703,7 +738,7 @@ class TestAdversarialFixtures(unittest.TestCase):
         for name, kbps in (('lossless_alac.m4a', 900), ('lossy_aac_256.m4a', 256)):
             with self.subTest(fixture=name):
                 r = _analyze(name, 'm4a', kbps, deep=True)
-                self.assertNotEqual(r['verdict'], 'INCONCLUSIVE')
+                self.assertNotIn(r['verdict'], ('INCONCLUSIVE', 'DAMAGED'))
                 self.assertTrue(r['deep_eligible'])
                 d = json.loads(r['details'])
                 self.assertEqual(d['integrity']['status'], 'full_decode_ok')
@@ -715,11 +750,14 @@ class TestAdversarialFixtures(unittest.TestCase):
         # the gate on the fallback: for a container libsndfile CAN open, a
         # librosa failure is the finding (corruption), not the wrong decoder.
         # Handing truncated.flac to ffmpeg would decode its intact prefix and
-        # launder a decode failure into a verdict.
+        # launder a decode failure into a verdict. (It reads DAMAGED/'corrupt'
+        # rather than INCONCLUSIVE/'decode_failed' since the container check
+        # positively identifies the truncation; what matters here is that no
+        # spectral verdict leaks through and no decoded seconds are claimed.)
         r = _analyze('truncated.flac', 'flac', 900, deep=True)
-        self.assertEqual(r['verdict'], 'INCONCLUSIVE')
-        self.assertEqual(json.loads(r['details'])['integrity'],
-                         {'status': 'decode_failed', 'coverage': None})
+        self.assertEqual(r['verdict'], 'DAMAGED')
+        self.assertIsNone(r['cutoff_hz'])
+        self.assertEqual(json.loads(r['details'])['integrity']['status'], 'corrupt')
 
     def test_load_segment_only_tries_ffmpeg_for_non_seekable_containers(self):
         # _load_segment keeps its librosa-only contract unless the caller has

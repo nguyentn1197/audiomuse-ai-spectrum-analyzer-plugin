@@ -1,5 +1,148 @@
 # Changelog
 
+## 0.5.0 — Damaged-file detection
+
+Whether a file is authentic and whether it is intact are separate questions,
+and the spectrum can't answer the second. A FLAC with zero-filled or
+truncated frames decodes cleanly right up to the damage, so a normal scan
+whose sampled windows miss it (or silently drop the window that hits it)
+reported CLEAN. The garbage a decoder makes of a broken frame is broadband
+noise, so the spectral reading of a damaged file isn't evidence either way.
+The new `integrity.py` reads damage from the container's own checksums.
+
+### What is checked
+
+- **FLAC, every scan:** every frame header (CRC-8) and body (CRC-16),
+  verified in numpy without decoding or spawning anything (~0.05–0.3 s per
+  track, ~13 % of segment-analysis time on the fixtures). The frame
+  sequence is checked against STREAMINFO's total sample count, so a file
+  cut exactly on a frame boundary, which no per-frame CRC can see, is
+  caught too. Fixed and variable block size, ID3v2-prefixed files of any tag
+  size.
+- **FLAC, deep scans:** the decoded stream is also compared with STREAMINFO's
+  MD5. That is the same pair of checks `flac -t` runs.
+- **Other formats, deep scans only:** a full ffmpeg decode with CRC and
+  bitstream checks on, plus the decoded length against the declared
+  duration. This catches `truncated.mp3`, which decodes without a single
+  error. MP3, PCM and ALAC carry few or no checksums, so a pass means
+  "decodes cleanly to its declared length". It is deep-only because one
+  subprocess plus a full decode per track is too much for a library scan.
+- Bytes after the last frame (ID3v1/APE tags, padding, junk) are reported in
+  `trailing_bytes` and never count as damage, since libFLAC and ffmpeg both
+  play such files to completion.
+
+### Result
+
+- New primary verdict **`DAMAGED`**, kept separate from `INCONCLUSIVE`:
+  "this file is broken, replace it" and "this file couldn't be analyzed"
+  call for different actions. A damaged file gets `integrity.status =
+  corrupt` (coverage `full`), `confidence` 1.0 (the evidence is checksums
+  or decoder errors, not a heuristic) and `deep_eligible = false`.
+  `est_source` gives the bad-frame count and the merged regions as plain
+  ASCII. The spectral reading it would have had is kept as a note, along
+  with all measurements and the spectrogram.
+- Overview: a damaged count next to suspect / lowpassed / inconclusive, a
+  Damaged column in the album table, and albums sorted by suspects, then
+  damaged. The verdict gets its own badge and filter chip. `DAMAGED` is not
+  a suspect verdict, and "deep scan all non-clean" skips it.
+- This amends the plan's verdict/substatus contract (INCONCLUSIVE was the
+  only non-authenticity verdict). `DAMAGED` clears all three objections that
+  contract guarded against: it can't vanish from the UI, pollute suspect
+  counts, or be swept into bulk deep scans. Amendment recorded in AGENTS.md
+  and IMPROVEMENT_PLAN.md.
+- New `details.integrity.stream`: method, result, frames / bad / missing,
+  truncated, damaged seconds, regions, zero-filled bytes (the
+  transfer-gap fingerprint), trailing bytes, MD5 status, or the ffmpeg
+  errors and durations. It is `null` when no check ran.
+- A decode failure on a damaged FLAC comes back `DAMAGED` with the
+  location. One with no provable damage (no FLAC marker, no ffmpeg check)
+  stays `INCONCLUSIVE`.
+- `ANALYSIS_REV` 7 → 8: every stored row is re-checked once on the next scan.
+
+### Review fixes (before release)
+
+- **Final FLAC frame.** The last frame has no next header to bound it. It
+  used to be bounded at the first place a running CRC-16 reached zero, but
+  in an intact frame that also happens by chance. After such a point every
+  corruption verified: 146/200 single-byte corruptions of a one-frame file
+  passed. Its end is now found by walking its structure the way a decoder
+  does (subframes, wasted bits, warm-up samples, LPC coefficients,
+  Rice/escape residual partitions, padding), and the CRC is checked there.
+  The walker lands exactly on the next header on every frame of every
+  fixture, and on ffmpeg-encoded mono/6-channel/24/32-bit and
+  compression-level 0/12 streams. Final-frame corruptions caught: 1000/1000
+  across five encodings. Trailing bytes that start with a frame sync are a
+  damaged final frame, not junk.
+- **Multi-stream containers.** The truncation check compares against the
+  audio stream's own duration, never the container's. A valid MP4 with 4 s
+  of video and 1 s of audio was flagged truncated. The container duration
+  is used only when the stream reports none and audio is the only stream
+  (Matroska).
+- **MD5 at every FLAC depth (4–32 bit).** libsndfile handles 8/16/24-bit;
+  ffmpeg handles every other depth and is the fallback. A skipped check is
+  never silent: `md5: not_checked` comes with a new `md5_detail` saying
+  why.
+
+### Second review fixes (before release)
+
+- **Bounded memory.**
+  - The final-frame walk used to expand the frame into per-bit numpy arrays
+    and Python lists, about 550× the frame: 415 MiB for one valid 786 KB
+    8-channel/24-bit/32768-sample frame. It now reads bits straight from the
+    frame's bytes, so memory is one copy of the frame (0.75 MiB there). It
+    is also faster: ~1.4 ms instead of ~9 ms for a typical frame.
+  - The whole check now runs at a constant ~8 MiB plus a few hundred bytes
+    per frame. The frame-sync scan, zero-run count and trailer check work in
+    place on the memory map instead of building ~3× the file in temporaries
+    (117 MiB for a 39 MiB FLAC before).
+  - The CRC pass is block-parallel (256-byte blocks chained by CRC
+    linearity). A few huge frames no longer degenerate it (3.5 s → ~10 ms),
+    and ordinary files check 2–4× faster: ~55 ms average across the
+    fixtures, 0.5 s for a 117 MiB 24/96 file.
+- **Enforceable ffmpeg MD5 deadline.** A blocked pipe read never reached
+  the clock check, so a stalled ffmpeg held the worker: with a 0.5 s
+  timeout it waited until the process died 30 s later. A watchdog now kills
+  ffmpeg at the deadline, including one that closed its output but never
+  exits, and always reaps it. The timeout becomes `md5: not_checked` with
+  the reason.
+
+### Tests
+
+- `tests/test_integrity.py` (50 tests). Damage variants are deterministic
+  transforms of committed fixtures, built on the fly rather than committed:
+  zero-fill burst, single bit flip, dropped frame, cut on a frame boundary,
+  header damage, MD5 flip/zero, large ID3v2 prefix, ID3v1 and junk suffixes,
+  a variable-block-size rewrite (verified sample-identical), scattered
+  damage beyond the region cap, and a zero-filled MP3. Review regressions:
+  byte flips inside the final frame (including 120 positions of a one-frame
+  file), the structural frame end checked against the next header on every
+  fixture, a damaged final header with no declared total, an MP4 whose
+  audio is shorter than its video, audio-only Matroska, and MD5 at
+  4/8/12/16/20/24/32 bit. The odd depths come from a new spec-complete
+  verbatim FLAC writer, cross-checked by libsndfile and ffmpeg. A 32-bit
+  file from ffmpeg's own encoder is also covered, and the no-ffmpeg path is
+  tested. Second-review regressions:
+  - a valid 786 KB 8-channel frame walked within 3× its size
+  - ffmpeg-encoded Rice-coded 32768-sample 8-channel frames
+  - whole-check peak flat from a 5 to a 14 MiB file
+  - the block CRC matched against a reference over arbitrary span layouts
+  - a fake ffmpeg that stalls (silent, or closed-stdout-but-alive), killed
+    at a 0.5 s deadline and proven reaped
+- No false alarms: every committed FLAC fixture passes every frame and its
+  MD5. ffmpeg reports zero errors on every committed MP3/M4A/OGG.
+- Changed expectations: `truncated.flac` is now caught in segment mode too.
+  The old test pinned that as a documented limitation, not as the desired
+  outcome. Both modes now read `DAMAGED`/`corrupt`; deep mode used to give
+  `INCONCLUSIVE`/`decode_failed`.
+  `truncated.mp3` is caught by deep scans when ffmpeg is present. Exact
+  `details.integrity` comparisons gained the `stream` key.
+- Field check: a real 16-bit/44.1 kHz FLAC damaged in a download
+  (54 zero-filled 1158-byte holes on a 1348-byte grid) is reported as 29
+  bad frames, 6 missing, 62,532 zero-filled bytes, at 2:41.9-2:46.7 and
+  3:01.0-3:01.6, matching a manual frame-by-frame analysis. Before, it was
+  CLEAN in both modes. A clean 24-bit/48 kHz copy of the same track passes,
+  MD5 included.
+
 ## 0.4.0 — AudioMuse-AI 3.6.4
 
 AudioMuse-AI 3.2 replaced Redis/RQ with a task queue living in Postgres, and
